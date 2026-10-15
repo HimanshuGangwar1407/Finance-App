@@ -4,7 +4,7 @@
 const app = document.getElementById('app'), dlg = document.getElementById('dlg');
 const S = { user: null, today: '', date: '', approvedOnly: false, uncertain: true, pos: null };
 // what one signed-in person was looking at; cleared on sign-out so the next person starts fresh
-const fresh = () => Object.assign(S, { view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, tf: null, ef: null, dash: null, notes: null, notesAt: 0, approvedOnly: false, uncertain: true });
+const fresh = () => Object.assign(S, { bday: null, view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, tf: null, ef: null, dash: null, notes: null, notesAt: 0, approvedOnly: false, uncertain: true });
 fresh();
 
 function h(tag, attrs, ...kids) {
@@ -86,23 +86,7 @@ function authScreen(needsSetup) {
     h('h1', {}, needsSetup ? 'Set up the app' : 'Sign in'),
     needsSetup && h('p', { class: 'muted' }, 'Create the admin account. You can add other people after this.'),
     form(fields, needsSetup ? 'Create account' : 'Sign in', async (v) => { S.user = (await api(needsSetup ? '/api/setup' : '/api/login', v)).user; await load(); }),
-    !needsSetup && h('div', { class: 'signup-cta' }, h('span', { class: 'muted' }, 'First time here?'), h('button', { class: 'small', onclick: signupScreen }, 'Sign up'))));
-}
-
-// sign up: for people already added to the app (in People). The reply is the same for any email, on purpose.
-function signupScreen() {
-  const card = h('div', { class: 'card narrow' },
-    h('h1', {}, 'Sign up'),
-    h('p', { class: 'muted' }, 'For people already added to this app by an admin. Enter the email address they have for you, and you’ll choose your own password.'),
-    form([{ name: 'email', label: 'Your email', type: 'email', required: true, autocomplete: 'email' }], 'Continue', async (v) => {
-      await api('/api/signup', { email: v.email });
-      card.replaceChildren(
-        h('h1', {}, 'Check your email'),
-        h('p', {}, 'If ', h('strong', {}, v.email.trim().toLowerCase()), ' belongs to someone added to this app, we’ve emailed a link to choose your password. It works once, for 7 days.'),
-        h('p', { class: 'muted' }, 'If this app can’t send email yet, your admin has been told instead and will send you a link. Nothing arrived? Ask your admin.'),
-        h('button', { onclick: () => authScreen(false) }, 'Back to sign in'));
-    }, { onCancel: () => authScreen(false) }));
-  app.replaceChildren(card);
+    !needsSetup && h('p', { class: 'muted small signin-note' }, 'Your login (email and password) is given to you by your admin.')));
 }
 
 // ── the page shown: the dashboard, Transactions, EMIs, People, Positions, or the activity log ──
@@ -114,13 +98,13 @@ async function load() {
     S.user = st.user;
   } catch { /* offline for a moment: the page itself will say so */ }
   if (S.view === 'activity' && !can('admin')) S.view = 'position';
-  try { await ({ position: loadPosition, transactions: loadTransactions, emis: loadEmis, people: loadPeople, positions: loadPositions, activity: loadActivity })[S.view](); }
+  try { await ({ position: loadPosition, banks: loadBanks, transactions: loadTransactions, emis: loadEmis, people: loadPeople, positions: loadPositions, activity: loadActivity })[S.view](); }
   catch (e) { if (S.user) app.replaceChildren(topBar(), h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again'))); }
 }
 
 // simple line icons (stroke paths on a 24×24 grid)
 const ICONS = {
-  home: 'M3 11l9-8 9 8M5 10v10h14V10M10 20v-6h4v6', swap: 'M4 7h14l-4-4M20 17H6l4 4', list: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01',
+  home: 'M3 11l9-8 9 8M5 10v10h14V10M10 20v-6h4v6', bank: 'M3 21h18M5 21V11M9.5 21V11M14.5 21V11M19 21V11M2 10l10-6 10 6z', swap: 'M4 7h14l-4-4M20 17H6l4 4', list: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01',
   calendar: 'M3 5h18v16H3zM16 3v4M8 3v4M3 10h18', users: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8',
   badge: 'M3 7h18v13H3zM9 7V4h6v3M3 13h18', shield: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z', bell: 'M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0',
   menu: 'M3 6h18M3 12h18M3 18h18', wallet: 'M3 7h18v13H3zM16 14h2M3 7l3-4h12l3 4',
@@ -145,7 +129,7 @@ function go(key) {
 // the fixed left sidebar and the header (reminders bell, who is signed in); on phones the sidebar slides in
 function topBar() {
   document.body.classList.add('has-shell');
-  const items = [['position', 'Dashboard', 'home'], ['transactions:records', 'Receipts & Payments', 'swap'], ['transactions:history', 'Transaction History', 'list'],
+  const items = [['position', 'Dashboard', 'home'], ['banks', 'Banks', 'bank'], ['transactions:records', 'Receipts & Payments', 'swap'], ['transactions:history', 'Transaction History', 'list'],
     ['emis', 'EMI Management', 'calendar'], ['people', 'People', 'users'], ['positions', 'Positions', 'badge'], can('admin') && ['activity', 'Activity Log', 'shield']].filter(Boolean);
   const unread = S.notes?.unread ?? 0;
   if (Date.now() - S.notesAt > 60000) refreshNotes();
@@ -249,8 +233,7 @@ function render() {
       can('editor') && h('button', { class: 'c-red', onclick: () => paymentDialog(anyBank) }, '+ Payment'),
       can('editor') && h('button', { class: 'c-green', onclick: () => receiptDialog(anyBank) }, '+ Receipt'),
       P.banks.length > 0 && h('button', { class: 'c-amber', onclick: () => go('emis') }, 'EMIs'),
-      can('admin') && h('button', { onclick: bankDialog }, '+ Account'),
-      can('admin') && h('button', { onclick: usersDialog }, 'Users')));
+      can('admin') && h('button', { onclick: bankDialog }, '+ Account')));
 
   const alerts = [
     ...P.rows.filter((r) => r.id != null && r.final < 0 && T.final >= 0).map((r) => ['bad', `${r.name} will be short by ${inr(-r.final)}. Transfer money into it before the payments go out.`]),
@@ -365,17 +348,6 @@ function bankDialog() {
     { name: 'bank', label: 'Bank', placeholder: 'e.g. HDFC Bank', required: true },
     { name: 'last4', label: 'Last 4 digits of the account number', required: true },
   ], 'Add account', (v) => api('/api/banks', v));
-}
-
-async function usersDialog() {
-  let users;
-  try { ({ users } = await api('/api/users')); } catch (e) { return alert(e.message); }
-  openDialog('Users', [
-    { name: 'name', label: 'Name', required: true },
-    { name: 'email', label: 'Email', type: 'email', required: true },
-    { name: 'role', label: 'Role', type: 'select', value: 'editor', options: [['viewer', 'Viewer — can only look'], ['editor', 'Editor — adds and updates entries'], ['admin', 'Admin — also approves payments, adds accounts and users']] },
-    { name: 'password', label: 'First password', type: 'password', required: true, autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers. Share it with them privately.' },
-  ], 'Add user', (v) => api('/api/users', v), users.map((u) => `${u.name} (${u.role})`).join(' · '));
 }
 
 // ── Transactions: money received and paid, bank statements for a period, reports and exports ──
@@ -529,6 +501,81 @@ function shortfallAlerts(list) {
       ? `${first.bank_name} can’t cover the ${first.lender} EMI of ${inr(first.left)} due ${nice(first.due_date)} — short by ${inr(first.short_by)}. Move money in before then.`
       : `${first.bank_name} can’t cover ${xs.length} EMIs due in the next 30 days. The first is the ${first.lender} EMI of ${inr(first.left)} on ${nice(first.due_date)} (short by ${inr(first.short_by)}); to cover them all it needs ${inr(all.short_by)} more by ${nice(all.due_date)}.`;
   });
+}
+
+// ── Banks: each account's day — opening balance, debits, credits, closing balance, and its EMIs ──
+async function loadBanks() {
+  const d = await api(`/api/banks/day?date=${S.bday || S.today}`);
+  S.bday = d.date;
+  renderBanks(d);
+}
+
+function renderBanks(d) {
+  const T = d.total, isToday = d.date === d.today;
+  const day = (n) => { S.bday = addDays(d.date, n); load(); };
+  const picker = h('div', { class: 'card toolbar' }, h('div', { class: 'bar' },
+    h('button', { class: 'small', onclick: () => day(-1), 'aria-label': 'Previous day' }, '‹ Previous day'),
+    h('input', { type: 'date', value: d.date, max: d.today, 'aria-label': 'Day', onchange: (e) => { if (e.target.value) { S.bday = e.target.value > d.today ? d.today : e.target.value; load(); } } }),
+    h('button', { class: 'small', disabled: isToday, onclick: () => day(1), 'aria-label': 'Next day' }, 'Next day ›'),
+    !isToday && h('button', { class: 'small', onclick: () => { S.bday = d.today; load(); } }, 'Today')));
+
+  const tile = (cls, label, p, sub) => h('div', { class: `tile ${cls}` }, h('div', { class: 'tile-lbl' }, label), h('div', { class: `tile-amt ${p < 0 ? 'neg' : ''}` }, inr(p)), sub && h('div', { class: 'tile-sub' }, sub));
+  const n = (k) => d.banks.reduce((m, b) => m + b[k].length, 0);
+  const summary = h('header', { class: 'hero' },
+    h('div', { class: 'hero-top' }, h('div', {}, h('div', { class: 'eyebrow' }, isToday ? `Today · ${nice(d.date)}` : nice(d.date)), h('h1', {}, 'All banks for the day'))),
+    h('div', { class: 'tiles' },
+      tile('t-bal', 'Opening balance', T.opening, 'At the start of the day'),
+      tile('t-pay', '− Debits', T.paid, `${n('debits')} payment(s) out`),
+      tile('t-rec', '+ Credits', T.received, `${n('credits')} receipt(s) in`),
+      tile('t-fin', isToday ? '= Closing balance (so far)' : '= Closing balance', T.closing, T.corrections ? `Includes balance corrections ${inr(T.corrections)}` : isToday ? 'So far today' : 'At the end of the day')),
+    (T.emiDue > 0 || T.reserved > 0) && h('div', { class: 'hold-strip' }, h('span', { class: 'badge-emi' }, 'EMI'),
+      h('span', {}, T.emiDue ? [h('strong', {}, inr(T.emiDue)), ' of EMIs due on this day. '] : '', isToday && T.reserved ? [h('strong', {}, inr(T.reserved)), ' reserved for EMIs in this app now.'] : '')));
+
+  const table = d.banks.length && h('section', { class: 'card' }, h('h2', {}, h('span', { class: 'dot d-blue' }), `Bank-wise · ${nice(d.date)}`),
+    h('div', { class: 'scroll' }, h('table', { class: 'tx' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Bank account'), h('th', { class: 'num' }, 'Opening'), h('th', { class: 'num' }, '− Debits'), h('th', { class: 'num' }, '+ Credits'), h('th', { class: 'num' }, '= Closing'), h('th', {}, 'EMI'))),
+      h('tbody', {}, d.banks.map((b) => h('tr', {},
+        h('td', {}, h('strong', {}, b.name), h('div', { class: 'muted small' }, b.bank)),
+        h('td', { class: 'num' }, money(b.opening)), h('td', { class: 'num' }, money(b.paid, b.paid ? 'red' : '')), h('td', { class: 'num' }, money(b.received, b.received ? 'pos' : '')),
+        h('td', { class: 'num' }, h('strong', {}, money(b.closing))),
+        h('td', {}, emiSummary(b, isToday))))),
+      h('tfoot', {}, h('tr', {}, h('td', {}, 'All banks'), h('td', { class: 'num' }, money(T.opening)), h('td', { class: 'num' }, money(T.paid, 'red')), h('td', { class: 'num' }, money(T.received, 'pos')), h('td', { class: 'num' }, money(T.closing)), h('td', {}, T.emiDue ? `${inr(T.emiDue)} due` : '—'))))));
+
+  const line = (label, p, cls = '') => h('div', { class: 'bc-line' }, h('span', { class: 'muted' }, label), money(p, cls));
+  const moves = (list, out) => list.length
+    ? h('ul', { class: 'day-moves' }, list.map((m) => h('li', {}, h('span', {}, m.name, m.note && h('span', { class: 'muted small' }, ` · ${m.note}`), h('span', { class: 'muted small' }, ` · ${m.ref}`)), money(out ? -m.amount : m.amount, out ? '' : 'pos'))))
+    : h('div', { class: 'muted small day-none' }, out ? 'No debits' : 'No credits');
+  const cards = d.banks.length
+    ? h('div', { class: 'bank-cards' }, d.banks.map((b) => h('section', { class: `bank-card ${b.closing < 0 ? 'short' : ''}` },
+      h('div', { class: 'bc-head' }, h('div', {}, h('strong', {}, b.name), h('div', { class: 'muted small' }, b.bank)),
+        !b.balanceEntered && h('span', { class: 'chip c-amber', title: 'Enter a bank balance on the Dashboard so this starts from the right figure.' }, 'no balance entered')),
+      h('div', { class: `bc-amt ${b.closing < 0 ? 'neg' : ''}` }, inr(b.closing)),
+      h('div', { class: 'muted small bc-cap' }, isToday ? 'closing balance so far today' : 'closing balance'),
+      line('Opening balance', b.opening),
+      line(`− Debits (${b.debits.length})`, b.paid, 'red'), moves(b.debits, true),
+      line(`+ Credits (${b.credits.length})`, b.received, 'pos'), moves(b.credits, false),
+      b.corrections !== 0 && line('± Balance correction', b.corrections, 'amber'),
+      h('div', { class: 'bc-line total' }, h('span', {}, '= Closing balance'), money(b.closing)),
+      h('div', { class: 'bc-emi' }, h('strong', {}, 'EMI'), emiDetail(b, isToday))))
+    )
+    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add them on the Dashboard (“+ Account”).' : 'No bank accounts yet.'));
+
+  app.replaceChildren(...[topBar(), pageHead('Banks', 'Each bank account for a day: opening balance, debits, credits, closing balance, and EMIs.'), picker, summary, table, cards].filter(Boolean));
+}
+const EMI_STATE_SHORT = { paid: ['paid', 'c-green'], overdue: ['unpaid', 'c-red'], due: ['due today', 'c-amber'], upcoming: ['upcoming', 'c-blue'], scheduled: ['scheduled', ''] };
+// the EMI column: what is due that day, else the next one
+function emiSummary(b, isToday) {
+  if (b.emisDue.length) return h('div', { class: 'chips' }, b.emisDue.map((e) => h('span', { class: `chip ${EMI_STATE_SHORT[e.state]?.[1] ?? ''}` }, `${e.lender} ${inr(e.amount)} · ${EMI_STATE_SHORT[e.state]?.[0] ?? e.state}`)));
+  if (b.nextEmi) return h('span', { class: 'muted small' }, `Next: ${b.nextEmi.lender} ${inr(b.nextEmi.amount)} on ${nice(b.nextEmi.due_date)}${isToday && b.reserved ? ` · ${inr(b.reserved)} reserved` : ''}`);
+  return h('span', { class: 'muted small' }, '—');
+}
+function emiDetail(b, isToday) {
+  return h('div', {},
+    b.emisDue.length
+      ? b.emisDue.map((e) => h('div', { class: 'bc-line' }, h('span', {}, `${e.lender} (due this day)`, ' ', h('span', { class: `chip ${EMI_STATE_SHORT[e.state]?.[1] ?? ''}` }, e.state === 'paid' && e.paid_on ? `paid ${nice(e.paid_on)}` : EMI_STATE_SHORT[e.state]?.[0] ?? e.state)), money(e.amount, 'amber')))
+      : h('div', { class: 'muted small' }, 'No EMI due on this day.'),
+    isToday && b.reserved > 0 && h('div', { class: 'bc-line' }, h('span', { class: 'muted' }, 'Reserved for EMIs now (in this app)'), money(b.reserved, 'amber')),
+    b.nextEmi && h('div', { class: 'muted small' }, `Next EMI: ${b.nextEmi.lender} ${inr(b.nextEmi.amount)} on ${nice(b.nextEmi.due_date)}`));
 }
 
 // ── dashboard summary cards ──
@@ -722,7 +769,7 @@ function renderPeople(people, positions, hidden) {
         [['', 'All positions'], ['none', 'No position'], ...positions.map((x) => [String(x.id), x.name + (x.active ? '' : ' (inactive)')])].map(([v, t]) => h('option', { value: v, selected: S.pf.position === v }, t)))));
   const table = people.length
     ? h('div', { class: 'scroll' }, h('table', { class: 'people' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Position'), !hidden && h('th', {}, 'Email'), !hidden && h('th', {}, 'Phone'), h('th', {}, 'Status'), !hidden && h('th', {}, 'App access'), can('editor') && h('th', {}, ''))),
+      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Position'), !hidden && h('th', {}, 'Email'), !hidden && h('th', {}, 'Phone'), h('th', {}, 'Status'), !hidden && h('th', {}, 'App access'), can('admin') && h('th', {}, ''))),
       h('tbody', {}, people.map((x) => h('tr', { class: x.active ? '' : 'inactive' },
         h('td', {}, h('button', { class: 'link', onclick: () => personView(x, positions, hidden) }, x.name)),
         h('td', {}, x.position ? h('span', { class: `chip ${x.position_active ? 'c-violet' : ''}` }, x.position) : h('span', { class: 'muted' }, '—')),
@@ -730,14 +777,14 @@ function renderPeople(people, positions, hidden) {
         !hidden && h('td', { class: 'nowrap' }, x.phone || h('span', { class: 'muted' }, '—')),
         h('td', {}, statusChip(x.active)),
         !hidden && h('td', {}, accessChip(x)),
-        can('editor') && h('td', { class: 'acts-cell' },
+        can('admin') && h('td', { class: 'acts-cell' },
           h('button', { class: 'small', onclick: () => personForm(x, positions) }, 'Edit'),
           h('button', { class: 'small', onclick: () => setPersonActive(x, !x.active) }, x.active ? 'Deactivate' : 'Activate'),
           ...accessButtons(x)))))))
     : h('p', { class: 'empty' }, S.pf.q || S.pf.position || S.pf.status !== 'active' ? 'No one matches.' : 'No people yet.');
   app.replaceChildren(topBar(),
     pageHead('People', `${people.length} shown${hidden ? ' · contact details are visible to editors and admins' : ''}`,
-      can('editor') && h('button', { class: 'primary', onclick: () => personForm(null, positions) }, '+ Person')),
+      can('admin') && h('button', { class: 'primary', onclick: () => personForm(null, positions) }, '+ Person')),
     filters, h('section', { class: 'card' }, table));
 }
 
@@ -766,7 +813,23 @@ function personForm(x, positions) {
     { name: 'email', label: 'Email (optional)', type: 'email', value: x?.email },
     { name: 'phone', label: 'Phone (optional)', type: 'tel', value: x?.phone, placeholder: '+91 98765 43210' },
     { name: 'notes', label: 'Notes (optional)', value: x?.notes },
-  ], x ? 'Save changes' : 'Add person', (v) => api(x ? `/api/people/${x.id}` : '/api/people', v));
+    ...(x ? [] : [
+      { name: 'login_role', label: 'App login', type: 'select', value: '', options: [['', 'No login'], ...ROLE_OPTS],
+        hint: 'To let them use the app, choose what they can do and set their password. They sign in with the email above.' },
+      { name: 'password', label: 'Password (for their login)', type: 'password', autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers. Give it to them privately.' },
+      { name: 'confirm', label: 'Password again', type: 'password', autocomplete: 'new-password' },
+    ]),
+  ], x ? 'Save changes' : 'Add person', async (v) => {
+    if (x) return api(`/api/people/${x.id}`, v);
+    const { confirm: again, ...body } = v;
+    if (body.login_role) {
+      if (!body.email) throw new Error('A login needs their email address: it is what they sign in with.');
+      if (!body.password) throw new Error('Set a password for their login.');
+      if (body.password !== again) throw new Error('The two passwords don’t match.');
+    } else { delete body.password; delete body.login_role; }
+    await api('/api/people', body);
+    if (body.login_role) setTimeout(() => alert(`${body.name} can now sign in with ${body.email.trim().toLowerCase()} and the password you set. Give them the password privately.`), 0);
+  });
 }
 
 const setPersonActive = (x, active) => {
@@ -774,58 +837,51 @@ const setPersonActive = (x, active) => {
   act(`/api/people/${x.id}/active`, { active });
 };
 
-// ── app access: who can sign in, invites and password-reset links ──
+// ── app access: logins are created by admins — the person's email from People and a password the admin sets ──
 const ROLE = { viewer: 'Viewer', editor: 'Editor', admin: 'Admin' };
+const ROLE_OPTS = [['viewer', 'Viewer — can look, can’t change anything'], ['editor', 'Editor — adds and updates records'], ['admin', 'Admin — everything, including people and logins']];
 function accessChip(x) {
   if (x.user_id) return x.access_active ? h('span', { class: `chip ${x.access_role === 'admin' ? 'c-violet' : 'c-green'}` }, `${ROLE[x.access_role]} access`) : h('span', { class: 'chip c-red' }, 'Access removed');
-  if (x.open_link) return h('span', { class: 'chip c-amber', title: `Link valid until ${when(x.open_link.expires_at)}` }, `Invited · ${ROLE[x.open_link.role]}`);
-  return h('span', { class: 'muted small' }, 'No access');
+  return h('span', { class: 'muted small' }, 'No login');
 }
 function accessButtons(x) {
   if (!can('admin') || !x.active) return [];
-  if (x.user_id) return x.access_active
-    ? [x.user_id !== S.user.id && h('button', { class: 'small', onclick: () => roleDialog(x) }, 'Change role'),
-      h('button', { class: 'small', onclick: () => linkAction(`/api/people/${x.id}/reset-link`, {}, `Password reset link for ${x.name}`, x) }, 'Reset password link'),
-      x.user_id !== S.user.id && h('button', { class: 'small', onclick: () => { if (confirm(`Remove ${x.name}’s access? They are signed out everywhere and can’t sign in until you restore it.`)) act(`/api/people/${x.id}/access`, { active: false }); } }, 'Remove access')].filter(Boolean)
-    : [h('button', { class: 'small', onclick: () => act(`/api/people/${x.id}/access`, { active: true }) }, 'Restore access')];
+  const me = x.user_id === S.user.id;
+  if (!x.user_id) return [h('button', { class: 'small c-violet', onclick: () => loginDialog(x) }, 'Create login')];
+  if (!x.access_active) return [h('button', { class: 'small', onclick: () => act(`/api/people/${x.id}/access`, { active: true }) }, 'Restore access')];
   return [
-    h('button', { class: 'small c-violet', onclick: () => inviteDialog(x) }, x.open_link ? 'New invite link' : 'Invite'),
-    x.open_link && h('button', { class: 'small', onclick: () => { if (confirm(`Cancel ${x.name}’s invite link? It will stop working.`)) act(`/api/people/${x.id}/invite/cancel`, {}); } }, 'Cancel invite'),
+    !me && h('button', { class: 'small', onclick: () => roleDialog(x) }, 'Change role'),
+    !me && h('button', { class: 'small', onclick: () => setPasswordDialog(x) }, 'Set password'),
+    !me && h('button', { class: 'small', onclick: () => { if (confirm(`Remove ${x.name}’s access? They are signed out everywhere and can’t sign in until you restore it.`)) act(`/api/people/${x.id}/access`, { active: false }); } }, 'Remove access'),
   ].filter(Boolean);
 }
 
+const passwordFields = (label) => [
+  { name: 'password', label, type: 'password', required: true, autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers. Give it to them privately.' },
+  { name: 'confirm', label: 'Password again', type: 'password', required: true, autocomplete: 'new-password' },
+];
+function loginDialog(x) {
+  if (!x.email) return alert(`Add ${x.name}’s email address first (Edit). It is what they sign in with.`);
+  openDialog(`Create a login for ${x.name}`, [
+    { name: 'role', label: 'What can they do?', type: 'select', value: 'viewer', options: ROLE_OPTS },
+    ...passwordFields('Password'),
+  ], 'Create login', async (v) => {
+    if (v.password !== v.confirm) throw new Error('The two passwords don’t match.');
+    await api(`/api/people/${x.id}/login`, { role: v.role, password: v.password });
+    setTimeout(() => alert(`${x.name} can now sign in with ${x.email} and the password you set. Give them the password privately.`), 0);
+  }, `They will sign in with ${x.email}.`);
+}
+function setPasswordDialog(x) {
+  openDialog(`Set a new password for ${x.name}`, passwordFields('New password'), 'Set password', async (v) => {
+    if (v.password !== v.confirm) throw new Error('The two passwords don’t match.');
+    await api(`/api/people/${x.id}/password`, { password: v.password });
+    setTimeout(() => alert(`Done. ${x.name} is signed out everywhere and now signs in with the new password.`), 0);
+  }, `For their login ${x.email}. They are signed out everywhere and use this password from now on.`);
+}
 function roleDialog(x) {
   openDialog(`Change ${x.name}’s role`, [
-    { name: 'role', label: 'What can they do?', type: 'select', value: x.access_role, options: [['viewer', 'Viewer — can look, can’t change anything'], ['editor', 'Editor — adds and updates records'], ['admin', 'Admin — everything, including users and approvals']] },
+    { name: 'role', label: 'What can they do?', type: 'select', value: x.access_role, options: ROLE_OPTS },
   ], 'Save', (v) => api(`/api/people/${x.id}/role`, v), 'It applies the next time they open a page; they don’t need to sign in again.');
-}
-
-function inviteDialog(x) {
-  if (!x.email) return alert(`Add ${x.name}’s email address first (Edit). It is what they will sign in with.`);
-  openDialog(`Invite ${x.name} to the app`, [
-    { name: 'role', label: 'What can they do?', type: 'select', value: x.open_link?.role ?? 'viewer', options: [['viewer', 'Viewer — can look, can’t change anything'], ['editor', 'Editor — adds and updates records'], ['admin', 'Admin — everything, including users and approvals']] },
-  ], 'Create invite link', async (v) => { const r = await api(`/api/people/${x.id}/invite`, v); setTimeout(() => showLink(r, `Invite link for ${x.name}`, x), 0); },
-  `They will sign in with ${x.email} and choose their own password. The link works once, for 7 days${x.open_link ? ' — and replaces the link sent earlier' : ''}.`);
-}
-async function linkAction(path, body, title, x) {
-  try { const r = await api(path, body); await load(); showLink(r, title, x); } catch (e) { alert(e.message); }
-}
-// the link, ready to copy and send (WhatsApp, email…); it is shown only now and can't be looked up later
-function showLink(r, title, x) {
-  const box = h('input', { type: 'text', readonly: true, value: r.link, class: 'link-box', 'aria-label': 'Link', onfocus: (e) => e.target.select() });
-  const copied = h('span', { class: 'muted small', role: 'status' });
-  const sent = { sent: `Also emailed to ${x.email}.`, failed: `Emailing it to ${x.email} failed — send the link yourself.`, 'not set up': 'Email isn’t set up, so send the link yourself.' }[r.emailed];
-  dlg.className = '';
-  dlg.replaceChildren(h('h2', {}, title),
-    h('p', {}, `Send this link to ${x.name}. It works once, until ${when(r.expires_at)}. Anyone with the link can use it, so send it only to them.`),
-    box,
-    h('div', { class: 'bar link-acts' },
-      h('button', { class: 'primary', onclick: async () => {
-        try { await navigator.clipboard.writeText(r.link); copied.textContent = 'Copied.'; } catch { box.focus(); box.select(); copied.textContent = 'Press Ctrl+C to copy.'; }
-      } }, 'Copy link'), copied),
-    h('p', { class: 'muted small' }, sent, ' This link can’t be shown again; you can always make a new one.'),
-    h('div', { class: 'bar' }, h('button', { onclick: () => dlg.close() }, 'Done')));
-  if (!dlg.open) dlg.showModal();
 }
 
 function passwordDialog() {
@@ -840,36 +896,9 @@ function passwordDialog() {
   });
 }
 
-// the page an invite or reset link opens: who it is for, then "choose your password"
-async function linkScreen(kind, token) {
-  document.body.classList.remove('has-shell', 'nav-open');
-  const clear = () => history.replaceState(null, '', location.pathname); // the secret leaves the address bar
-  let info;
-  try { info = await api('/api/invites/check', { token }); }
-  catch (e) {
-    clear();
-    return app.replaceChildren(h('div', { class: 'card narrow' }, h('h1', {}, 'This link can’t be used'), h('p', {}, e.message), h('button', { onclick: boot }, 'Go to sign in')));
-  }
-  const invite = kind === 'invite';
-  app.replaceChildren(h('div', { class: 'card narrow' },
-    h('h1', {}, invite ? `Welcome, ${info.name}` : 'Set a new password'),
-    h('p', { class: 'muted' }, invite ? `You’ve been given ${ROLE[info.role]} access to the Finance app. Choose a password to finish.` : `For ${info.name}. Your other devices will be signed out.`),
-    h('div', { class: 'kv' }, h('span', { class: 'muted' }, 'You sign in with'), h('strong', {}, info.email)),
-    form([
-      ...(invite ? [{ name: 'name', label: 'Your name', value: info.name, required: true }] : []),
-      { name: 'password', label: 'Choose a password', type: 'password', required: true, autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers.' },
-      { name: 'confirm', label: 'Type it again', type: 'password', required: true, autocomplete: 'new-password' },
-    ], invite ? 'Create my account' : 'Save new password', async (v) => {
-      if (v.password !== v.confirm) throw new Error('The two passwords don’t match.');
-      S.user = (await api('/api/invites/accept', { token, password: v.password, name: v.name })).user;
-      clear(); fresh();
-      await boot();
-    })));
-}
-
 // ── Positions ──
 async function loadPositions() {
-  const [{ positions }, people] = await Promise.all([api('/api/positions'), can('editor') ? api('/api/people?status=active') : null]);
+  const [{ positions }, people] = await Promise.all([api('/api/positions'), can('admin') ? api('/api/people?status=active') : null]);
   renderPositions(positions, people?.people ?? []);
 }
 
@@ -881,7 +910,7 @@ function renderPositions(positions, people) {
         p.description && h('div', { class: 'muted small' }, p.description),
         h('div', { class: 'muted small' }, `${p.people} active ${p.people === 1 ? 'person' : 'people'}`)),
       h('div', { class: 'acts' },
-        can('editor') && p.active && h('button', { class: 'small c-violet', onclick: () => assignDialog(p, people) }, 'Assign'),
+        can('admin') && p.active && h('button', { class: 'small c-violet', onclick: () => assignDialog(p, people) }, 'Assign'),
         h('button', { class: 'small', onclick: () => { S.view = 'people'; S.pf = { status: 'active', position: String(p.id), q: '' }; load(); } }, 'View people'),
         can('admin') && h('button', { class: 'small', onclick: () => positionForm(p) }, 'Edit'),
         can('admin') && h('button', { class: 'small', onclick: () => setPositionActive(p, !p.active) }, p.active ? 'Deactivate' : 'Activate'))))
@@ -917,7 +946,7 @@ const ACTION_LABELS = {
   'emi.edit': 'Changed EMI settings', 'emi.reminders': 'Checked EMI reminders',
   'report.export': 'Exported a report',
   login: 'Signed in', 'login.failed': 'Failed sign-in', 'login.locked': 'Locked out (too many wrong passwords)', logout: 'Signed out',
-  setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user',
+  setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user', 'account.create': 'Created a login', 'account.password': 'Set someone’s password',
   'invite.create': 'Invited someone to the app', 'invite.reset_link': 'Made a password reset link', 'invite.cancel': 'Cancelled an invite link',
   'invite.accept': 'Accepted an invite (set their password)', 'password.reset': 'Set a new password from a reset link', 'password.change': 'Changed their password',
   'signup.request': 'Asked to sign up', 'access.role': 'Changed someone’s role',
@@ -960,7 +989,7 @@ function renderActivity() {
   const filters = h('div', { class: 'card toolbar' }, h('div', { class: 'bar grow' },
     h('input', { type: 'search', name: 'aq', class: 'search', placeholder: 'Search actions, names, references', value: f.q ?? '', oninput: onSearch((v) => { S.af = { ...S.af, q: v }; }), 'aria-label': 'Search activity' }),
     h('select', { 'aria-label': 'Who', onchange: set('user') }, [['', 'Everyone'], ...users.map((u) => [String(u.id), `${u.name} (${u.role})`]), ['none', 'Not signed in']].map(([v, t]) => h('option', { value: v, selected: (f.user ?? '') === v }, t))),
-    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'All activity'], ['signin', 'Sign-ins'], ['people', 'People'], ['positions', 'Positions'], ['payments', 'Payments'], ['receipts', 'Receipts'], ['emis', 'EMIs'], ['balances', 'Bank balances'], ['accounts', 'Bank accounts'], ['users', 'Users & access'], ['reports', 'Report exports']]
+    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'All activity'], ['signin', 'Sign-ins'], ['people', 'People'], ['positions', 'Positions'], ['payments', 'Payments'], ['receipts', 'Receipts'], ['emis', 'EMIs'], ['balances', 'Bank balances'], ['accounts', 'Bank accounts'], ['users', 'Logins & access'], ['reports', 'Report exports']]
       .map(([v, t]) => h('option', { value: v, selected: (f.type ?? '') === v }, t))),
     h('label', { class: 'check' }, 'From', h('input', { type: 'date', value: f.from ?? '', max: S.today, onchange: set('from') })),
     h('label', { class: 'check' }, 'To', h('input', { type: 'date', value: f.to ?? '', max: S.today, onchange: set('to') })),
@@ -982,8 +1011,6 @@ function renderActivity() {
 
 async function boot() {
   dlg.open && dlg.close();
-  const link = /^#(invite|reset)=([A-Za-z0-9_-]+)$/.exec(location.hash);
-  if (link) return linkScreen(link[1], link[2]);
   try {
     const s = await api('/api/state');
     S.today = s.today; S.date = S.date && S.date >= s.today ? S.date : s.today; S.user = s.user;
@@ -993,6 +1020,4 @@ async function boot() {
     app.replaceChildren(h('div', { class: 'card narrow' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: boot }, 'Try again')));
   }
 }
-// opening an invite or reset link in a tab that already has the app open only changes the part after "#"
-window.addEventListener('hashchange', () => { if (/^#(invite|reset)=/.test(location.hash)) boot(); });
 boot();

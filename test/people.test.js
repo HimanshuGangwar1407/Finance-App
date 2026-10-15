@@ -57,22 +57,25 @@ test('positions: admins create and edit them; names are unique ignoring case', a
 
 test('people: add, view, edit, search, filter, deactivate and activate', async () => {
   const pos = new Map((await admin('/api/positions')).body.positions.map((p) => [p.name, p.id]));
-  const ravi = await editor('/api/people', { name: 'Ravi Kumar', email: 'Ravi@Firm.in', phone: '+91 98765 43210', position_id: pos.get('Senior Accountant'), notes: 'Handles GST' });
+  const ravi = await admin('/api/people', { name: 'Ravi Kumar', email: 'Ravi@Firm.in', phone: '+91 98765 43210', position_id: pos.get('Senior Accountant'), notes: 'Handles GST' });
   assert.equal(ravi.status, 200);
-  const meena = await editor('/api/people', { name: 'Meena Shah', position_id: pos.get('Manager') });
-  await editor('/api/people', { name: 'Arjun Rao' });
-  assert.equal((await editor('/api/people', { name: 'Dup', email: 'ravi@firm.in' })).body.error.message, 'Someone in People already has that email.');
-  assert.equal((await editor('/api/people', { name: 'X', email: 'not-an-email' })).status, 400);
-  assert.equal((await editor('/api/people', { name: 'X', phone: 'call me' })).status, 400);
-  assert.equal((await editor('/api/people', { name: '' })).status, 400);
+  const meena = await admin('/api/people', { name: 'Meena Shah', position_id: pos.get('Manager') });
+  await admin('/api/people', { name: 'Arjun Rao' });
+  assert.equal((await admin('/api/people', { name: 'Dup', email: 'ravi@firm.in' })).body.error.message, 'Someone in People already has that email.');
+  assert.equal((await admin('/api/people', { name: 'X', email: 'not-an-email' })).status, 400);
+  assert.equal((await admin('/api/people', { name: 'X', phone: 'call me' })).status, 400);
+  assert.equal((await admin('/api/people', { name: '' })).status, 400);
   assert.equal((await viewer('/api/people', { name: 'Nope' })).status, 403);
+  assert.equal((await editor('/api/people', { name: 'Nope' })).status, 403); // only admins add, edit or deactivate people
+  assert.equal((await editor(`/api/people/${ravi.body.id}`, { name: 'X' })).status, 403);
+  assert.equal((await editor(`/api/people/${ravi.body.id}/active`, { active: false })).status, 403);
 
   let list = (await editor('/api/people')).body.people;
-  assert.deepEqual(list.map((p) => p.name), ['Arjun Rao', 'Meena Shah', 'Ravi Kumar']); // sorted by name
+  assert.deepEqual(list.map((p) => p.name), ['Arjun Rao', 'Asha Admin', 'Eli Editor', 'Meena Shah', 'Ravi Kumar', 'Vik Viewer']); // sorted by name; everyone with a login is in People too
   const r = list.find((p) => p.name === 'Ravi Kumar');
   assert.equal(r.email, 'ravi@firm.in');
   assert.equal(r.position, 'Senior Accountant');
-  assert.equal(r.created_by, 'Eli Editor');
+  assert.equal(r.created_by, 'Asha Admin');
 
   const names = async (qs, who = editor) => (await who(`/api/people?${qs}`)).body.people.map((p) => p.name);
   assert.deepEqual(await names('q=ravi'), ['Ravi Kumar']);
@@ -81,22 +84,22 @@ test('people: add, view, edit, search, filter, deactivate and activate', async (
   assert.deepEqual(await names('q=manag'), ['Meena Shah']); // position name
   assert.deepEqual(await names('q=%25'), []); // % is searched literally, not as a wildcard
   assert.deepEqual(await names(`position=${pos.get('Manager')}`), ['Meena Shah']);
-  assert.deepEqual(await names('position=none'), ['Arjun Rao']);
+  assert.deepEqual(await names('position=none'), ['Arjun Rao', 'Asha Admin', 'Eli Editor', 'Vik Viewer']);
 
   // edit: change position and phone
-  assert.equal((await editor(`/api/people/${meena.body.id}`, { name: 'Meena Shah', position_id: pos.get('Senior Accountant'), phone: '022 1234 5678' })).status, 200);
+  assert.equal((await admin(`/api/people/${meena.body.id}`, { name: 'Meena Shah', position_id: pos.get('Senior Accountant'), phone: '022 1234 5678' })).status, 200);
   list = (await editor('/api/people')).body.people;
   assert.equal(list.find((p) => p.name === 'Meena Shah').position, 'Senior Accountant');
-  assert.equal(list.find((p) => p.name === 'Meena Shah').updated_by, 'Eli Editor');
+  assert.equal(list.find((p) => p.name === 'Meena Shah').updated_by, 'Asha Admin');
 
   // deactivate: hidden from the default list, shown under inactive / everyone; then back
-  assert.equal((await editor(`/api/people/${ravi.body.id}/active`, { active: false })).status, 200);
-  assert.equal((await editor(`/api/people/${ravi.body.id}/active`, { active: false })).status, 404);
-  assert.deepEqual(await names(''), ['Arjun Rao', 'Meena Shah']);
+  assert.equal((await admin(`/api/people/${ravi.body.id}/active`, { active: false })).status, 200);
+  assert.equal((await admin(`/api/people/${ravi.body.id}/active`, { active: false })).status, 404);
+  assert.deepEqual(await names(''), ['Arjun Rao', 'Asha Admin', 'Eli Editor', 'Meena Shah', 'Vik Viewer']);
   assert.deepEqual(await names('status=inactive'), ['Ravi Kumar']);
-  assert.deepEqual(await names('status=all'), ['Arjun Rao', 'Meena Shah', 'Ravi Kumar']);
-  assert.equal((await editor(`/api/people/${ravi.body.id}/active`, { active: true })).status, 200);
-  assert.deepEqual(await names(''), ['Arjun Rao', 'Meena Shah', 'Ravi Kumar']);
+  assert.deepEqual(await names('status=all'), ['Arjun Rao', 'Asha Admin', 'Eli Editor', 'Meena Shah', 'Ravi Kumar', 'Vik Viewer']);
+  assert.equal((await admin(`/api/people/${ravi.body.id}/active`, { active: true })).status, 200);
+  assert.deepEqual(await names(''), ['Arjun Rao', 'Asha Admin', 'Eli Editor', 'Meena Shah', 'Ravi Kumar', 'Vik Viewer']);
 });
 
 test('viewers see names and positions, but not contact details or notes', async () => {
@@ -109,28 +112,28 @@ test('viewers see names and positions, but not contact details or notes', async 
   assert.equal((await editor('/api/people')).body.contactsHidden, false);
 });
 
-test('assigning positions: editors assign active positions to active people', async () => {
+test('assigning positions: admins assign active positions to active people', async () => {
   const pos = new Map((await admin('/api/positions')).body.positions.map((p) => [p.name, p.id]));
   const people = new Map((await editor('/api/people?status=all')).body.people.map((p) => [p.name, p.id]));
-  assert.equal((await editor(`/api/positions/${pos.get('Manager')}/assign`, { person_id: people.get('Arjun Rao') })).status, 200);
-  assert.equal((await viewer(`/api/positions/${pos.get('Manager')}/assign`, { person_id: people.get('Arjun Rao') })).status, 403);
+  assert.equal((await admin(`/api/positions/${pos.get('Manager')}/assign`, { person_id: people.get('Arjun Rao') })).status, 200);
+  for (const who of [viewer, editor]) assert.equal((await who(`/api/positions/${pos.get('Manager')}/assign`, { person_id: people.get('Arjun Rao') })).status, 403);
   let list = (await editor('/api/people')).body.people;
   assert.equal(list.find((p) => p.name === 'Arjun Rao').position, 'Manager');
   assert.equal((await admin('/api/positions')).body.positions.find((p) => p.name === 'Manager').people, 1);
 
   // a deactivated position can't be given to anyone new, but people who hold it keep it
   assert.equal((await admin(`/api/positions/${pos.get('Manager')}`, { active: false })).status, 200);
-  assert.equal((await editor(`/api/positions/${pos.get('Manager')}/assign`, { person_id: people.get('Ravi Kumar') })).status, 400);
-  assert.match((await editor('/api/people', { name: 'New', position_id: pos.get('Manager') })).body.error.message, /inactive/);
+  assert.equal((await admin(`/api/positions/${pos.get('Manager')}/assign`, { person_id: people.get('Ravi Kumar') })).status, 400);
+  assert.match((await admin('/api/people', { name: 'New', position_id: pos.get('Manager') })).body.error.message, /inactive/);
   list = (await editor('/api/people')).body.people;
   assert.equal(list.find((p) => p.name === 'Arjun Rao').position, 'Manager');
-  assert.equal((await editor(`/api/people/${people.get('Arjun Rao')}`, { name: 'Arjun Rao', notes: 'still here' })).status, 200); // editing other fields is fine
+  assert.equal((await admin(`/api/people/${people.get('Arjun Rao')}`, { name: 'Arjun Rao', notes: 'still here' })).status, 200); // editing other fields is fine
   assert.equal((await admin(`/api/positions/${pos.get('Manager')}`, { active: true })).status, 200);
 
   // inactive people can't be assigned
-  await editor(`/api/people/${people.get('Ravi Kumar')}/active`, { active: false });
-  assert.equal((await editor(`/api/positions/${pos.get('Manager')}/assign`, { person_id: people.get('Ravi Kumar') })).status, 400);
-  await editor(`/api/people/${people.get('Ravi Kumar')}/active`, { active: true });
+  await admin(`/api/people/${people.get('Ravi Kumar')}/active`, { active: false });
+  assert.equal((await admin(`/api/positions/${pos.get('Manager')}/assign`, { person_id: people.get('Ravi Kumar') })).status, 400);
+  await admin(`/api/people/${people.get('Ravi Kumar')}/active`, { active: true });
 });
 
 test('admin has full access; editors and viewers are kept out of admin-only areas', async () => {
@@ -167,7 +170,7 @@ test('activity log: sign-ins, failures, lockouts and changes, with who and when 
   const unknown = all.find((a) => a.action === 'login.failed' && a.detail.email === 'nobody@x.in');
   assert.equal(unknown.user_id, null);
   const add = all.find((a) => a.action === 'person.add' && a.detail.name === 'Ravi Kumar');
-  assert.equal(add.user_name, 'Eli Editor');
+  assert.equal(add.user_name, 'Asha Admin');
   assert.ok(Math.abs(Date.parse(add.at) - Date.now()) < 120000);
   const edit = all.find((a) => a.action === 'person.edit' && a.detail.name === 'Meena Shah');
   assert.ok(edit.detail.changes.position_id);

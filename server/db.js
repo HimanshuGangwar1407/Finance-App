@@ -212,6 +212,14 @@ const MIGRATIONS = [
      revoked_at  timestamptz
    );
    CREATE INDEX invites_person ON invites (person_id, id DESC);`,
+  // logins are now made by admins in People (no more invite links or sign-up): every login appears in People —
+  // linked by email, or added — and any invite links still open stop working. Nothing is deleted.
+  `UPDATE people p SET user_id = u.id FROM users u
+     WHERE p.user_id IS NULL AND p.email <> '' AND lower(p.email) = u.email AND NOT EXISTS (SELECT 1 FROM people o WHERE o.user_id = u.id);
+   INSERT INTO people (name, email, user_id)
+     SELECT u.name, u.email, u.id FROM users u
+     WHERE NOT EXISTS (SELECT 1 FROM people p WHERE p.user_id = u.id) AND NOT EXISTS (SELECT 1 FROM people p WHERE lower(p.email) = u.email);
+   UPDATE invites SET revoked_at = now() WHERE used_at IS NULL AND revoked_at IS NULL;`,
 ];
 
 let ready;

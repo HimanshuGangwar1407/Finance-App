@@ -49,59 +49,24 @@ const changes = (before, after) => Object.fromEntries(Object.keys(after).filter(
 const unique = (message) => (e) => { throw e.code === 'conflict' ? err(409, 'conflict', message) : e; };
 const likeTerm = (s) => `%${s.replace(/[\\%_]/g, '\\$&')}%`;
 
-// one-time links (invites and password resets): 256 random bits, valid for 7 days, used once; only a hash is stored.
-// The secret goes after "#" in the link, so it is never sent to the server in a URL or written to server logs.
-const tokenHash = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
-const appUrl = (req) => (process.env.APP_URL || `${req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? 'https' : 'http'}://${req.headers['x-forwarded-host'] || req.headers.host}`).replace(/\/+$/, '');
-// sign-up attempts per IP address: at most 5 in 15 minutes
-const signupTries = new Map();
-function signupLimit(req) {
-  // on Vercel its proxy sets x-real-ip (a visitor can't fake it); anywhere else, the connection's own address
-  const ip = String((process.env.VERCEL && req.headers['x-real-ip']) || req.socket.remoteAddress || ''), now = Date.now();
-  const recent = (signupTries.get(ip) ?? []).filter((t) => now - t < 15 * 60000);
-  if (recent.length >= 5) throw err(429, 'too_many', 'Too many tries. Wait a few minutes and try again.');
-  recent.push(now); signupTries.set(ip, recent);
-  if (signupTries.size > 5000) signupTries.clear();
-}
 // a person whose email is already someone's sign-in is linked to that account (unless another person already is)
 const linkUser = (c, personId) => c.query(`UPDATE people p SET user_id = u.id FROM users u
   WHERE p.id = $1 AND p.user_id IS NULL AND p.email <> '' AND u.email = lower(p.email) AND NOT EXISTS (SELECT 1 FROM people o WHERE o.user_id = u.id)`, [personId]);
-async function personForLink(c, id) {
-  const { rows: [p] } = await c.query('SELECT id, name, email, active, user_id FROM people WHERE id = $1 FOR UPDATE', [id]);
-  if (!p) notFound('That person doesn’t exist.');
-  if (!p.active) bad(`${p.name} is inactive. Activate them first.`);
-  if (!p.email) bad(`Add ${p.name}’s email address first — it is what they sign in with.`);
-  return p;
-}
-async function makeLink(c, { kind, person, userId, role, by, req }) {
-  await c.query('UPDATE invites SET revoked_at = now() WHERE person_id = $1 AND used_at IS NULL AND revoked_at IS NULL', [person.id]); // a new link replaces the old one
-  const token = crypto.randomBytes(32).toString('base64url');
-  const { rows: [i] } = await c.query(`INSERT INTO invites (kind, person_id, user_id, email, role, token_hash, expires_at, created_by)
-    VALUES ($1, $2, $3, $4, $5, $6, now() + interval '7 days', $7) RETURNING id, expires_at`, [kind, person.id, userId, person.email, role, tokenHash(token), by]);
-  return { id: i.id, expires_at: i.expires_at, link: `${appUrl(req)}/#${kind}=${token}` };
-}
-// the link's details, if it is still usable (lock: for accepting it)
-async function openLink(db, token, lock = false) {
-  const t = String(token ?? '');
-  if (!/^[A-Za-z0-9_-]{20,100}$/.test(t)) throw err(410, 'link_invalid', 'This link isn’t valid. Check you copied all of it, or ask your admin for a new one.');
-  const { rows: [i] } = await db.query(`SELECT i.*, p.name AS person_name, p.active AS person_active, u.active AS user_active, u.role AS user_role
-    FROM invites i LEFT JOIN people p ON p.id = i.person_id LEFT JOIN users u ON u.id = i.user_id WHERE i.token_hash = $1${lock ? ' FOR UPDATE OF i' : ''}`, [tokenHash(t)]);
-  if (!i || i.used_at || i.revoked_at || new Date(i.expires_at) <= new Date()) throw err(410, 'link_invalid', 'This link has expired or has already been used. Ask your admin for a new one.');
-  return i;
-}
-// emails the link straight away when email is set up (the link itself is never stored); → 'sent' | 'failed' | 'not set up'
-async function emailLink({ kind, to, name, link, role, from }) {
-  if (!emailConfigured()) return 'not set up';
-  const mail = {
-    invite: ['Your invitation to the Finance app', `Hi ${name},\n\n${from} has given you ${role} access to the Finance app. Open this link to create your password — it works once, for 7 days:\n\n${link}\n\nIf you weren’t expecting this, you can ignore this email.`],
-    reset: ['Set a new password for the Finance app', `Hi ${name},\n\n${from} has sent you a link to set a new password for the Finance app. It works once, for 7 days:\n\n${link}\n\nIf you didn’t ask for this, tell ${from}.`],
-    signup: ['Finish signing up for the Finance app', `Hi ${name},\n\nSomeone — hopefully you — asked to sign up for the Finance app with this email address. Open this link to choose your password. It works once, for 7 days:\n\n${link}\n\nIf this wasn’t you, ignore this email: nothing changes until the link is used.`],
-  }[kind];
-  try { await sendEmail({ to, subject: mail[0], text: mail[1] }); return 'sent'; }
-  catch { return 'failed'; }
+// a login for a person: their email from People, a role and a password chosen by the admin
+async function createLogin(c, { person, role, password, by }) {
+  if (!person.active) bad(`${person.name} is inactive. Activate them first.`);
+  if (!person.email) bad(`Add ${person.name}’s email address first — it is what they sign in with.`);
+  if (person.user_id) throw err(409, 'conflict', `${person.name} already has a login. Use “Set password” to change it.`);
+  if ((await c.query('SELECT 1 FROM users WHERE email = $1', [person.email])).rowCount) throw err(409, 'conflict', `Someone already signs in with ${person.email}.`);
+  const problem = A.passwordProblem(password);
+  if (problem) bad(`Password: ${problem}`);
+  const { rows: [u] } = await c.query('INSERT INTO users (email, name, pw, role) VALUES ($1, $2, $3, $4) RETURNING id', [person.email, person.name, A.hashPassword(password), role]);
+  await c.query('UPDATE people SET user_id = $2 WHERE id = $1', [person.id, u.id]);
+  await audit(c, by, 'account.create', { person_id: person.id, name: person.name, email: person.email, role });
+  return u;
 }
 // activity log filters: a type is the part of the action before the dot
-const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user', 'invite', 'password', 'access', 'signup'], reports: ['report'] };
+const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user', 'account', 'password', 'access', 'invite', 'signup'], reports: ['report'] };
 const istStart = (d) => new Date(`${d}T00:00:00+05:30`).toISOString();
 
 // makes each active EMI's instalments into payments, up to `through` (once each: a cancelled one stays cancelled)
@@ -473,6 +438,7 @@ const routes = [
       if ((await c.query('SELECT 1 FROM users')).rowCount) throw err(403, 'permission_denied', 'The app is already set up. Sign in instead.');
       const { rows: [u] } = await c.query("INSERT INTO users (email, name, pw, role) VALUES ($1, $2, $3, 'admin') RETURNING id, email, name, role, ver", [e, name, A.hashPassword(body.password)]);
       await audit(c, u.id, 'setup', { email: e });
+      await c.query('INSERT INTO people (name, email, user_id, created_by, updated_by) VALUES ($1, $2, $3, $3, $3)', [name, e, u.id]); // they appear in People
       return u;
     });
     signIn(ctx, user);
@@ -694,6 +660,33 @@ const routes = [
     }).catch(unique(REF_TAKEN));
   }],
 
+  // the Banks page: each account's day — opening balance, debits (money paid out), credits (money received), closing
+  // balance, the day's transactions, and its EMIs (due that day, reserved now, the next one). Same figures as Transactions.
+  ['GET', /^\/api\/banks\/day$/, 'viewer', async ({ url }) => {
+    const today = todayIST(), date = url.searchParams.get('date') ? ymd(url.searchParams.get('date'), 'Date') : today;
+    if (date > today) bad('Pick today or an earlier day.');
+    await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
+    const [banks, balances, entries, moves, sched, pos] = await Promise.all([
+      q('SELECT id, name, bank, last4 FROM banks ORDER BY name, id'), q('SELECT id, bank_id, amount, as_of FROM balances'),
+      q('SELECT kind, bank_id, amount, date FROM entries'), history({ from: date, to: date, bank: null, type: '', q: '' }),
+      emiSchedule({ query: q }, today), position({ query: q }, { today, upTo: today }),
+    ]);
+    const st = bankStatements({ banks: banks.rows, balances: balances.rows, entries: entries.rows, from: date, to: date });
+    const held = new Map(pos.rows.filter((r) => r.id != null).map((r) => [r.id, r.held]));
+    const real = sched.filter((r) => !r.projected);
+    const rows = st.rows.map((b) => ({
+      ...b,
+      debits: moves.filter((m) => m.bank_id === b.id && m.kind === 'OUT').map((m) => ({ name: m.name, amount: m.amount, ref: m.bank_ref, note: m.note || (m.emi ? 'EMI' : m.category) })),
+      credits: moves.filter((m) => m.bank_id === b.id && m.kind === 'IN').map((m) => ({ name: m.name, amount: m.amount, ref: m.bank_ref, note: m.note })),
+      emisDue: real.filter((r) => r.bank_id === b.id && r.due_date === date && r.state !== 'cancelled')
+        .map((r) => ({ lender: r.lender, amount: r.amount, paid: r.paid, left: r.left, state: r.state, paid_on: r.last_date })),
+      reserved: held.get(b.id) ?? 0,
+      nextEmi: (({ lender, left, due_date } = {}) => (lender ? { lender, amount: left, due_date } : null))(real.find((r) => r.bank_id === b.id && r.due_date > date && r.left > 0)),
+    }));
+    const total = { ...st.total, reserved: rows.reduce((n, r) => n + r.reserved, 0), emiDue: rows.reduce((n, r) => n + r.emisDue.reduce((m, e) => m + e.amount, 0), 0) };
+    return { date, today, banks: rows, total };
+  }],
+
   ['GET', /^\/api\/transactions\/summary$/, 'viewer', async ({ url }) => {
     const f = txFilters(url), today = todayIST();
     await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
@@ -747,7 +740,11 @@ const routes = [
       return await withTx(async (c) => {
         const { rows: [u] } = await c.query('INSERT INTO users (email, name, pw, role) VALUES ($1, $2, $3, $4) RETURNING id', [e, name, A.hashPassword(body.password), role]);
         await audit(c, user.id, 'user.add', { id: u.id, email: e, role });
-        await c.query('UPDATE people SET user_id = $1 WHERE lower(email) = $2 AND user_id IS NULL', [u.id, e]); // their entry in People shows their access
+        // their entry in People shows their access; if they aren't in People yet, they are added
+        const linked = await c.query('UPDATE people SET user_id = $1 WHERE lower(email) = $2 AND user_id IS NULL', [u.id, e]);
+        if (!linked.rowCount && !(await c.query('SELECT 1 FROM people WHERE lower(email) = $1', [e])).rowCount) {
+          await c.query('INSERT INTO people (name, email, user_id, created_by, updated_by) VALUES ($1, $2, $3, $4, $4)', [name, e, u.id, user.id]);
+        }
         return u;
       });
     } catch (x) {
@@ -792,7 +789,7 @@ const routes = [
     }).catch(unique('A position with that name already exists.'));
   }],
 
-  ['POST', /^\/api\/positions\/(\d+)\/assign$/, 'editor', async ({ body, user, m }) => withTx(async (c) => {
+  ['POST', /^\/api\/positions\/(\d+)\/assign$/, 'admin', async ({ body, user, m }) => withTx(async (c) => {
     const positionId = await usablePosition(c, intId(m[1], 'Position')), personId = intId(body.person_id, 'Person');
     const { rows: [p] } = await c.query('SELECT name, position_id, active FROM people WHERE id = $1 FOR UPDATE', [personId]);
     if (!p) notFound('That person doesn’t exist.');
@@ -805,40 +802,26 @@ const routes = [
 
   // ── people ──
   // viewers see names and positions; contact details and notes are for editors and admins
-  // ── app access for people: invite links, password-reset links, removing access ──
-  // an admin invites a person (who needs an email address) with a role; they open the link and choose their own password
-  ['POST', /^\/api\/people\/(\d+)\/invite$/, 'admin', async ({ body, user, m, req }) => {
+  // ── logins for people: only admins create them, with the person's email from People and a password they set ──
+  ['POST', /^\/api\/people\/(\d+)\/login$/, 'admin', async ({ body, user, m }) => withTx(async (c) => {
     const role = oneOf(body.role || 'viewer', ['viewer', 'editor', 'admin'], 'Role');
-    const made = await withTx(async (c) => {
-      const p = await personForLink(c, intId(m[1]));
-      if (p.user_id) throw err(409, 'conflict', `${p.name} already has access. Use “Password reset link” if they can’t sign in.`);
-      if ((await c.query('SELECT 1 FROM users WHERE email = $1', [p.email])).rowCount) throw err(409, 'conflict', `Someone already signs in with ${p.email}.`);
-      return { p, ...(await makeLink(c, { kind: 'invite', person: p, userId: null, role, by: user.id, req })) };
-    });
-    const emailed = await emailLink({ kind: 'invite', to: made.p.email, name: made.p.name, link: made.link, role, from: user.name });
-    await log(user.id, 'invite.create', { id: made.id, person_id: made.p.id, name: made.p.name, email: made.p.email, role, emailed });
-    return { link: made.link, expires_at: made.expires_at, emailed };
-  }],
+    const { rows: [p] } = await c.query('SELECT id, name, email, active, user_id FROM people WHERE id = $1 FOR UPDATE', [intId(m[1])]);
+    if (!p) notFound('That person doesn’t exist.');
+    await createLogin(c, { person: p, role, password: body.password, by: user.id });
+    return {};
+  })],
 
-  // a new password for someone who already has access (their other sessions end when they set it)
-  ['POST', /^\/api\/people\/(\d+)\/reset-link$/, 'admin', async ({ user, m, req }) => {
-    const made = await withTx(async (c) => {
-      const p = await personForLink(c, intId(m[1]));
-      const { rows: [u] } = await c.query('SELECT id, active FROM users WHERE id = $1', [p.user_id]);
-      if (!u) bad(`${p.name} doesn’t have access yet. Use “Invite” instead.`);
-      if (!u.active) bad(`${p.name}’s access is removed. Restore it first.`);
-      return { p, ...(await makeLink(c, { kind: 'reset', person: p, userId: u.id, role: null, by: user.id, req })) };
-    });
-    const emailed = await emailLink({ kind: 'reset', to: made.p.email, name: made.p.name, link: made.link, from: user.name });
-    await log(user.id, 'invite.reset_link', { id: made.id, person_id: made.p.id, name: made.p.name, emailed });
-    return { link: made.link, expires_at: made.expires_at, emailed };
-  }],
-
-  ['POST', /^\/api\/people\/(\d+)\/invite\/cancel$/, 'admin', async ({ user, m }) => withTx(async (c) => {
-    const id = intId(m[1]);
-    const { rows } = await c.query('UPDATE invites SET revoked_at = now() WHERE person_id = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now() RETURNING id', [id]);
-    if (!rows.length) notFound('There is no open link to cancel.');
-    await audit(c, user.id, 'invite.cancel', { person_id: id, links: rows.map((r) => r.id) });
+  // a new password for someone who forgot theirs; they are signed out everywhere and use the new one
+  ['POST', /^\/api\/people\/(\d+)\/password$/, 'admin', async ({ body, user, m }) => withTx(async (c) => {
+    const { rows: [p] } = await c.query('SELECT x.id, x.name, x.user_id, u.active FROM people x LEFT JOIN users u ON u.id = x.user_id WHERE x.id = $1', [intId(m[1])]);
+    if (!p) notFound('That person doesn’t exist.');
+    if (!p.user_id) bad(`${p.name} doesn’t have a login yet. Use “Create login”.`);
+    if (p.user_id === user.id) bad('To change your own password, use “Change password” at the top.');
+    if (!p.active) bad(`${p.name}’s access is removed. Restore it first.`);
+    const problem = A.passwordProblem(body.password);
+    if (problem) bad(`Password: ${problem}`);
+    await c.query('UPDATE users SET pw = $2, ver = ver + 1, fails = 0, lock_until = 0 WHERE id = $1', [p.user_id, A.hashPassword(body.password)]);
+    await audit(c, user.id, 'account.password', { person_id: p.id, name: p.name, user_id: p.user_id });
     return {};
   })],
 
@@ -855,7 +838,7 @@ const routes = [
     return {};
   })],
 
-  // remove (or give back) a person's access; removing signs them out everywhere and cancels open links
+  // remove (or give back) a person's access; removing signs them out everywhere
   ['POST', /^\/api\/people\/(\d+)\/access$/, 'admin', async ({ body, user, m }) => withTx(async (c) => {
     const active = body.active === true;
     const { rows: [p] } = await c.query('SELECT x.id, x.name, x.user_id, u.role, u.active FROM people x LEFT JOIN users u ON u.id = x.user_id WHERE x.id = $1', [intId(m[1])]);
@@ -865,76 +848,11 @@ const routes = [
     if (!active) {
       if (p.user_id === user.id) bad('You can’t remove your own access.');
       if (p.role === 'admin' && Number((await c.query("SELECT count(*) AS n FROM users WHERE role = 'admin' AND active")).rows[0].n) <= 1) bad('This is the only admin. Make someone else an admin first.');
-      await c.query('UPDATE invites SET revoked_at = now() WHERE person_id = $1 AND used_at IS NULL AND revoked_at IS NULL', [p.id]);
     }
     await c.query('UPDATE users SET active = $2, ver = ver + 1 WHERE id = $1', [p.user_id, active]);
     await audit(c, user.id, active ? 'access.restore' : 'access.remove', { person_id: p.id, name: p.name, user_id: p.user_id });
     return {};
   })],
-
-  // sign up from the login page: only for someone in People whose email isn't signed up yet. The link goes to their
-  // email (proving it is theirs); without email set up, the admins are asked to send an invite instead. The answer is
-  // the same whatever the email, so nobody can use this to find out who is in People.
-  ['POST', /^\/api\/signup$/, null, async ({ body, req }) => {
-    const e = str(body.email, 200).toLowerCase();
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)) bad('Enter a valid email address.');
-    signupLimit(req);
-    const { rows: [p] } = await q(`SELECT x.id, x.name, x.email, x.active, x.user_id, EXISTS (SELECT 1 FROM users u WHERE u.email = x.email) AS taken,
-        (SELECT max(i.created_at) FROM invites i WHERE i.person_id = x.id AND i.created_by IS NULL) AS last_signup,
-        (SELECT i.role FROM invites i WHERE i.person_id = x.id AND i.used_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > now() ORDER BY i.id DESC LIMIT 1) AS open_role
-      FROM people x WHERE x.email = $1 AND x.email <> ''`, [e]);
-    const eligible = p && p.active && !p.user_id && !p.taken;
-    if (!eligible) { await log(null, 'signup.request', { email: e, matched: false }); return { ok: true }; }
-    if (p.last_signup && Date.now() - new Date(p.last_signup) < 10 * 60000) return { ok: true }; // a link went out minutes ago
-    if (emailConfigured()) {
-      // an invite an admin already sent keeps its role; otherwise sign-ups start as viewers
-      const role = p.open_role ?? 'viewer';
-      const made = await withTx((c) => makeLink(c, { kind: 'invite', person: p, userId: null, role, by: null, req }));
-      const emailed = await emailLink({ kind: 'signup', to: p.email, name: p.name, link: made.link });
-      await log(null, 'signup.request', { email: e, person_id: p.id, name: p.name, matched: true, role, emailed });
-    } else {
-      await withTx(async (c) => {
-        const { rows: admins } = await c.query("SELECT id FROM users WHERE role = 'admin' AND active");
-        for (const a of admins) {
-          await c.query(`INSERT INTO notifications (user_id, kind, title, body, link, dedupe_key) VALUES ($1, 'signup', $2, $3, 'people', $4) ON CONFLICT (user_id, dedupe_key) DO NOTHING`,
-            [a.id, `${p.name} (${p.email}) wants to sign up`, 'Email isn’t set up, so the app can’t send them a link. Open People and use “Invite”.', `signup:${p.id}:${todayIST()}`]);
-        }
-        await audit(c, null, 'signup.request', { email: e, person_id: p.id, name: p.name, matched: true, emailed: 'not set up', admins: admins.length });
-      });
-    }
-    return { ok: true };
-  }],
-
-  // the link's page asks who it is for, then the person sets their password (no sign-in needed: the link is the proof)
-  ['POST', /^\/api\/invites\/check$/, null, async ({ body }) => {
-    const i = await openLink({ query: q }, body.token);
-    return { kind: i.kind, name: i.person_name, email: i.email, role: i.role ?? i.user_role, expires_at: i.expires_at };
-  }],
-
-  ['POST', /^\/api\/invites\/accept$/, null, async (ctx) => {
-    const { body } = ctx, problem = A.passwordProblem(body.password);
-    if (problem) bad(problem);
-    const user = await withTx(async (c) => {
-      const i = await openLink(c, body.token, true);
-      let u;
-      if (i.kind === 'invite') {
-        if (!i.person_active) throw err(410, 'link_invalid', 'This invitation is no longer valid. Ask your admin for a new one.');
-        if ((await c.query('SELECT 1 FROM users WHERE email = $1', [i.email])).rowCount) throw err(409, 'conflict', `An account for ${i.email} already exists. Sign in instead.`);
-        ({ rows: [u] } = await c.query('INSERT INTO users (email, name, pw, role) VALUES ($1, $2, $3, $4) RETURNING id, email, name, role, ver',
-          [i.email, str(body.name, 100) || i.person_name, A.hashPassword(body.password), i.role]));
-        await c.query('UPDATE people SET user_id = $2 WHERE id = $1', [i.person_id, u.id]);
-        await audit(c, u.id, 'invite.accept', { id: i.id, person_id: i.person_id, email: i.email, role: i.role });
-      } else {
-        if (!i.user_active) throw err(410, 'link_invalid', 'This account’s access has been removed. Ask your admin.');
-        ({ rows: [u] } = await c.query('UPDATE users SET pw = $2, ver = ver + 1, fails = 0, lock_until = 0 WHERE id = $1 RETURNING id, email, name, role, ver', [i.user_id, A.hashPassword(body.password)]));
-        await audit(c, u.id, 'password.reset', { id: i.id, person_id: i.person_id });
-      }
-      await c.query('UPDATE invites SET used_at = now() WHERE id = $1', [i.id]);
-      return u;
-    });
-    signIn(ctx, user);
-    return { user };
-  }],
 
   // anyone signed in can change their own password; their other sessions end
   ['POST', /^\/api\/me\/password$/, 'viewer', async (ctx) => {
@@ -967,19 +885,17 @@ const routes = [
       const t = arg(likeTerm(term));
       where.push(`(x.name ILIKE ${t} OR coalesce(ps.name, '') ILIKE ${t}${hide ? '' : ` OR x.email ILIKE ${t} OR x.phone ILIKE ${t}`})`);
     }
-    // app access: their account's role and whether it is active, or an open invite / reset link
+    // app access: their login's role and whether it is active
     const { rows } = await q(`SELECT x.id, x.name, x.email, x.phone, x.notes, x.position_id, ps.name AS position, ps.active AS position_active, x.active,
         x.created_at, cu.name AS created_by, x.updated_at, uu.name AS updated_by,
-        x.user_id, au.role AS access_role, au.active AS access_active,
-        (SELECT json_build_object('kind', i.kind, 'role', i.role, 'expires_at', i.expires_at) FROM invites i
-          WHERE i.person_id = x.id AND i.used_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > now() ORDER BY i.id DESC LIMIT 1) AS open_link
+        x.user_id, au.role AS access_role, au.active AS access_active
       FROM people x LEFT JOIN positions ps ON ps.id = x.position_id LEFT JOIN users cu ON cu.id = x.created_by LEFT JOIN users uu ON uu.id = x.updated_by
         LEFT JOIN users au ON au.id = x.user_id
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY lower(x.name), x.id LIMIT 500`, args);
-    return { contactsHidden: hide, people: hide ? rows.map(({ email: _e, phone: _p, notes: _n, user_id: _u, access_role: _r, access_active: _a, open_link: _l, ...r }) => r) : rows };
+    return { contactsHidden: hide, people: hide ? rows.map(({ email: _e, phone: _p, notes: _n, user_id: _u, access_role: _r, access_active: _a, ...r }) => r) : rows };
   }],
 
-  ['POST', /^\/api\/people$/, 'editor', async ({ body, user }) => {
+  ['POST', /^\/api\/people$/, 'admin', async ({ body, user }) => {
     const v = { name: need(str(body.name, 120), 'Name'), email: optEmail(body.email), phone: phone(body.phone), position_id: optPosition(body.position_id), notes: str(body.notes, 500) };
     return withTx(async (c) => {
       await usablePosition(c, v.position_id);
@@ -987,11 +903,16 @@ const routes = [
         [v.name, v.email, v.phone, v.position_id, v.notes, user.id]);
       await audit(c, user.id, 'person.add', { id: x.id, name: v.name, position_id: v.position_id });
       await linkUser(c, x.id);
+      // a login at the same time, if the admin chose a role
+      if (body.login_role) {
+        const role = oneOf(body.login_role, ['viewer', 'editor', 'admin'], 'Login role');
+        await createLogin(c, { person: { id: x.id, name: v.name, email: v.email, active: true, user_id: null }, role, password: body.password, by: user.id });
+      }
       return x;
     }).catch(unique('Someone in People already has that email.'));
   }],
 
-  ['POST', /^\/api\/people\/(\d+)$/, 'editor', async ({ body, user, m }) => {
+  ['POST', /^\/api\/people\/(\d+)$/, 'admin', async ({ body, user, m }) => {
     const id = intId(m[1]);
     return withTx(async (c) => {
       const { rows: [old] } = await c.query('SELECT name, email, phone, position_id, notes, user_id FROM people WHERE id = $1 FOR UPDATE', [id]);
@@ -1017,7 +938,7 @@ const routes = [
     }).catch(unique('Someone in People already has that email.'));
   }],
 
-  ['POST', /^\/api\/people\/(\d+)\/active$/, 'editor', async ({ body, user, m }) => withTx(async (c) => {
+  ['POST', /^\/api\/people\/(\d+)\/active$/, 'admin', async ({ body, user, m }) => withTx(async (c) => {
     const id = intId(m[1]), active = body.active === true;
     const { rows: [p] } = await c.query('UPDATE people SET active = $2, updated_by = $3, updated_at = now() WHERE id = $1 AND active <> $2 RETURNING name', [id, active, user.id]);
     if (!p) notFound(active ? 'That person is already active.' : 'That person is already inactive.');
