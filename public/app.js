@@ -4,7 +4,7 @@
 const app = document.getElementById('app'), dlg = document.getElementById('dlg');
 const S = { user: null, today: '', date: '', approvedOnly: false, uncertain: true, pos: null };
 // what one signed-in person was looking at; cleared on sign-out so the next person starts fresh
-const fresh = () => Object.assign(S, { view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, tf: null, approvedOnly: false, uncertain: true });
+const fresh = () => Object.assign(S, { view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, tf: null, ef: null, notes: null, notesAt: 0, approvedOnly: false, uncertain: true });
 fresh();
 
 function h(tag, attrs, ...kids) {
@@ -68,12 +68,16 @@ function openDialog(title, fields, submitLabel, onSubmit, intro, wide = false) {
   dlg.showModal();
 }
 // asks before adding something that looks like a duplicate
+const confirmCode = async (code, send) => {
+  try { return await send(false); } catch (e) { if (e.code === code && confirm(e.message)) return send(true); throw e; }
+};
 const confirmDup = async (send) => {
   try { return await send(false); } catch (e) { if (e.code === 'duplicate' && confirm(e.message)) return send(true); throw e; }
 };
 
 // ── sign in / first-time setup ──
 function authScreen(needsSetup) {
+  document.body.classList.remove('has-shell', 'nav-open');
   const fields = needsSetup
     ? [{ name: 'name', label: 'Your name', required: true }, { name: 'email', label: 'Email', type: 'email', required: true, autocomplete: 'username' },
       { name: 'password', label: 'Password', type: 'password', required: true, autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers.' }]
@@ -84,21 +88,83 @@ function authScreen(needsSetup) {
     form(fields, needsSetup ? 'Create account' : 'Sign in', async (v) => { S.user = (await api(needsSetup ? '/api/setup' : '/api/login', v)).user; await load(); })));
 }
 
-// ── the page shown: the day's position, People, Positions, or the activity log ──
+// ── the page shown: the dashboard, Transactions, EMIs, People, Positions, or the activity log ──
 async function load() {
   if (S.view === 'activity' && !can('admin')) S.view = 'position';
-  try { await ({ position: loadPosition, transactions: loadTransactions, people: loadPeople, positions: loadPositions, activity: loadActivity })[S.view](); }
+  try { await ({ position: loadPosition, transactions: loadTransactions, emis: loadEmis, people: loadPeople, positions: loadPositions, activity: loadActivity })[S.view](); }
   catch (e) { if (S.user) app.replaceChildren(topBar(), h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again'))); }
 }
 
+// simple line icons (stroke paths on a 24×24 grid)
+const ICONS = {
+  home: 'M3 11l9-8 9 8M5 10v10h14V10M10 20v-6h4v6', swap: 'M4 7h14l-4-4M20 17H6l4 4', list: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01',
+  calendar: 'M3 5h18v16H3zM16 3v4M8 3v4M3 10h18', users: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8',
+  badge: 'M3 7h18v13H3zM9 7V4h6v3M3 13h18', shield: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z', bell: 'M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0',
+  menu: 'M3 6h18M3 12h18M3 18h18', wallet: 'M3 7h18v13H3zM16 14h2M3 7l3-4h12l3 4',
+};
+function icon(name) {
+  const ns = 'http://www.w3.org/2000/svg', svg = document.createElementNS(ns, 'svg'), p = document.createElementNS(ns, 'path');
+  for (const [k, v] of Object.entries({ viewBox: '0 0 24 24', width: '20', height: '20', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true' })) svg.setAttribute(k, v);
+  p.setAttribute('d', ICONS[name]); svg.append(p);
+  return svg;
+}
+const navKey = () => (S.view === 'transactions' ? `transactions:${S.tf?.view ?? 'history'}` : S.view);
+function go(key) {
+  document.body.classList.remove('nav-open');
+  const [view, sub] = key.split(':');
+  if (view === 'transactions') S.tf = { ...(S.tf ?? txDefaults()), view: sub };
+  S.view = view;
+  load();
+}
+
+// the fixed left sidebar and the header (reminders bell, who is signed in); on phones the sidebar slides in
 function topBar() {
-  const tabs = [['position', 'Bank position'], ['transactions', 'Transactions'], ['people', 'People'], ['positions', 'Positions'], can('admin') && ['activity', 'Activity log']].filter(Boolean);
-  return h('div', { class: 'topbar' },
-    h('nav', { class: 'tabs', 'aria-label': 'Sections' }, tabs.map(([v, t]) => h('button', {
-      class: `tab ${v === S.view ? 'on' : ''}`, 'aria-current': v === S.view ? 'page' : null, onclick: () => { if (S.view !== v) { S.view = v; load(); } },
-    }, t))),
-    h('div', { class: 'who' }, h('span', { class: 'avatar' }, S.user.name.trim().slice(0, 1).toUpperCase()), h('span', { class: 'who-name' }, S.user.name, h('small', {}, S.user.role)),
-      h('button', { class: 'small', onclick: async () => { await api('/api/logout', {}); S.user = null; fresh(); boot(); } }, 'Sign out')));
+  document.body.classList.add('has-shell');
+  const items = [['position', 'Dashboard', 'home'], ['transactions:records', 'Receipts & Payments', 'swap'], ['transactions:history', 'Transaction History', 'list'],
+    ['emis', 'EMI Management', 'calendar'], ['people', 'People', 'users'], ['positions', 'Positions', 'badge'], can('admin') && ['activity', 'Activity Log', 'shield']].filter(Boolean);
+  const unread = S.notes?.unread ?? 0;
+  if (Date.now() - S.notesAt > 60000) refreshNotes();
+  return h('div', { class: 'chrome' },
+    h('aside', { class: 'sidebar', 'aria-label': 'Main menu' },
+      h('div', { class: 'brand' }, icon('wallet'), h('div', {}, h('strong', {}, 'Finance'), h('small', {}, 'Bank, EMIs & people'))),
+      h('nav', {}, items.map(([k, t, ic]) => h('button', { class: `nav-item ${navKey() === k ? 'on' : ''}`, 'aria-current': navKey() === k ? 'page' : null, onclick: () => go(k) }, icon(ic), h('span', {}, t))))),
+    h('div', { class: 'scrim', onclick: () => document.body.classList.remove('nav-open') }),
+    h('header', { class: 'topbar' },
+      h('button', { class: 'icon-btn menu-btn', 'aria-label': 'Open menu', onclick: () => document.body.classList.toggle('nav-open') }, icon('menu')),
+      h('span', { class: 'grow' }),
+      h('div', { class: 'bell-wrap' },
+        h('button', { class: 'icon-btn bell', id: 'bell', 'aria-label': `Reminders${unread ? `, ${unread} unread` : ''}`, onclick: toggleNotes }, icon('bell'), h('span', { class: 'badge', id: 'bell-badge', hidden: !unread }, unread > 99 ? '99+' : unread)),
+        h('div', { class: 'notes-panel', id: 'notes', hidden: true })),
+      h('div', { class: 'who' }, h('span', { class: 'avatar' }, S.user.name.trim().slice(0, 1).toUpperCase()), h('span', { class: 'who-name' }, S.user.name, h('small', {}, S.user.role)),
+        h('button', { class: 'small', onclick: async () => { await api('/api/logout', {}); S.user = null; fresh(); document.body.classList.remove('has-shell', 'nav-open'); boot(); } }, 'Sign out'))));
+}
+
+// in-app reminders: fetched at most once a minute; the bell shows how many are unread
+async function refreshNotes() {
+  S.notesAt = Date.now();
+  try { S.notes = await api('/api/notifications'); } catch { return; }
+  const b = document.getElementById('bell-badge');
+  if (b) { b.hidden = !S.notes.unread; b.textContent = S.notes.unread > 99 ? '99+' : S.notes.unread; }
+  const p = document.getElementById('notes');
+  if (p && !p.hidden) fillNotes(p);
+}
+function toggleNotes() {
+  const p = document.getElementById('notes');
+  p.hidden = !p.hidden;
+  if (!p.hidden) { fillNotes(p); refreshNotes(); }
+}
+function fillNotes(p) {
+  const items = S.notes?.items ?? [];
+  const tone = { overdue: 'c-red', shortfall: 'c-red', due: 'c-amber', upcoming: 'c-blue' };
+  p.replaceChildren(
+    h('div', { class: 'notes-head' }, h('strong', {}, 'Reminders'),
+      items.some((n) => !n.read_at) && h('button', { class: 'small', onclick: async () => { await api('/api/notifications/read', { all: true }); S.notesAt = 0; await refreshNotes(); } }, 'Mark all read')),
+    // replaceChildren takes each element as its own argument, so the list is spread
+    ...(items.length ? items.map((n) => h('button', { class: `note ${n.read_at ? '' : 'unread'}`, onclick: async () => {
+      if (!n.read_at) await api('/api/notifications/read', { id: n.id }).catch(() => {});
+      S.notesAt = 0; go('emis');
+    } }, h('span', { class: `chip ${tone[n.kind] ?? ''}` }, n.kind), h('span', { class: 'note-title' }, n.title), h('span', { class: 'muted small' }, when(n.created_at))))
+      : [h('p', { class: 'empty' }, 'No reminders yet.')]));
 }
 
 // ── the day's position ──
@@ -156,7 +222,7 @@ function render() {
       can('editor') && P.banks.length > 0 && h('button', { class: 'c-blue', onclick: () => balanceDialog(bankOpts) }, 'Enter bank balance'),
       can('editor') && h('button', { class: 'c-red', onclick: () => paymentDialog(anyBank) }, '+ Payment'),
       can('editor') && h('button', { class: 'c-green', onclick: () => receiptDialog(anyBank) }, '+ Receipt'),
-      P.banks.length > 0 && h('button', { class: 'c-amber', onclick: () => emisDialog(bankOpts) }, 'EMIs'),
+      P.banks.length > 0 && h('button', { class: 'c-amber', onclick: () => go('emis') }, 'EMIs'),
       can('admin') && h('button', { onclick: bankDialog }, '+ Account'),
       can('admin') && h('button', { onclick: usersDialog }, 'Users')));
 
@@ -217,40 +283,6 @@ function itemRow(i, bankOpts) {
     h('div', { class: 'item-amt' }, money(i.amount, i.emi ? 'amber' : out ? 'red' : 'pos')));
 }
 
-async function emisDialog(bankOpts) {
-  let data;
-  try { data = await api('/api/emis'); } catch (e) { return alert(e.message); }
-  const list = h('div', { class: 'emi-list' },
-    data.emis.length ? data.emis.map((e) => h('div', { class: `emi-row ${e.active ? '' : 'stopped'}` },
-      h('div', {},
-        h('strong', {}, e.lender), e.ref && h('span', { class: 'muted' }, ` · ${e.ref}`),
-        h('div', { class: 'muted small' }, `${e.bank_name} · every month on day ${e.day}` +
-          (e.hold_days ? ` · held from ${e.hold_days} day(s) before` : ' · held on the EMI day') +
-          (e.active ? (e.next_due ? ` · next ${nice(e.next_due)}` : '') : ' · stopped'))),
-      h('div', { class: 'emi-right' }, money(e.amount, 'amber'),
-        e.active && can('editor') && h('button', { class: 'small', onclick: async () => {
-          if (!confirm(`Stop the EMI “${e.lender}”? Instalments after today that have nothing paid will be removed.`)) return;
-          try { await api(`/api/emis/${e.id}/stop`, {}); dlg.close(); await load(); emisDialog(bankOpts); } catch (x) { alert(x.message); }
-        } }, 'Stop'))))
-      : h('p', { class: 'empty' }, 'No EMIs yet.'),
-    can('editor') && h('h3', {}, 'Add an EMI'));
-  if (!can('editor')) {
-    dlg.className = 'wide';
-    dlg.replaceChildren(h('h2', {}, 'EMIs'), list, h('div', { class: 'bar' }, h('button', { onclick: () => dlg.close() }, 'Close')));
-    return dlg.showModal();
-  }
-  openDialog('EMIs', [
-    { name: 'lender', label: 'Lender / loan', placeholder: 'e.g. HDFC car loan', required: true },
-    { name: 'amount', label: 'EMI amount (₹)', type: 'money', required: true },
-    { name: 'bank_id', label: 'Paid from account', type: 'select', options: bankOpts, required: true },
-    { name: 'start_date', label: 'Next EMI date', type: 'date', min: addDays(S.pos.today, -31), required: true, hint: 'It repeats on this day every month.' },
-    { name: 'hold_days', label: 'Hold the money from', type: 'select', value: '0', options: [['0', 'The EMI day only'], ['1', '1 day before'], ['2', '2 days before'], ['3', '3 days before'], ['5', '5 days before'], ['7', '7 days before'], ['10', '10 days before'], ['15', '15 days before']],
-      hint: 'While held, the app won’t let that money be paid to anyone else from this account.' },
-    { name: 'end_date', label: 'Last EMI date (optional)', type: 'date' },
-    { name: 'ref', label: 'Loan account no. (optional)' },
-  ], 'Add EMI', (v) => api('/api/emis', v), list, true);
-}
-
 const act = async (path, body) => { try { await api(path, body); await load(); } catch (e) { alert(e.message); } };
 
 // ── dialogs ──
@@ -261,7 +293,7 @@ function settleDialog(i, bankOpts) {
     { name: 'bank_id', label: out ? 'Paid from' : 'Received in', type: 'select', value: i.bankId ?? (bankOpts.length === 1 ? bankOpts[0][0] : ''), options: [['', 'Choose…'], ...bankOpts], required: true },
     { name: 'date', label: 'Date in the bank', type: 'date', value: S.today, max: S.today, required: true },
     { name: 'ref', label: 'Bank reference (UTR / cheque no.)', required: true },
-  ], 'Save', (v) => api(`/api/${out ? 'payments' : 'receipts'}/${i.id}/settle`, v));
+  ], 'Save', (v) => confirmCode('insufficient', (ok) => api(`/api/${out ? 'payments' : 'receipts'}/${i.id}/settle`, { ...v, confirmShortfall: ok })));
 }
 
 function balanceDialog(bankOpts) {
@@ -330,13 +362,14 @@ function period(preset, today = S.today) {
   if (preset === 'fy') return { from: `${m >= 4 ? y : y - 1}-04-01`, to: today }; // Indian financial year, April to March
   return { from: monthStart(today), to: today };
 }
+const txDefaults = () => ({ preset: 'month', ...period('month'), bank: '', type: '', status: '', q: '', view: 'history' });
 const txQuery = (extra = {}) => {
   const f = S.tf;
   return new URLSearchParams(Object.entries({ view: f.view, from: f.from, to: f.to, bank: f.bank, type: f.type, status: f.view === 'records' ? f.status : '', q: f.q, ...extra }).filter(([, v]) => v));
 };
 
 async function loadTransactions() {
-  if (!S.tf) S.tf = { preset: 'month', ...period('month'), bank: '', type: '', status: '', q: '', view: 'history' };
+  if (!S.tf) S.tf = txDefaults();
   const [sum, list] = await Promise.all([api(`/api/transactions/summary?${txQuery({ view: '' })}`), api(`/api/transactions?${txQuery()}`)]);
   keepFocus(() => renderTransactions(sum, list.rows));
 }
@@ -458,6 +491,137 @@ function txDialog(kind, accounts) {
     { name: 'note', label: 'Description (optional)' },
     ...(out && can('admin') ? [{ name: 'approved', label: 'Approved', type: 'checkbox', value: true }] : []),
   ], out ? 'Record payment' : 'Record receipt', (v) => confirmDup((dup) => api('/api/transactions', { ...v, kind, confirmDuplicate: dup })));
+}
+
+// ── EMI management: loans, the money held for them, the schedule, and reminders ──
+const EMI_STATE = { overdue: ['Overdue', 'c-red'], due: ['Due today', 'c-amber'], upcoming: ['Upcoming', 'c-blue'], scheduled: ['Scheduled', ''], paid: ['Paid', 'c-green'], cancelled: ['Cancelled', ''] };
+const HOLD_OPTS = [['0', 'The EMI day only'], ['1', '1 day before'], ['2', '2 days before'], ['3', '3 days before'], ['5', '5 days before'], ['7', '7 days before'], ['10', '10 days before'], ['15', '15 days before']];
+const REMIND_OPTS = [['0', 'No advance reminder'], ['1', '1 day before'], ['2', '2 days before'], ['3', '3 days before'], ['5', '5 days before'], ['7', '7 days before'], ['10', '10 days before'], ['15', '15 days before']];
+
+async function loadEmis() {
+  if (!S.ef) S.ef = { status: 'open', emi: '', bank: '' };
+  const qs = new URLSearchParams(Object.entries(S.ef).filter(([, v]) => v));
+  const [ov, list, sched, rem] = await Promise.all([api('/api/emis/overview'), api('/api/emis'), api(`/api/emis/schedule?${qs}`), can('admin') ? api('/api/reminders/status') : null]);
+  renderEmis(ov, list.emis, sched.rows, rem);
+}
+
+function renderEmis(ov, emis, rows, rem) {
+  const T = ov.totals, f = S.ef;
+  const bankOpts = ov.accounts.map((b) => [b.id, `${b.name} — ${b.bank}`]);
+  const tile = (cls, label, p, sub) => h('div', { class: `tile ${cls}` }, h('div', { class: 'tile-lbl' }, label), h('div', { class: `tile-amt ${p < 0 ? 'neg' : ''}` }, inr(p)), sub && h('div', { class: 'tile-sub' }, sub));
+  const summary = h('header', { class: 'hero' },
+    h('div', { class: 'hero-top' }, h('div', {}, h('div', { class: 'eyebrow' }, `Today · ${nice(ov.today)}`), h('h1', {}, 'EMIs at a glance'))),
+    h('div', { class: 'tiles' },
+      tile('t-hold', 'Reserved for EMIs', T.reserved, 'Held in the accounts — can’t be paid to anyone else'),
+      tile(T.available < 0 ? 't-fin bad' : 't-fin', 'Available to spend', T.available, `Balance ${inr(T.balance)} − reserved`),
+      tile('t-pay', `Overdue (${T.overdue.count})`, T.overdue.amount, T.overdue.count ? 'Unpaid after the due date' : 'Nothing overdue'),
+      tile('t-bal', `Due in 30 days (${T.due.count + T.upcoming.count})`, T.due.amount + T.upcoming.amount, `${T.active} active EMI(s) · ${inr(T.monthly)} a month`)));
+
+  const accounts = ov.accounts.length > 0 && h('div', { class: 'bank-cards' }, ov.accounts.map((a) => h('section', { class: `bank-card ${a.available < 0 ? 'short' : ''}` },
+    h('div', { class: 'bc-head' }, h('div', {}, h('strong', {}, a.name), h('div', { class: 'muted small' }, a.bank)),
+      a.available < 0 ? h('span', { class: 'chip c-red' }, `short by ${inr(-a.available)}`) : a.reserved > 0 ? h('span', { class: 'chip c-amber' }, 'money held') : null),
+    h('div', { class: `bc-amt ${a.available < 0 ? 'neg' : ''}` }, inr(a.available)),
+    h('div', { class: 'muted small bc-cap' }, 'available to spend'),
+    h('div', { class: 'bc-line' }, h('span', { class: 'muted' }, 'Balance now'), money(a.balance)),
+    h('div', { class: 'bc-line' }, h('span', { class: 'muted' }, '− Reserved for EMIs'), money(a.reserved, 'amber')),
+    h('div', { class: 'bc-line total' }, h('span', {}, '= Available'), money(a.available)),
+    h('div', { class: 'muted small bc-next' }, a.next ? `Next: ${a.next.lender} ${inr(a.next.left)} on ${nice(a.next.due_date)}` : 'No EMIs due from this account'),
+    !a.balanceEntered && h('div', { class: 'muted small' }, 'No bank balance entered yet.'))));
+
+  const loans = h('section', { class: 'card' },
+    h('h2', {}, h('span', { class: 'dot d-amber' }), 'Loans', h('span', { class: 'count' }, emis.filter((e) => e.active).length)),
+    emis.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Loan'), h('th', {}, 'Account'), h('th', { class: 'num' }, 'EMI'), h('th', {}, 'Every month'), h('th', {}, 'Money held'), h('th', {}, 'Reminders'), h('th', {}, 'Next due'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
+      h('tbody', {}, emis.map((e) => h('tr', { class: e.active ? '' : 'inactive' },
+        h('td', {}, h('strong', {}, e.lender), e.ref && h('div', { class: 'muted small' }, e.ref)),
+        h('td', {}, e.bank_name),
+        h('td', { class: 'num' }, money(e.amount, 'amber')),
+        h('td', { class: 'nowrap' }, `Day ${e.day}`, e.end_date && h('div', { class: 'muted small' }, `until ${nice(e.end_date)}`)),
+        h('td', {}, e.hold_days ? `${e.hold_days} day(s) before` : 'On the EMI day'),
+        h('td', {}, h('div', { class: 'chips' },
+          e.remind_in_app ? h('span', { class: 'chip c-blue' }, `In-app${e.remind_days ? ` · ${e.remind_days}d before` : ''}`) : null,
+          e.remind_email ? h('span', { class: 'chip c-violet', title: e.remind_to || 'All admins' }, `Email · ${e.remind_to ? e.remind_to.split(', ').length + ' address(es)' : 'admins'}`) : null,
+          !e.remind_in_app && !e.remind_email && h('span', { class: 'muted small' }, 'Off'))),
+        h('td', { class: 'nowrap' }, e.next_due ? nice(e.next_due) : '—'),
+        h('td', {}, h('span', { class: `chip ${e.active ? 'c-green' : ''}` }, e.active ? 'Active' : 'Stopped')),
+        can('editor') && h('td', { class: 'acts-cell' }, e.active && [
+          h('button', { class: 'small', onclick: () => emiSettingsDialog(e) }, 'Settings'),
+          h('button', { class: 'small', onclick: () => { if (confirm(`Stop the EMI “${e.lender}”? Instalments after today that have nothing paid will be removed.`)) act(`/api/emis/${e.id}/stop`, {}); } }, 'Stop')]))))))
+      : h('p', { class: 'empty' }, can('editor') ? 'No EMIs yet. Add your loans with “+ Add EMI”.' : 'No EMIs yet.'));
+
+  const set = (k) => (e) => { S.ef = { ...S.ef, [k]: e.target.value }; load(); };
+  const schedule = h('section', { class: 'card' },
+    h('div', { class: 'toolbar-row' },
+      h('h2', {}, h('span', { class: 'dot d-blue' }), 'Schedule', h('span', { class: 'count' }, rows.length)),
+      h('div', { class: 'bar' },
+        h('select', { 'aria-label': 'Schedule status', onchange: set('status') }, [['open', 'Still to pay'], ['overdue', 'Overdue'], ['due', 'Due today'], ['upcoming', 'Next 30 days'], ['scheduled', 'Later'], ['paid', 'Paid'], ['cancelled', 'Cancelled'], ['', 'Everything (incl. next 12 months)']].map(([v, t]) => h('option', { value: v, selected: f.status === v }, t))),
+        h('select', { 'aria-label': 'Loan', onchange: set('emi') }, [['', 'All loans'], ...emis.map((e) => [String(e.id), e.lender + (e.active ? '' : ' (stopped)')])].map(([v, t]) => h('option', { value: v, selected: f.emi === v }, t))),
+        h('select', { 'aria-label': 'Account', onchange: set('bank') }, [['', 'All accounts'], ...ov.accounts.map((a) => [String(a.id), a.name])].map(([v, t]) => h('option', { value: v, selected: f.bank === v }, t))))),
+    rows.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Due date'), h('th', {}, 'Loan'), h('th', {}, 'Account'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'Paid'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
+      h('tbody', {}, rows.map((r) => {
+        const [label, tone] = EMI_STATE[r.state], open = !r.projected && r.left > 0 && r.state !== 'cancelled';
+        return h('tr', { class: r.state === 'cancelled' ? 'inactive' : '' },
+          h('td', { class: 'nowrap' }, nice(r.due_date)),
+          h('td', {}, h('strong', {}, r.lender), r.loan_ref && h('div', { class: 'muted small' }, r.loan_ref)),
+          h('td', {}, r.bank_name),
+          h('td', { class: 'num' }, money(r.amount)),
+          h('td', { class: 'num' }, r.paid ? money(r.paid, 'pos') : '—', r.refs && h('div', { class: 'muted small' }, r.refs)),
+          h('td', {}, h('div', { class: 'chips' }, h('span', { class: `chip ${tone}` }, label), r.paid > 0 && r.left > 0 && h('span', { class: 'chip c-blue' }, `${inr(r.left)} left`),
+            r.reserved && h('span', { class: 'chip c-amber', title: `Held since ${nice(r.hold_from)}` }, 'reserved'), r.projected && h('span', { class: 'muted small' }, 'projected'))),
+          can('editor') && h('td', { class: 'acts-cell' }, open && h('button', { class: 'small solid-red', onclick: () => settleDialog({ kind: 'OUT', id: r.payment_id, name: `${r.lender} EMI (${nice(r.due_date)})`, amount: r.left, bankId: r.bank_id }, bankOpts) }, 'Confirm payment')));
+      }))))
+      : h('p', { class: 'empty' }, 'Nothing matches.'));
+
+  const reminders = rem && h('section', { class: 'card' },
+    h('h2', {}, h('span', { class: 'dot d-violet' }), 'Email reminders'),
+    h('div', { class: 'chips' },
+      h('span', { class: `chip ${rem.emailConfigured ? 'c-green' : 'c-amber'}` }, rem.emailConfigured ? 'Email sending is set up' : 'Email sending is not set up'),
+      h('span', { class: `chip ${rem.scheduleConfigured ? 'c-green' : 'c-amber'}` }, rem.scheduleConfigured ? 'Daily check is set up' : 'Daily check is not set up')),
+    (!rem.emailConfigured || !rem.scheduleConfigured) && h('p', { class: 'muted small' },
+      !rem.emailConfigured && 'To send emails, add RESEND_API_KEY and EMAIL_FROM to the server’s settings. ',
+      !rem.scheduleConfigured && 'For a check every morning even when nobody opens the app, add CRON_SECRET. Until then, reminders are checked whenever someone uses the app or presses “Check reminders now”.'),
+    rem.outbox.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Queued'), h('th', {}, 'To'), h('th', {}, 'Subject'), h('th', {}, 'Status'))),
+      h('tbody', {}, rem.outbox.map((m) => h('tr', {},
+        h('td', { class: 'nowrap' }, when(m.created_at)), h('td', {}, m.to_addr), h('td', {}, m.subject),
+        h('td', {}, h('span', { class: `chip ${{ sent: 'c-green', failed: 'c-red', skipped: 'c-amber', pending: 'c-blue' }[m.status]}`, title: m.error }, m.status), m.error && h('div', { class: 'muted small' }, m.error)))))))
+      : h('p', { class: 'empty' }, 'No email reminders yet.'));
+
+  app.replaceChildren(...[topBar(),
+    pageHead('EMI management', 'Monthly loan instalments, the money held for them, and reminders.',
+      can('admin') && h('button', { onclick: async (e) => {
+        e.target.disabled = true;
+        try { const r = await api('/api/reminders/run', {}); alert(`${r.reminders} reminder(s) due: ${r.inApp} new in-app, ${r.queued} email(s) queued, ${r.sent} sent${r.skipped ? `, ${r.skipped} not sent (email not set up)` : ''}${r.failed ? `, ${r.failed} failed` : ''}.`); S.notesAt = 0; await load(); }
+        catch (x) { alert(x.message); e.target.disabled = false; }
+      } }, 'Check reminders now'),
+      can('editor') && h('button', { class: 'primary', onclick: () => emiForm(bankOpts) }, '+ Add EMI')),
+    summary, accounts, loans, schedule, reminders].filter(Boolean));
+}
+
+const reminderFields = (e) => [
+  { name: 'hold_days', label: 'Hold the money from', type: 'select', value: String(e?.hold_days ?? 0), options: HOLD_OPTS, hint: 'While held, that money can’t be paid to anyone else from this account.' },
+  { name: 'remind_days', label: 'Remind me', type: 'select', value: String(e?.remind_days ?? 3), options: REMIND_OPTS, hint: 'Reminders also come on the due date, and if it becomes overdue or the account is short.' },
+  { name: 'remind_in_app', label: 'In-app reminder (the bell)', type: 'checkbox', value: e?.remind_in_app ?? true },
+  { name: 'remind_email', label: 'Email reminder', type: 'checkbox', value: e?.remind_email ?? false },
+  { name: 'remind_to', label: 'Email to (optional)', value: e?.remind_to ?? '', placeholder: 'accounts@firm.in, owner@firm.in', hint: 'Leave blank to email all admins. Up to 5 addresses.' },
+];
+
+function emiForm(bankOpts) {
+  if (!bankOpts.length) return alert('Add a bank account first (Dashboard → “+ Account”).');
+  openDialog('Add an EMI', [
+    { name: 'lender', label: 'Lender / loan', placeholder: 'e.g. HDFC car loan', required: true },
+    { name: 'amount', label: 'EMI amount (₹)', type: 'money', required: true },
+    { name: 'bank_id', label: 'Paid from account', type: 'select', options: bankOpts, required: true },
+    { name: 'start_date', label: 'Next EMI date', type: 'date', min: addDays(S.today, -31), required: true, hint: 'It repeats on this day every month (the last day in shorter months).' },
+    { name: 'end_date', label: 'Last EMI date (optional)', type: 'date' },
+    { name: 'ref', label: 'Loan account no. (optional)' },
+    ...reminderFields(null),
+  ], 'Add EMI', (v) => confirmDup((dup) => api('/api/emis', { ...v, confirmDuplicate: dup })), null, true);
+}
+
+function emiSettingsDialog(e) {
+  openDialog(`Settings: ${e.lender}`, reminderFields(e), 'Save', (v) => api(`/api/emis/${e.id}`, v), `${inr(e.amount)} from ${e.bank_name}, every month on day ${e.day}.`);
 }
 
 // ── People ──
@@ -586,6 +750,7 @@ function assignDialog(p, people) {
 
 // ── Activity log (admins) ──
 const ACTION_LABELS = {
+  'emi.edit': 'Changed EMI settings', 'emi.reminders': 'Checked EMI reminders',
   'report.export': 'Exported a report',
   login: 'Signed in', 'login.failed': 'Failed sign-in', 'login.locked': 'Locked out (too many wrong passwords)', logout: 'Signed out',
   setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user',
@@ -600,6 +765,7 @@ const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|s
 function describe(a, positions) {
   const d = a.detail || {}, out = [];
   const fmt = (k, v) => (v == null || v === '' ? '—' : k === 'position_id' ? positions.get(v) ?? `#${v}` : /amount/i.test(k) && typeof v === 'number' ? inr(v) : String(v));
+  if (a.action === 'emi.reminders') return `${d.reminders ?? 0} due · ${d.inApp ?? 0} in-app · ${d.queued ?? 0} email(s) queued · ${d.sent ?? 0} sent${d.via ? ' · daily schedule' : ''}`;
   if (a.action === 'report.export') return `${String(d.format).toUpperCase()} · ${d.view === 'history' ? 'transaction history' : 'receipts & payments'} · ${d.from} to ${d.to} · ${d.rows} row(s)`;
   for (const k of ['name', 'payee', 'party', 'lender', 'email', 'role', 'reason']) if (d[k]) out.push(String(d[k]));
   if (d.amount != null && typeof d.amount === 'number') out.push(inr(d.amount));
