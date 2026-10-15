@@ -20,7 +20,7 @@ test('today = opening balance − payments due today + receipts due today', () =
     ],
     receipts: [{ id: 1, party: 'Client', amount: 200_000, expected_date: T, certainty: 'FIRM', bank_id: 1 }],
   });
-  assert.deepEqual(r.total, { today: 1_000_000, pay: 350_000, receive: 200_000, final: 850_000 });
+  assert.deepEqual(r.total, { today: 1_000_000, pay: 350_000, receive: 200_000, final: 850_000, held: 0, free: 1_000_000 });
   assert.equal(r.rows[0].items.find((i) => i.id === 2).overdue, true);
 });
 
@@ -33,7 +33,7 @@ test('a payment marked paid today leaves "to pay" and comes off the balance — 
   const before = finalBalance({ ...base, entries: [] });
   const after = finalBalance({ ...base, entries: [{ kind: 'OUT', payment_id: 1, bank_id: 1, amount: 300_000, date: T }] });
   assert.equal(before.total.final, 700_000);
-  assert.deepEqual(after.total, { today: 700_000, pay: 0, receive: 0, final: 700_000 });
+  assert.deepEqual(after.total, { today: 700_000, pay: 0, receive: 0, final: 700_000, held: 0, free: 700_000 });
 });
 
 test('the API end to end', async (t) => {
@@ -69,14 +69,14 @@ test('the API end to end', async (t) => {
   assert.equal(dup.body.error.code, 'duplicate');
 
   let pos = (await call('/api/position')).body;
-  assert.deepEqual(pos.total, { today: 100_000_000, pay: 30_000_000, receive: 20_000_050, final: 90_000_050 });
+  assert.deepEqual(pos.total, { today: 100_000_000, pay: 30_000_000, receive: 20_000_050, final: 90_000_050, held: 0, free: 100_000_000 });
 
   // a part payment, then the bank reference can't be reused on the same account
   assert.equal((await call(`/api/payments/${pay.id}/settle`, { amount: '1,00,000', ref: 'UTR123' })).status, 200);
   assert.equal((await call(`/api/payments/${pay.id}/settle`, { amount: '1', ref: 'utr 123' })).status, 409);
   assert.equal((await call(`/api/payments/${pay.id}/settle`, { amount: '2,00,001', ref: 'UTR124' })).status, 400);
   pos = (await call('/api/position')).body;
-  assert.deepEqual(pos.total, { today: 90_000_000, pay: 20_000_000, receive: 20_000_050, final: 90_000_050 });
+  assert.deepEqual(pos.total, { today: 90_000_000, pay: 20_000_000, receive: 20_000_050, final: 90_000_050, held: 0, free: 90_000_000 });
 
   // looking 3 days ahead picks up the later payment
   pos = (await call(`/api/position?date=${addDays(today, 3)}`)).body;

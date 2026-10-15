@@ -11,8 +11,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { q, withTx, ensureSchema, setPool } from './db.js';
 import { finalBalance } from './balance.js';
+import { emiDates } from './emi.js';
 import * as A from './auth.js';
-import { bad, deny, notFound, toPaise, normRef, str, need, ymd, oneOf, intId, todayIST } from './money.js';
+import { bad, deny, notFound, toPaise, normRef, str, need, ymd, oneOf, intId, todayIST, addDays, inr } from './money.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const STATIC = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/app.css': ['app.css', 'text/css'] };
@@ -26,6 +27,38 @@ const email = (v) => { const s = str(v, 200).toLowerCase(); if (!/^[^@\s]+@[^@\s
 const optBank = (v) => (v === '' || v == null ? null : intId(v, 'Account'));
 const notFuture = (d, label) => { if (d > todayIST()) bad(`${label} can’t be in the future.`); return d; };
 async function bankExists(c, id) { if (id != null && !(await c.query('SELECT 1 FROM banks WHERE id = $1', [id])).rowCount) bad('That account doesn’t exist.'); return id; }
+
+// makes each active EMI's instalments into payments, up to `through` (once each: a cancelled one stays cancelled)
+async function syncEmis(c, through) {
+  const { rows } = await c.query('SELECT id, day, start_date, end_date FROM emis WHERE active');
+  const ids = [], dates = [];
+  for (const e of rows) for (const d of emiDates(e, through)) { ids.push(e.id); dates.push(d); }
+  if (!ids.length) return;
+  await c.query(`INSERT INTO payments (payee, ref, category, amount, due_date, bank_id, approved, note, emi_id, created_by)
+    SELECT e.lender, e.ref, 'Loan / EMI', e.amount, x.d, e.bank_id, true, 'EMI', e.id, e.created_by
+    FROM unnest($1::int[], $2::date[]) AS x(id, d) JOIN emis e ON e.id = x.id
+    ON CONFLICT (emi_id, due_date) WHERE emi_id IS NOT NULL DO NOTHING`, [ids, dates]);
+}
+
+// db: the pool, or a transaction's client
+async function position(db, { today, upTo, approvedOnly = false, uncertain = true }) {
+  const sql = [
+    'SELECT id, name, bank, last4 FROM banks ORDER BY name, id',
+    'SELECT id, bank_id, amount, as_of FROM balances',
+    "SELECT id, party, ref, amount, expected_date, certainty, bank_id, status FROM receipts WHERE status = 'OPEN'",
+    `SELECT p.id, p.payee, p.ref, p.category, p.amount, p.due_date, p.bank_id, p.approved, p.status, p.emi_id, (p.due_date - e.hold_days) AS hold_from
+       FROM payments p LEFT JOIN emis e ON e.id = p.emi_id WHERE p.status = 'OPEN'`,
+    'SELECT kind, receipt_id, payment_id, bank_id, amount, date FROM entries',
+  ];
+  // a transaction's client runs one query at a time; the pool can run them side by side
+  const out = [];
+  if (db.release) for (const t of sql) out.push(await db.query(t));
+  else out.push(...await Promise.all(sql.map((t) => db.query(t))));
+  const [banks, balances, receipts, payments, entries] = out;
+  const result = finalBalance({ banks: banks.rows, balances: balances.rows, receipts: receipts.rows, payments: payments.rows, entries: entries.rows, today, upTo, approvedOnly, uncertain });
+  return { banks: banks.rows, ...result };
+}
+const HORIZON = 62; // EMI payments are made this many days ahead, enough for any hold to have started
 
 async function currentUser(req) {
   const t = A.readToken(A.cookieValue(req.headers));
@@ -78,19 +111,50 @@ const routes = [
     const today = todayIST(), p = url.searchParams;
     const date = p.get('date') ? ymd(p.get('date')) : today;
     if (date < today) bad('Pick today or a later date.');
-    const [banks, balances, receipts, payments, entries] = await Promise.all([
-      q('SELECT id, name, bank, last4 FROM banks ORDER BY name, id'),
-      q('SELECT id, bank_id, amount, as_of FROM balances'),
-      q("SELECT id, party, ref, amount, expected_date, certainty, bank_id, status FROM receipts WHERE status = 'OPEN'"),
-      q("SELECT id, payee, ref, category, amount, due_date, bank_id, approved, status FROM payments WHERE status = 'OPEN'"),
-      q('SELECT kind, receipt_id, payment_id, bank_id, amount, date FROM entries'),
-    ]);
-    const result = finalBalance({
-      banks: banks.rows, balances: balances.rows, receipts: receipts.rows, payments: payments.rows, entries: entries.rows,
-      today, upTo: date, approvedOnly: p.get('approvedOnly') === '1', uncertain: p.get('uncertain') !== '0',
-    });
-    return { today, date, banks: banks.rows, ...result };
+    await withTx((c) => syncEmis(c, addDays(date, HORIZON)));
+    const result = await position({ query: q }, { today, upTo: date, approvedOnly: p.get('approvedOnly') === '1', uncertain: p.get('uncertain') !== '0' });
+    return { today, date, ...result };
   }],
+
+  ['GET', /^\/api\/emis$/, 'viewer', async () => {
+    const today = todayIST();
+    const { rows } = await q(`SELECT e.id, e.lender, e.ref, e.amount, e.day, e.bank_id, e.start_date, e.end_date, e.hold_days, e.active, b.name AS bank_name,
+        (SELECT min(p.due_date) FROM payments p WHERE p.emi_id = e.id AND p.status = 'OPEN'
+           AND p.amount > coalesce((SELECT sum(x.amount) FROM entries x WHERE x.payment_id = p.id), 0)) AS next_due
+      FROM emis e JOIN banks b ON b.id = e.bank_id ORDER BY e.active DESC, e.lender, e.id`);
+    return { today, emis: rows };
+  }],
+
+  ['POST', /^\/api\/emis$/, 'editor', async ({ body, user }) => {
+    const today = todayIST();
+    const e = {
+      lender: need(str(body.lender, 120), 'Lender / loan'), ref: str(body.ref, 80), amount: toPaise(body.amount, 'EMI amount', { allowZero: false }),
+      bankId: intId(body.bank_id, 'Account'), start: ymd(body.start_date, 'First EMI date'), end: ymd(body.end_date, 'Last EMI date', { optional: true }),
+      holdDays: Number(body.hold_days || 0),
+    };
+    if (e.start < addDays(today, -31)) bad('First EMI date: enter the next EMI you still have to pay, not one from long ago.');
+    if (e.end && e.end < e.start) bad('Last EMI date must be after the first one.');
+    if (!Number.isInteger(e.holdDays) || e.holdDays < 0 || e.holdDays > 31) bad('Hold from: enter 0 to 31 days.');
+    return withTx(async (c) => {
+      await bankExists(c, e.bankId);
+      const { rows: [x] } = await c.query('INSERT INTO emis (lender, ref, amount, day, bank_id, start_date, end_date, hold_days, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id',
+        [e.lender, e.ref, e.amount, Number(e.start.slice(8)), e.bankId, e.start, e.end, e.holdDays, user.id]);
+      await audit(c, user.id, 'emi.add', { id: x.id, ...e });
+      await syncEmis(c, addDays(today, HORIZON));
+      return x;
+    });
+  }],
+
+  // no more EMIs after today: instalments due later that have nothing paid are cancelled
+  ['POST', /^\/api\/emis\/(\d+)\/stop$/, 'editor', async ({ user, m }) => withTx(async (c) => {
+    const id = intId(m[1]), today = todayIST();
+    const { rowCount } = await c.query('UPDATE emis SET active = false, end_date = $2 WHERE id = $1 AND active', [id, today]);
+    if (!rowCount) notFound('That EMI is already stopped.');
+    const { rowCount: dropped } = await c.query(`UPDATE payments p SET status = 'CANCELLED' WHERE p.emi_id = $1 AND p.status = 'OPEN' AND p.due_date > $2
+      AND NOT EXISTS (SELECT 1 FROM entries x WHERE x.payment_id = p.id)`, [id, today]);
+    await audit(c, user.id, 'emi.stop', { id, cancelledInstalments: dropped });
+    return {};
+  })],
 
   ['POST', /^\/api\/banks$/, 'admin', async ({ body, user }) => {
     const name = need(str(body.name, 80), 'Account name'), bank = need(str(body.bank, 80), 'Bank'), last4 = str(body.last4, 4);
@@ -157,7 +221,7 @@ const routes = [
     const date = notFuture(ymd(body.date || todayIST(), 'Date'), 'Date');
     try {
       return await withTx(async (c) => {
-        const { rows: [x] } = await c.query(`SELECT id, amount, bank_id, status FROM ${table} WHERE id = $1 FOR UPDATE`, [id]);
+        const { rows: [x] } = await c.query(`SELECT id, amount, bank_id, status, ${isIn ? 'NULL' : 'emi_id'} AS emi_id FROM ${table} WHERE id = $1 FOR UPDATE`, [id]);
         if (!x) notFound('That record doesn’t exist.');
         if (x.status !== 'OPEN') bad('It was cancelled.');
         const { rows: [{ done }] } = await c.query(`SELECT coalesce(sum(amount), 0)::bigint AS done FROM entries WHERE ${isIn ? 'receipt_id' : 'payment_id'} = $1`, [id]);
@@ -166,6 +230,16 @@ const routes = [
         const amount = body.amount === '' || body.amount == null ? left : toPaise(body.amount, 'Amount', { allowZero: false });
         if (amount > left) bad(`Only ${(left / 100).toFixed(2)} is left on it.`);
         const bankId = await bankExists(c, body.bank_id ? intId(body.bank_id, 'Account') : x.bank_id ?? bad('Choose the account.'));
+        if (!isIn && !x.emi_id) {
+          // money held for EMIs can't go to anyone else; one payment per account checks at a time
+          const today = todayIST();
+          await c.query('SELECT pg_advisory_xact_lock(2, $1)', [bankId]);
+          await syncEmis(c, addDays(today, HORIZON));
+          const row = (await position(c, { today, upTo: today })).rows.find((r) => r.id === bankId);
+          if (row && row.held > 0 && amount > row.free) {
+            throw err(409, 'emi_hold', `Not allowed: ${inr(row.held)} in ${row.name} is held for EMIs. Of its ${inr(row.today)} balance, only ${inr(Math.max(row.free, 0))} can be paid to others. Bring in money or pay from another account.`);
+          }
+        }
         const { rows: [e] } = await c.query(`INSERT INTO entries (kind, ${isIn ? 'receipt_id' : 'payment_id'}, bank_id, amount, date, ref, ref_norm, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
           [isIn ? 'IN' : 'OUT', id, bankId, amount, date, ref, refNorm, user.id]);
         await audit(c, user.id, isIn ? 'receipt.received' : 'payment.paid', { id, entry: e.id, bankId, amount, date, ref });

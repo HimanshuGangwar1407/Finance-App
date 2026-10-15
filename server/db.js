@@ -104,6 +104,24 @@ const MIGRATIONS = [
      action  text NOT NULL,
      detail  jsonb NOT NULL DEFAULT '{}'
    );`,
+  // EMIs: a monthly loan instalment. Each month's instalment becomes a payment (emi_id set), and its money is held in
+  // the account from hold_days before the due date until it is paid.
+  `CREATE TABLE emis (
+     id          serial PRIMARY KEY,
+     lender      text NOT NULL,
+     ref         text NOT NULL DEFAULT '',
+     amount      bigint NOT NULL CHECK (amount > 0),
+     day         smallint NOT NULL CHECK (day BETWEEN 1 AND 31),
+     bank_id     integer NOT NULL REFERENCES banks(id),
+     start_date  date NOT NULL,
+     end_date    date,
+     hold_days   smallint NOT NULL DEFAULT 0 CHECK (hold_days BETWEEN 0 AND 31),
+     active      boolean NOT NULL DEFAULT true,
+     created_by  integer REFERENCES users(id),
+     created_at  timestamptz NOT NULL DEFAULT now()
+   );
+   ALTER TABLE payments ADD COLUMN emi_id integer REFERENCES emis(id);
+   CREATE UNIQUE INDEX payments_emi_date ON payments (emi_id, due_date) WHERE emi_id IS NOT NULL;`,
 ];
 
 let ready;

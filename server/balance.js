@@ -6,19 +6,21 @@
 //   to receive     = the unreceived part of each open receipt (cancelled and disputed ones left out)
 //   to pay         = the unpaid part of each open payment
 //   final balance  = balance today + to receive − to pay
+//   held for EMIs  = the unpaid part of each EMI whose hold has started by the date (from hold_days before it is due)
+//   free           = balance today − held for EMIs: what can go to anyone else without touching EMI money
 //
 // Receipts and payments without an account are shown under "Account not decided" so nothing is left out.
 
 /**
  * banks: [{id, name, bank, last4}] · balances: [{bank_id, amount, as_of}] (any order) ·
  * receipts: [{id, party, ref, amount, expected_date, certainty, bank_id, disputed?}] ·
- * payments: [{id, payee, ref, category, amount, due_date, bank_id, approved}] ·
+ * payments: [{id, payee, ref, category, amount, due_date, bank_id, approved, emi_id?, hold_from?}] ·
  * entries: [{kind: 'IN'|'OUT', receipt_id, payment_id, bank_id, amount, date}]
  * options: upTo (YYYY-MM-DD or null = everything), approvedOnly, uncertain (include uncertain receipts)
  */
 export function finalBalance({ banks, balances, receipts, payments, entries, today, upTo = null, approvedOnly = false, uncertain = true }) {
   const within = (d) => !upTo || d <= upTo;
-  const blank = (b) => ({ id: b?.id ?? null, name: b ? b.name : 'Account not decided', bank: b ? `${b.bank} XXXX${b.last4}` : '', balance: null, asOf: null, since: 0, today: 0, receive: 0, pay: 0, final: 0, items: [] });
+  const blank = (b) => ({ id: b?.id ?? null, name: b ? b.name : 'Account not decided', bank: b ? `${b.bank} XXXX${b.last4}` : '', balance: null, asOf: null, since: 0, today: 0, receive: 0, pay: 0, final: 0, held: 0, free: 0, holds: [], items: [] });
   const rows = new Map(banks.map((b) => [b.id, blank(b)]));
   const none = blank(null);
   const R = (id) => rows.get(id) ?? none;
@@ -43,13 +45,16 @@ export function finalBalance({ banks, balances, receipts, payments, entries, tod
   for (const p of payments) {
     if (p.status === 'CANCELLED' || (approvedOnly && !p.approved)) continue;
     const left = Number(p.amount) - (paid.get(p.id) || 0);
-    if (left <= 0 || !within(p.due_date)) continue;
-    const row = R(p.bank_id); row.pay += left;
-    row.items.push({ kind: 'OUT', id: p.id, date: p.due_date, name: p.payee, ref: p.ref, category: p.category, amount: left, overdue: p.due_date < today, approved: !!p.approved });
+    if (left <= 0) continue;
+    const row = R(p.bank_id);
+    if (p.emi_id && within(p.hold_from ?? p.due_date)) { row.held += left; row.holds.push({ id: p.id, name: p.payee, date: p.due_date, amount: left }); }
+    if (!within(p.due_date)) continue;
+    row.pay += left;
+    row.items.push({ kind: 'OUT', id: p.id, date: p.due_date, name: p.payee, ref: p.ref, category: p.category, amount: left, overdue: p.due_date < today, approved: !!p.approved, emi: !!p.emi_id });
   }
   const list = [...rows.values(), ...(none.receive || none.pay ? [none] : [])];
-  for (const r of list) { r.today = (r.balance || 0) + r.since; r.final = r.today + r.receive - r.pay; r.items.sort((a, b) => a.date.localeCompare(b.date) || a.kind.localeCompare(b.kind)); delete r.balId; }
-  const total = list.reduce((s, r) => ({ today: s.today + r.today, receive: s.receive + r.receive, pay: s.pay + r.pay, final: s.final + r.final }), { today: 0, receive: 0, pay: 0, final: 0 });
+  for (const r of list) { r.today = (r.balance || 0) + r.since; r.final = r.today + r.receive - r.pay; r.free = r.today - r.held; r.items.sort((a, b) => a.date.localeCompare(b.date) || a.kind.localeCompare(b.kind)); delete r.balId; }
+  const total = list.reduce((s, r) => ({ today: s.today + r.today, receive: s.receive + r.receive, pay: s.pay + r.pay, final: s.final + r.final, held: s.held + r.held, free: s.free + r.free }), { today: 0, receive: 0, pay: 0, final: 0, held: 0, free: 0 });
   // day by day: where the total goes, and its lowest point
   const days = new Map();
   for (const r of list) for (const i of r.items) { const d = i.date < today ? today : i.date; days.set(d, (days.get(d) || 0) + (i.kind === 'IN' ? i.amount : -i.amount)); }
