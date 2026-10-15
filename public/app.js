@@ -28,7 +28,7 @@ const can = (role) => ({ viewer: 0, editor: 1, admin: 2 })[S.user.role] >= ({ vi
 
 async function api(path, body) {
   const r = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  const j = await r.json().catch(() => ({ error: { message: 'The server didn’t answer properly. Try again.' } }));
+  const j = await r.json().catch(() => ({ error: { message: `The app’s server didn’t answer (${path} gave HTTP ${r.status}, not app data). Check that the server or the Vercel API function is running.` } }));
   if (r.status === 401 && S.user && !path.endsWith('/login')) { S.user = null; boot(); }
   if (!r.ok) throw Object.assign(new Error(j.error?.message || 'Something went wrong.'), { code: j.error?.code });
   return j;
