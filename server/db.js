@@ -151,6 +151,38 @@ const MIGRATIONS = [
    CREATE INDEX people_position ON people (position_id);
    CREATE INDEX audit_user ON audit (user_id, id DESC);
    CREATE INDEX audit_action ON audit (action, id DESC);`,
+  // EMI reminders: per-EMI settings, in-app notifications per user, and an email outbox. The unique keys make each
+  // reminder happen once, however often reminders are checked.
+  `ALTER TABLE emis
+     ADD COLUMN remind_days   smallint NOT NULL DEFAULT 3 CHECK (remind_days BETWEEN 0 AND 30),
+     ADD COLUMN remind_in_app boolean NOT NULL DEFAULT true,
+     ADD COLUMN remind_email  boolean NOT NULL DEFAULT false,
+     ADD COLUMN remind_to     text NOT NULL DEFAULT '';
+   CREATE TABLE notifications (
+     id          serial PRIMARY KEY,
+     user_id     integer NOT NULL REFERENCES users(id),
+     kind        text NOT NULL,
+     title       text NOT NULL,
+     body        text NOT NULL DEFAULT '',
+     link        text NOT NULL DEFAULT '',
+     dedupe_key  text NOT NULL,
+     created_at  timestamptz NOT NULL DEFAULT now(),
+     read_at     timestamptz,
+     UNIQUE (user_id, dedupe_key)
+   );
+   CREATE INDEX notifications_user ON notifications (user_id, id DESC);
+   CREATE TABLE email_outbox (
+     id          serial PRIMARY KEY,
+     to_addr     text NOT NULL,
+     subject     text NOT NULL,
+     body        text NOT NULL,
+     dedupe_key  text NOT NULL UNIQUE,
+     status      text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed', 'skipped')),
+     error       text NOT NULL DEFAULT '',
+     attempts    integer NOT NULL DEFAULT 0,
+     created_at  timestamptz NOT NULL DEFAULT now(),
+     sent_at     timestamptz
+   );`,
 ];
 
 let ready;

@@ -14,6 +14,8 @@ import { finalBalance } from './balance.js';
 import { emiDates } from './emi.js';
 import { bankStatements } from './ledger.js';
 import { toCsv, toXlsx } from './export.js';
+import { dueReminders, projectDates } from './reminders.js';
+import { emailConfigured, sendEmail } from './email.js';
 import * as A from './auth.js';
 import { bad, deny, notFound, toPaise, normRef, str, need, ymd, oneOf, intId, todayIST, addDays, inr } from './money.js';
 
@@ -159,10 +161,149 @@ async function settle(c, { table, id, body, user }) {
       throw err(409, 'emi_hold', `Not allowed: ${inr(row.held)} in ${row.name} is held for EMIs. Of its ${inr(row.today)} balance, only ${inr(Math.max(row.free, 0))} can be paid to others. Bring in money or pay from another account.`);
     }
   }
+  let overdraft = false;
+  if (!isIn && x.emi_id) {
+    // confirming an EMI payment: if the account doesn't have the money, say so and ask before recording it
+    const today = todayIST();
+    const row = (await position(c, { today, upTo: today })).rows.find((r) => r.id === bankId);
+    if (row && amount > row.today) {
+      if (!body.confirmShortfall) throw err(409, 'insufficient', `${row.name} has ${inr(row.today)}. Paying ${inr(amount)} takes it to ${inr(row.today - amount)}. Record this payment anyway (for example, it went through on an overdraft)?`);
+      overdraft = true;
+    }
+  }
   const { rows: [e] } = await c.query(`INSERT INTO entries (kind, ${isIn ? 'receipt_id' : 'payment_id'}, bank_id, amount, date, ref, ref_norm, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
     [isIn ? 'IN' : 'OUT', id, bankId, amount, date, ref, refNorm, user.id]);
-  await audit(c, user.id, isIn ? 'receipt.received' : 'payment.paid', { id, entry: e.id, bankId, amount, date, ref });
+  await audit(c, user.id, isIn ? 'receipt.received' : 'payment.paid', { id, entry: e.id, bankId, amount, date, ref, ...(overdraft ? { overdraft: true } : {}) });
   return { id: e.id, left: left - amount };
+}
+
+// ── EMI management: settings, schedule, money held, reminders ──
+const flag = (v, fallback) => (v === undefined ? fallback : v === true || v === 'true');
+const emailList = (v) => {
+  const list = [...new Set(str(v, 600).toLowerCase().split(/[\s,;]+/).filter(Boolean))];
+  if (list.length > 5) bad('Email reminders: up to 5 addresses.');
+  for (const x of list) if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x)) bad(`Email reminders: “${x}” is not a valid email address.`);
+  return list.join(', ');
+};
+// hold and reminder settings, from a form; anything not sent keeps its current value
+function emiSettings(body, old = { hold_days: 0, remind_days: 3, remind_in_app: true, remind_email: false, remind_to: '' }) {
+  const days = (k, label, max) => {
+    if (!(k in body) || body[k] === '' || body[k] == null) return old[k];
+    const n = Number(body[k]);
+    if (!Number.isInteger(n) || n < 0 || n > max) bad(`${label}: enter 0 to ${max} days.`);
+    return n;
+  };
+  return {
+    hold_days: days('hold_days', 'Hold from', 31), remind_days: days('remind_days', 'Remind before', 30),
+    remind_in_app: flag(body.remind_in_app, old.remind_in_app), remind_email: flag(body.remind_email, old.remind_email),
+    remind_to: 'remind_to' in body ? emailList(body.remind_to) : old.remind_to,
+  };
+}
+
+// every EMI instalment with its state: paid · overdue · due (today) · upcoming (next 30 days) · scheduled (later) · cancelled.
+// reserved = its money is being held now. Future months beyond the records are projected (projected: true).
+async function emiSchedule(db, today) {
+  const { rows } = await db.query(`SELECT p.id AS payment_id, p.emi_id, e.lender, e.ref AS loan_ref, p.bank_id, b.name AS bank_name, p.due_date, p.amount, p.status,
+      coalesce(s.paid, 0)::bigint AS paid, s.last_date, s.refs, (p.due_date - e.hold_days) AS hold_from
+    FROM payments p JOIN emis e ON e.id = p.emi_id JOIN banks b ON b.id = p.bank_id
+    LEFT JOIN (SELECT payment_id, sum(amount) AS paid, max(date) AS last_date, string_agg(ref, ', ' ORDER BY id) AS refs FROM entries WHERE payment_id IS NOT NULL GROUP BY payment_id) s ON s.payment_id = p.id
+    ORDER BY p.due_date, p.id`);
+  const soon = addDays(today, 30);
+  const state = (r) => (r.status === 'CANCELLED' ? 'cancelled' : r.paid >= r.amount ? 'paid' : r.due_date < today ? 'overdue' : r.due_date === today ? 'due' : r.due_date <= soon ? 'upcoming' : 'scheduled');
+  const out = rows.map((r) => {
+    const s = state(r), open = s !== 'paid' && s !== 'cancelled';
+    return { ...r, left: open ? r.amount - r.paid : 0, state: s, reserved: open && r.hold_from <= today, projected: false };
+  });
+  const last = new Map();
+  for (const r of rows) if (!last.has(r.emi_id) || r.due_date > last.get(r.emi_id)) last.set(r.emi_id, r.due_date);
+  const { rows: emis } = await db.query('SELECT e.id, e.lender, e.ref, e.amount, e.day, e.bank_id, e.start_date, e.end_date, e.hold_days, b.name AS bank_name FROM emis e JOIN banks b ON b.id = e.bank_id WHERE e.active');
+  for (const e of emis) {
+    const after = addDays(last.get(e.id) ?? addDays(today, -1), 1);
+    for (const d of projectDates(e, after < e.start_date ? e.start_date : after, 12)) {
+      out.push({ payment_id: null, emi_id: e.id, lender: e.lender, loan_ref: e.ref, bank_id: e.bank_id, bank_name: e.bank_name, due_date: d, amount: Number(e.amount), status: 'OPEN',
+        paid: 0, last_date: null, refs: null, hold_from: addDays(d, -e.hold_days), left: Number(e.amount), state: d <= soon ? 'upcoming' : 'scheduled', reserved: false, projected: true });
+    }
+  }
+  return out.sort((a, b) => a.due_date.localeCompare(b.due_date) || a.emi_id - b.emi_id);
+}
+
+// per account: balance now, money held for EMIs (reserved), and what is available for anything else
+async function emiOverview(today) {
+  await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
+  const [pos, sched, { rows: [act] }] = await Promise.all([
+    position({ query: q }, { today, upTo: today }), emiSchedule({ query: q }, today),
+    q('SELECT count(*)::int AS n, coalesce(sum(amount), 0)::bigint AS monthly FROM emis WHERE active'),
+  ]);
+  const open = sched.filter((r) => !r.projected && ['overdue', 'due', 'upcoming', 'scheduled'].includes(r.state));
+  const sum = (xs) => ({ count: xs.length, amount: xs.reduce((s, r) => s + r.left, 0) });
+  const accounts = pos.rows.filter((r) => r.id != null).map((r) => ({
+    id: r.id, name: r.name, bank: r.bank, balance: r.today, reserved: r.held, available: r.free, balanceEntered: r.balance != null,
+    next: open.find((s) => s.bank_id === r.id) ?? null,
+  }));
+  const add = (k) => accounts.reduce((s, a) => s + a[k], 0);
+  return {
+    today, accounts,
+    totals: {
+      balance: add('balance'), reserved: add('reserved'), available: add('available'), active: act.n, monthly: Number(act.monthly),
+      overdue: sum(open.filter((r) => r.state === 'overdue')), due: sum(open.filter((r) => r.state === 'due')), upcoming: sum(open.filter((r) => r.state === 'upcoming')),
+    },
+  };
+}
+
+// works out which reminders are due and stores them: in-app for every editor and admin, email per the EMI's settings.
+// Checked at most every few minutes when people use the app, on the daily schedule, or on demand by an admin.
+let lastReminderRun = 0;
+async function runReminders({ force = false } = {}) {
+  if (!force && Date.now() - lastReminderRun < 5 * 60000) return null;
+  lastReminderRun = Date.now();
+  const today = todayIST();
+  return withTx(async (c) => {
+    await c.query('SELECT pg_advisory_xact_lock(7103)'); // one run at a time
+    await syncEmis(c, addDays(today, HORIZON));
+    const free = new Map((await position(c, { today, upTo: today })).rows.filter((r) => r.id != null).map((r) => [r.id, r.free]));
+    const { rows: settings } = await c.query('SELECT id, remind_days, remind_in_app, remind_email, remind_to, hold_days FROM emis');
+    const cfg = new Map(settings.map((s) => [s.id, s]));
+    const instalments = (await emiSchedule(c, today)).filter((r) => !r.projected && r.left > 0).map((r) => ({ ...r, ...cfg.get(r.emi_id), id: undefined }));
+    const events = dueReminders({ instalments, free, today });
+    const { rows: users } = await c.query("SELECT id, email, role FROM users WHERE active AND role IN ('editor', 'admin')");
+    const admins = users.filter((u) => u.role === 'admin').map((u) => u.email);
+    let inApp = 0, queued = 0;
+    for (const ev of events) {
+      const s = cfg.get(ev.emi_id);
+      if (s.remind_in_app) for (const u of users) {
+        inApp += (await c.query(`INSERT INTO notifications (user_id, kind, title, body, link, dedupe_key) VALUES ($1, $2, $3, $4, 'emis', $5)
+          ON CONFLICT (user_id, dedupe_key) DO NOTHING`, [u.id, ev.kind, ev.title, ev.body, ev.key])).rowCount;
+      }
+      if (s.remind_email) for (const to of s.remind_to ? s.remind_to.split(', ') : admins) {
+        queued += (await c.query(`INSERT INTO email_outbox (to_addr, subject, body, dedupe_key) VALUES ($1, $2, $3, $4) ON CONFLICT (dedupe_key) DO NOTHING`,
+          [to, ev.title, `${ev.title}\n\n${ev.body}\n\n— Finance app`, `${ev.key}:${to}`])).rowCount;
+      }
+    }
+    return { reminders: events.length, inApp, queued };
+  });
+}
+
+// sends queued reminder emails; each is claimed before sending so two runs never send the same one
+async function deliverEmails(limit = 20) {
+  const { rows } = await q("SELECT id, to_addr, subject, body, status, attempts FROM email_outbox WHERE status = 'pending' OR (status = 'failed' AND attempts < 5) ORDER BY id LIMIT $1", [limit]);
+  const out = { sent: 0, failed: 0, skipped: 0 };
+  for (const m of rows) {
+    if (!emailConfigured()) {
+      await q("UPDATE email_outbox SET status = 'skipped', error = 'Email is not set up (RESEND_API_KEY and EMAIL_FROM).' WHERE id = $1 AND status = $2", [m.id, m.status]);
+      out.skipped++; continue;
+    }
+    const claim = await q('UPDATE email_outbox SET attempts = attempts + 1 WHERE id = $1 AND status = $2 AND attempts = $3', [m.id, m.status, m.attempts]);
+    if (!claim.rowCount) continue;
+    try {
+      await sendEmail({ to: m.to_addr, subject: m.subject, text: m.body });
+      await q("UPDATE email_outbox SET status = 'sent', error = '', sent_at = now() WHERE id = $1", [m.id]);
+      out.sent++;
+    } catch (e) {
+      await q("UPDATE email_outbox SET status = 'failed', error = $2 WHERE id = $1", [m.id, String(e.message).slice(0, 300)]);
+      out.failed++;
+    }
+  }
+  return out;
 }
 
 // filters shared by the transaction lists, the summary and the exports; the period defaults to this month so far
@@ -289,6 +430,42 @@ const routes = [
     return { user };
   }],
 
+  // ── reminders: in-app notifications for the signed-in person ──
+  ['GET', /^\/api\/notifications$/, 'viewer', async ({ user }) => {
+    try { if (await runReminders()) await deliverEmails(); } catch (e) { console.error('reminders', e); } // never blocks the page
+    const { rows } = await q('SELECT id, kind, title, body, link, created_at, read_at FROM notifications WHERE user_id = $1 ORDER BY id DESC LIMIT 30', [user.id]);
+    const { rows: [{ n }] } = await q('SELECT count(*)::int AS n FROM notifications WHERE user_id = $1 AND read_at IS NULL', [user.id]);
+    return { unread: n, items: rows };
+  }],
+
+  ['POST', /^\/api\/notifications\/read$/, 'viewer', async ({ body, user }) => {
+    if (body.all === true) await q('UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL', [user.id]);
+    else await q('UPDATE notifications SET read_at = now() WHERE user_id = $1 AND id = $2 AND read_at IS NULL', [user.id, intId(body.id, 'Notification')]);
+    return {};
+  }],
+
+  // check and send reminders now (admins), and see what email reminders did
+  ['POST', /^\/api\/reminders\/run$/, 'admin', async ({ user }) => {
+    const made = await runReminders({ force: true }), mail = await deliverEmails();
+    await log(user.id, 'emi.reminders', { ...made, ...mail });
+    return { ...made, ...mail };
+  }],
+
+  ['GET', /^\/api\/reminders\/status$/, 'admin', async () => ({
+    emailConfigured: emailConfigured(), scheduleConfigured: !!process.env.CRON_SECRET,
+    outbox: (await q('SELECT id, to_addr, subject, status, error, attempts, created_at, sent_at FROM email_outbox ORDER BY id DESC LIMIT 30')).rows,
+  })],
+
+  // the daily scheduled run (Vercel Cron sends "Authorization: Bearer <CRON_SECRET>")
+  ['GET', /^\/api\/cron\/reminders$/, null, async ({ req }) => {
+    const secret = process.env.CRON_SECRET;
+    if (!secret) throw err(503, 'config', 'Scheduled reminders are not set up: add CRON_SECRET.');
+    if (!A.safeEqual(req.headers.authorization || '', `Bearer ${secret}`)) throw err(401, 'unauthenticated', 'Not allowed.');
+    const made = await runReminders({ force: true }), mail = await deliverEmails(50);
+    await log(null, 'emi.reminders', { ...made, ...mail, via: 'schedule' });
+    return { ...made, ...mail };
+  }],
+
   ['POST', /^\/api\/logout$/, null, async (ctx) => {
     if (ctx.user) await log(ctx.user.id, 'logout', { email: ctx.user.email });
     ctx.headers.push(['Set-Cookie', A.cookieHeader('', ctx.secure, 0)]);
@@ -307,6 +484,7 @@ const routes = [
   ['GET', /^\/api\/emis$/, 'viewer', async () => {
     const today = todayIST();
     const { rows } = await q(`SELECT e.id, e.lender, e.ref, e.amount, e.day, e.bank_id, e.start_date, e.end_date, e.hold_days, e.active, b.name AS bank_name,
+        e.remind_days, e.remind_in_app, e.remind_email, e.remind_to,
         (SELECT min(p.due_date) FROM payments p WHERE p.emi_id = e.id AND p.status = 'OPEN'
            AND p.amount > coalesce((SELECT sum(x.amount) FROM entries x WHERE x.payment_id = p.id), 0)) AS next_due
       FROM emis e JOIN banks b ON b.id = e.bank_id ORDER BY e.active DESC, e.lender, e.id`);
@@ -318,19 +496,55 @@ const routes = [
     const e = {
       lender: need(str(body.lender, 120), 'Lender / loan'), ref: str(body.ref, 80), amount: toPaise(body.amount, 'EMI amount', { allowZero: false }),
       bankId: intId(body.bank_id, 'Account'), start: ymd(body.start_date, 'First EMI date'), end: ymd(body.end_date, 'Last EMI date', { optional: true }),
-      holdDays: Number(body.hold_days || 0),
+      ...emiSettings(body),
     };
     if (e.start < addDays(today, -31)) bad('First EMI date: enter the next EMI you still have to pay, not one from long ago.');
     if (e.end && e.end < e.start) bad('Last EMI date must be after the first one.');
-    if (!Number.isInteger(e.holdDays) || e.holdDays < 0 || e.holdDays > 31) bad('Hold from: enter 0 to 31 days.');
     return withTx(async (c) => {
       await bankExists(c, e.bankId);
-      const { rows: [x] } = await c.query('INSERT INTO emis (lender, ref, amount, day, bank_id, start_date, end_date, hold_days, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id',
-        [e.lender, e.ref, e.amount, Number(e.start.slice(8)), e.bankId, e.start, e.end, e.holdDays, user.id]);
+      // the same loan twice would hold and pay the money twice
+      if (!body.confirmDuplicate) {
+        const { rows: [d] } = await c.query('SELECT lender FROM emis WHERE active AND lower(lender) = lower($1) AND bank_id = $2 AND amount = $3 AND day = $4 LIMIT 1',
+          [e.lender, e.bankId, e.amount, Number(e.start.slice(8))]);
+        if (d) throw err(409, 'duplicate', `An active EMI “${d.lender}” for ${inr(e.amount)} on day ${Number(e.start.slice(8))} from this account already exists. Add another one anyway?`);
+      }
+      const { rows: [x] } = await c.query(`INSERT INTO emis (lender, ref, amount, day, bank_id, start_date, end_date, hold_days, remind_days, remind_in_app, remind_email, remind_to, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
+        [e.lender, e.ref, e.amount, Number(e.start.slice(8)), e.bankId, e.start, e.end, e.hold_days, e.remind_days, e.remind_in_app, e.remind_email, e.remind_to, user.id]);
       await audit(c, user.id, 'emi.add', { id: x.id, ...e });
       await syncEmis(c, addDays(today, HORIZON));
       return x;
     });
+  }],
+
+  // change how far ahead money is held and how reminders are sent (send only what changes)
+  ['POST', /^\/api\/emis\/(\d+)$/, 'editor', async ({ body, user, m }) => withTx(async (c) => {
+    const id = intId(m[1]);
+    const { rows: [old] } = await c.query('SELECT lender, hold_days, remind_days, remind_in_app, remind_email, remind_to FROM emis WHERE id = $1 FOR UPDATE', [id]);
+    if (!old) notFound('That EMI doesn’t exist.');
+    const next = emiSettings(body, old), diff = changes(old, next);
+    if (!Object.keys(diff).length) return {};
+    await c.query('UPDATE emis SET hold_days = $2, remind_days = $3, remind_in_app = $4, remind_email = $5, remind_to = $6 WHERE id = $1',
+      [id, next.hold_days, next.remind_days, next.remind_in_app, next.remind_email, next.remind_to]);
+    await audit(c, user.id, 'emi.edit', { id, lender: old.lender, changes: diff });
+    return {};
+  })],
+
+  // money held for EMIs and what is left to spend, per account; overdue and upcoming instalments
+  ['GET', /^\/api\/emis\/overview$/, 'viewer', async () => emiOverview(todayIST())],
+
+  // every instalment: past and current ones from the records, future ones projected 12 months ahead
+  ['GET', /^\/api\/emis\/schedule$/, 'viewer', async ({ url }) => {
+    const today = todayIST(), p = url.searchParams;
+    const status = oneOf(p.get('status') || '', ['', 'open', 'overdue', 'due', 'upcoming', 'scheduled', 'paid', 'cancelled'], 'Status');
+    const emi = p.get('emi') ? intId(p.get('emi'), 'EMI') : null, bank = p.get('bank') ? intId(p.get('bank'), 'Bank account') : null;
+    const from = ymd(p.get('from'), 'From', { optional: true }), to = ymd(p.get('to'), 'To', { optional: true });
+    if (from && to && from > to) bad('The “from” date must be on or before the “to” date.');
+    await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
+    const rows = (await emiSchedule({ query: q }, today)).filter((r) =>
+      (!status || (status === 'open' ? ['overdue', 'due', 'upcoming', 'scheduled'].includes(r.state) && !r.projected : r.state === status)) &&
+      (!emi || r.emi_id === emi) && (!bank || r.bank_id === bank) && (!from || r.due_date >= from) && (!to || r.due_date <= to));
+    return { today, rows };
   }],
 
   // no more EMIs after today: instalments due later that have nothing paid are cancelled
