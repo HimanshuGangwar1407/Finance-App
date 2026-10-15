@@ -14,7 +14,7 @@ import { finalBalance } from './balance.js';
 import { emiDates } from './emi.js';
 import { bankStatements } from './ledger.js';
 import { toCsv, toXlsx } from './export.js';
-import { dueReminders, projectDates } from './reminders.js';
+import { dueReminders, projectDates, coverage, DEFAULT_BEFORE } from './reminders.js';
 import { emailConfigured, sendEmail } from './email.js';
 import * as A from './auth.js';
 import { bad, deny, notFound, toPaise, normRef, str, need, ymd, oneOf, intId, todayIST, addDays, inr } from './money.js';
@@ -44,7 +44,7 @@ async function usablePosition(c, id) {
   if (!p.active) bad('That position is inactive. Activate it first, or choose another.');
   return id;
 }
-const changes = (before, after) => Object.fromEntries(Object.keys(after).filter((k) => before[k] !== after[k]).map((k) => [k, [before[k], after[k]]]));
+const changes = (before, after) => Object.fromEntries(Object.keys(after).filter((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k])).map((k) => [k, [before[k], after[k]]]));
 // a unique name/email clash becomes a readable message
 const unique = (message) => (e) => { throw e.code === 'conflict' ? err(409, 'conflict', message) : e; };
 const likeTerm = (s) => `%${s.replace(/[\\%_]/g, '\\$&')}%`;
@@ -152,13 +152,13 @@ async function settle(c, { table, id, body, user }) {
   if (amount > left) bad(`Only ${(left / 100).toFixed(2)} is left on it.`);
   const bankId = await bankExists(c, body.bank_id ? intId(body.bank_id, 'Account') : x.bank_id ?? bad('Choose the account.'));
   if (!isIn && !x.emi_id) {
-    // money held for EMIs can't go to anyone else; one payment per account checks at a time
+    // money reserved for EMIs (in this app) can't go to anyone else; one payment per account checks at a time
     const today = todayIST();
     await c.query('SELECT pg_advisory_xact_lock(2, $1)', [bankId]);
     await syncEmis(c, addDays(today, HORIZON));
     const row = (await position(c, { today, upTo: today })).rows.find((r) => r.id === bankId);
     if (row && row.held > 0 && amount > row.free) {
-      throw err(409, 'emi_hold', `Not allowed: ${inr(row.held)} in ${row.name} is held for EMIs. Of its ${inr(row.today)} balance, only ${inr(Math.max(row.free, 0))} can be paid to others. Bring in money or pay from another account.`);
+      throw err(409, 'emi_hold', `Not allowed: ${inr(row.held)} in ${row.name} is reserved for EMIs. Of its ${inr(row.today)} balance, only ${inr(Math.max(row.free, 0))} can be paid to others. Bring in money or pay from another account.`);
     }
   }
   let overdraft = false;
@@ -185,23 +185,43 @@ const emailList = (v) => {
   for (const x of list) if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x)) bad(`Email reminders: “${x}” is not a valid email address.`);
   return list.join(', ');
 };
-// hold and reminder settings, from a form; anything not sent keeps its current value
-function emiSettings(body, old = { hold_days: 0, remind_days: 3, remind_in_app: true, remind_email: false, remind_to: '' }) {
+// reminder points: whole days before the due date, 1 to 30, newest last ("7, 3, 1")
+const beforeList = (v) => {
+  const list = (Array.isArray(v) ? v : String(v ?? '').split(/[\s,;]+/)).filter((x) => x !== '' && x != null).map(Number);
+  for (const n of list) if (!Number.isInteger(n) || n < 1 || n > 30) bad('Remind before: use days from 1 to 30.');
+  const out = [...new Set(list)].sort((a, b) => b - a);
+  if (out.length > 6) bad('Remind before: up to 6 reminder points.');
+  return out;
+};
+// reservation and reminder settings, from a form; anything not sent keeps its current value
+const NEW_EMI = { hold_days: 0, remind_before: DEFAULT_BEFORE, remind_due: true, remind_overdue: true, remind_in_app: true, remind_email: false, remind_to: '' };
+function emiSettings(body, old = NEW_EMI) {
   const days = (k, label, max) => {
     if (!(k in body) || body[k] === '' || body[k] == null) return old[k];
     const n = Number(body[k]);
     if (!Number.isInteger(n) || n < 0 || n > max) bad(`${label}: enter 0 to ${max} days.`);
     return n;
   };
+  let before = old.remind_before;
+  if ('remind_before' in body) before = beforeList(body.remind_before);
+  else if (body.remind_days !== undefined && body.remind_days !== '' && body.remind_days !== null) { const n = days('remind_days', 'Remind before', 30); before = n ? [n] : []; } // older forms: one point
   return {
-    hold_days: days('hold_days', 'Hold from', 31), remind_days: days('remind_days', 'Remind before', 30),
+    hold_days: days('hold_days', 'Reserve from', 31), remind_before: before,
+    remind_due: flag(body.remind_due, old.remind_due), remind_overdue: flag(body.remind_overdue, old.remind_overdue),
     remind_in_app: flag(body.remind_in_app, old.remind_in_app), remind_email: flag(body.remind_email, old.remind_email),
     remind_to: 'remind_to' in body ? emailList(body.remind_to) : old.remind_to,
   };
 }
 
+// marks each unpaid instalment covered or not: can its account's balance pay it together with its earlier EMIs?
+async function withCoverage(rows, today) {
+  const balances = new Map((await position({ query: q }, { today, upTo: today })).rows.filter((r) => r.id != null).map((r) => [r.id, r.today]));
+  const cover = coverage(rows.filter((r) => !r.projected && r.left > 0), balances);
+  return rows.map((r) => { const c = cover.get(r.payment_id); return c && !r.projected ? { ...r, covered: c.covered, short_by: c.shortBy } : r; });
+}
+
 // every EMI instalment with its state: paid · overdue · due (today) · upcoming (next 30 days) · scheduled (later) · cancelled.
-// reserved = its money is being held now. Future months beyond the records are projected (projected: true).
+// reserved = its money is set aside in this app now (an internal reservation, not a hold at the bank). Future months beyond the records are projected (projected: true).
 async function emiSchedule(db, today) {
   const { rows } = await db.query(`SELECT p.id AS payment_id, p.emi_id, e.lender, e.ref AS loan_ref, p.bank_id, b.name AS bank_name, p.due_date, p.amount, p.status,
       coalesce(s.paid, 0)::bigint AS paid, s.last_date, s.refs, (p.due_date - e.hold_days) AS hold_from
@@ -260,11 +280,11 @@ async function runReminders({ force = false } = {}) {
   return withTx(async (c) => {
     await c.query('SELECT pg_advisory_xact_lock(7103)'); // one run at a time
     await syncEmis(c, addDays(today, HORIZON));
-    const free = new Map((await position(c, { today, upTo: today })).rows.filter((r) => r.id != null).map((r) => [r.id, r.free]));
-    const { rows: settings } = await c.query('SELECT id, remind_days, remind_in_app, remind_email, remind_to, hold_days FROM emis');
+    const balances = new Map((await position(c, { today, upTo: today })).rows.filter((r) => r.id != null).map((r) => [r.id, r.today]));
+    const { rows: settings } = await c.query('SELECT id, remind_before, remind_due, remind_overdue, remind_in_app, remind_email, remind_to, hold_days FROM emis');
     const cfg = new Map(settings.map((s) => [s.id, s]));
     const instalments = (await emiSchedule(c, today)).filter((r) => !r.projected && r.left > 0).map((r) => ({ ...r, ...cfg.get(r.emi_id), id: undefined }));
-    const events = dueReminders({ instalments, free, today });
+    const events = dueReminders({ instalments, balances, today });
     const { rows: users } = await c.query("SELECT id, email, role FROM users WHERE active AND role IN ('editor', 'admin')");
     const admins = users.filter((u) => u.role === 'admin').map((u) => u.email);
     let inApp = 0, queued = 0;
@@ -484,7 +504,7 @@ const routes = [
   ['GET', /^\/api\/emis$/, 'viewer', async () => {
     const today = todayIST();
     const { rows } = await q(`SELECT e.id, e.lender, e.ref, e.amount, e.day, e.bank_id, e.start_date, e.end_date, e.hold_days, e.active, b.name AS bank_name,
-        e.remind_days, e.remind_in_app, e.remind_email, e.remind_to,
+        e.remind_before, e.remind_due, e.remind_overdue, e.remind_in_app, e.remind_email, e.remind_to,
         (SELECT min(p.due_date) FROM payments p WHERE p.emi_id = e.id AND p.status = 'OPEN'
            AND p.amount > coalesce((SELECT sum(x.amount) FROM entries x WHERE x.payment_id = p.id), 0)) AS next_due
       FROM emis e JOIN banks b ON b.id = e.bank_id ORDER BY e.active DESC, e.lender, e.id`);
@@ -508,9 +528,9 @@ const routes = [
           [e.lender, e.bankId, e.amount, Number(e.start.slice(8))]);
         if (d) throw err(409, 'duplicate', `An active EMI “${d.lender}” for ${inr(e.amount)} on day ${Number(e.start.slice(8))} from this account already exists. Add another one anyway?`);
       }
-      const { rows: [x] } = await c.query(`INSERT INTO emis (lender, ref, amount, day, bank_id, start_date, end_date, hold_days, remind_days, remind_in_app, remind_email, remind_to, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
-        [e.lender, e.ref, e.amount, Number(e.start.slice(8)), e.bankId, e.start, e.end, e.hold_days, e.remind_days, e.remind_in_app, e.remind_email, e.remind_to, user.id]);
+      const { rows: [x] } = await c.query(`INSERT INTO emis (lender, ref, amount, day, bank_id, start_date, end_date, hold_days, remind_before, remind_due, remind_overdue, remind_in_app, remind_email, remind_to, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::smallint[], $10, $11, $12, $13, $14, $15) RETURNING id`,
+        [e.lender, e.ref, e.amount, Number(e.start.slice(8)), e.bankId, e.start, e.end, e.hold_days, e.remind_before, e.remind_due, e.remind_overdue, e.remind_in_app, e.remind_email, e.remind_to, user.id]);
       await audit(c, user.id, 'emi.add', { id: x.id, ...e });
       await syncEmis(c, addDays(today, HORIZON));
       return x;
@@ -520,17 +540,38 @@ const routes = [
   // change how far ahead money is held and how reminders are sent (send only what changes)
   ['POST', /^\/api\/emis\/(\d+)$/, 'editor', async ({ body, user, m }) => withTx(async (c) => {
     const id = intId(m[1]);
-    const { rows: [old] } = await c.query('SELECT lender, hold_days, remind_days, remind_in_app, remind_email, remind_to FROM emis WHERE id = $1 FOR UPDATE', [id]);
+    const { rows: [old] } = await c.query('SELECT lender, hold_days, remind_before, remind_due, remind_overdue, remind_in_app, remind_email, remind_to FROM emis WHERE id = $1 FOR UPDATE', [id]);
     if (!old) notFound('That EMI doesn’t exist.');
     const next = emiSettings(body, old), diff = changes(old, next);
     if (!Object.keys(diff).length) return {};
-    await c.query('UPDATE emis SET hold_days = $2, remind_days = $3, remind_in_app = $4, remind_email = $5, remind_to = $6 WHERE id = $1',
-      [id, next.hold_days, next.remind_days, next.remind_in_app, next.remind_email, next.remind_to]);
+    await c.query('UPDATE emis SET hold_days = $2, remind_before = $3::smallint[], remind_due = $4, remind_overdue = $5, remind_in_app = $6, remind_email = $7, remind_to = $8 WHERE id = $1',
+      [id, next.hold_days, next.remind_before, next.remind_due, next.remind_overdue, next.remind_in_app, next.remind_email, next.remind_to]);
     await audit(c, user.id, 'emi.edit', { id, lender: old.lender, changes: diff });
     return {};
   })],
 
-  // money held for EMIs and what is left to spend, per account; overdue and upcoming instalments
+  // the dashboard: balances, money reserved for EMIs, what is available, EMIs due soon or overdue, accounts that can't
+  // cover their EMIs, and the money received and paid this month
+  ['GET', /^\/api\/dashboard$/, 'viewer', async () => {
+    const today = todayIST(), from = `${today.slice(0, 8)}01`;
+    const ov = await emiOverview(today);
+    const [open, banks, balances, entries] = await Promise.all([
+      emiSchedule({ query: q }, today).then((rows) => withCoverage(rows.filter((r) => !r.projected && r.left > 0), today)),
+      q('SELECT id, name, bank, last4 FROM banks ORDER BY name, id'), q('SELECT id, bank_id, amount, as_of FROM balances'), q('SELECT kind, bank_id, amount, date FROM entries'),
+    ]);
+    const month = bankStatements({ banks: banks.rows, balances: balances.rows, entries: entries.rows, from, to: today }).total;
+    const sum = (xs) => ({ count: xs.length, amount: xs.reduce((n, r) => n + r.left, 0) });
+    const within = (days) => sum(open.filter((r) => r.due_date >= today && r.due_date <= addDays(today, days)));
+    return {
+      today, from, balance: ov.totals.balance, reserved: ov.totals.reserved, available: ov.totals.available,
+      next7: within(7), next30: within(30), overdue: sum(open.filter((r) => r.due_date < today)),
+      received: month.received, paid: month.paid,
+      shortfalls: open.filter((r) => r.covered === false && r.due_date <= addDays(today, 30))
+        .map((r) => ({ payment_id: r.payment_id, lender: r.lender, bank_id: r.bank_id, bank_name: r.bank_name, due_date: r.due_date, left: r.left, short_by: r.short_by })),
+    };
+  }],
+
+  // money reserved for EMIs and what is left to spend, per account; overdue and upcoming instalments
   ['GET', /^\/api\/emis\/overview$/, 'viewer', async () => emiOverview(todayIST())],
 
   // every instalment: past and current ones from the records, future ones projected 12 months ahead
@@ -541,7 +582,7 @@ const routes = [
     const from = ymd(p.get('from'), 'From', { optional: true }), to = ymd(p.get('to'), 'To', { optional: true });
     if (from && to && from > to) bad('The “from” date must be on or before the “to” date.');
     await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
-    const rows = (await emiSchedule({ query: q }, today)).filter((r) =>
+    const rows = (await withCoverage(await emiSchedule({ query: q }, today), today)).filter((r) =>
       (!status || (status === 'open' ? ['overdue', 'due', 'upcoming', 'scheduled'].includes(r.state) && !r.projected : r.state === status)) &&
       (!emi || r.emi_id === emi) && (!bank || r.bank_id === bank) && (!from || r.due_date >= from) && (!to || r.due_date <= to));
     return { today, rows };
