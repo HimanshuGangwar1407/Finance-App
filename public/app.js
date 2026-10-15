@@ -60,7 +60,7 @@ function form(fields, submitLabel, onSubmit, { onCancel } = {}) {
 }
 
 function openDialog(title, fields, submitLabel, onSubmit, intro) {
-  dlg.replaceChildren(h('h2', {}, title), intro && h('p', { class: 'muted' }, intro), form(fields, submitLabel, async (v) => { await onSubmit(v); dlg.close(); await load(); }, { onCancel: () => dlg.close() }));
+  dlg.replaceChildren(...[h('h2', {}, title), intro && h('p', { class: 'muted' }, intro), form(fields, submitLabel, async (v) => { await onSubmit(v); dlg.close(); await load(); }, { onCancel: () => dlg.close() })].filter(Boolean));
   dlg.showModal();
 }
 // asks before adding something that looks like a duplicate
@@ -90,7 +90,7 @@ async function load() {
 function render() {
   const P = S.pos, T = P.total, isToday = P.date === P.today;
   const bankOpts = P.banks.map((b) => [b.id, `${b.name} — ${b.bank} XXXX${b.last4}`]);
-  const anyBank = [['', 'Not decided yet'], ...bankOpts];
+  const anyBank = [...bankOpts, ['', 'Not decided yet']]; // the first account is picked unless changed
 
   const warnings = [];
   if (!P.banks.length) warnings.push(can('admin') ? 'Add your bank accounts to start (“+ Account”).' : 'No bank accounts yet — ask an admin to add them.');
@@ -110,7 +110,7 @@ function render() {
     !isToday && h('button', { class: 'small', onclick: () => { S.date = P.today; load(); } }, 'Back to today'),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: S.approvedOnly, onchange: (e) => { S.approvedOnly = e.target.checked; load(); } }), 'Approved payments only'),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: S.uncertain, onchange: (e) => { S.uncertain = e.target.checked; load(); } }), 'Count uncertain receipts'),
-    h('span', { style: 'flex:1' }),
+    h('span', { class: 'grow' }),
     can('editor') && P.banks.length > 0 && h('button', { onclick: () => balanceDialog(bankOpts) }, 'Enter bank balance'),
     can('editor') && h('button', { onclick: () => paymentDialog(anyBank) }, '+ Payment'),
     can('editor') && h('button', { onclick: () => receiptDialog(anyBank) }, '+ Receipt'),
@@ -173,7 +173,7 @@ function settleDialog(i, bankOpts) {
   const out = i.kind === 'OUT';
   openDialog(out ? `Mark paid: ${i.name}` : `Mark received: ${i.name}`, [
     { name: 'amount', label: 'Amount (₹)', type: 'money', value: rupees(i.amount), required: true, hint: `Still ${out ? 'to pay' : 'to receive'}: ${inr(i.amount)}. Enter less for a part ${out ? 'payment' : 'receipt'}.` },
-    { name: 'bank_id', label: out ? 'Paid from' : 'Received in', type: 'select', value: i.bankId ?? '', options: [['', 'Choose…'], ...bankOpts], required: true },
+    { name: 'bank_id', label: out ? 'Paid from' : 'Received in', type: 'select', value: i.bankId ?? (bankOpts.length === 1 ? bankOpts[0][0] : ''), options: [['', 'Choose…'], ...bankOpts], required: true },
     { name: 'date', label: 'Date in the bank', type: 'date', value: S.pos.today, max: S.pos.today, required: true },
     { name: 'ref', label: 'Bank reference (UTR / cheque no.)', required: true },
   ], 'Save', (v) => api(`/api/${out ? 'payments' : 'receipts'}/${i.id}/settle`, v));

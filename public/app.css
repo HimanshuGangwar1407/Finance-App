@@ -63,3 +63,4 @@ dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--c
 dialog::backdrop { background: rgba(0, 0, 0, .4); }
 .err { color: var(--neg); font-size: 14px; min-height: 1em; margin: 4px 0 10px; }
 .narrow { max-width: 380px; margin: 60px auto; }
+.grow { flex: 1; }
