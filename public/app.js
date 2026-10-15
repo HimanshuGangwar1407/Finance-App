@@ -3,6 +3,9 @@
 
 const app = document.getElementById('app'), dlg = document.getElementById('dlg');
 const S = { user: null, today: '', date: '', approvedOnly: false, uncertain: true, pos: null };
+// what one signed-in person was looking at; cleared on sign-out so the next person starts fresh
+const fresh = () => Object.assign(S, { view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, approvedOnly: false, uncertain: true });
+fresh();
 
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
@@ -29,7 +32,7 @@ const can = (role) => ({ viewer: 0, editor: 1, admin: 2 })[S.user.role] >= ({ vi
 async function api(path, body) {
   const r = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const j = await r.json().catch(() => ({ error: { message: `The app’s server didn’t answer (${path} gave HTTP ${r.status}, not app data). Check that the server or the Vercel API function is running.` } }));
-  if (r.status === 401 && S.user && !path.endsWith('/login')) { S.user = null; boot(); }
+  if (r.status === 401 && S.user && !path.endsWith('/login')) { S.user = null; fresh(); boot(); }
   if (!r.ok) throw Object.assign(new Error(j.error?.message || 'Something went wrong.'), { code: j.error?.code });
   return j;
 }
@@ -81,11 +84,28 @@ function authScreen(needsSetup) {
     form(fields, needsSetup ? 'Create account' : 'Sign in', async (v) => { S.user = (await api(needsSetup ? '/api/setup' : '/api/login', v)).user; await load(); })));
 }
 
-// ── the day's position ──
+// ── the page shown: the day's position, People, Positions, or the activity log ──
 async function load() {
+  if (S.view === 'activity' && !can('admin')) S.view = 'position';
+  try { await ({ position: loadPosition, people: loadPeople, positions: loadPositions, activity: loadActivity })[S.view](); }
+  catch (e) { if (S.user) app.replaceChildren(topBar(), h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again'))); }
+}
+
+function topBar() {
+  const tabs = [['position', 'Bank position'], ['people', 'People'], ['positions', 'Positions'], can('admin') && ['activity', 'Activity log']].filter(Boolean);
+  return h('div', { class: 'topbar' },
+    h('nav', { class: 'tabs', 'aria-label': 'Sections' }, tabs.map(([v, t]) => h('button', {
+      class: `tab ${v === S.view ? 'on' : ''}`, 'aria-current': v === S.view ? 'page' : null, onclick: () => { if (S.view !== v) { S.view = v; load(); } },
+    }, t))),
+    h('div', { class: 'who' }, h('span', { class: 'avatar' }, S.user.name.trim().slice(0, 1).toUpperCase()), h('span', { class: 'who-name' }, S.user.name, h('small', {}, S.user.role)),
+      h('button', { class: 'small', onclick: async () => { await api('/api/logout', {}); S.user = null; fresh(); boot(); } }, 'Sign out')));
+}
+
+// ── the day's position ──
+async function loadPosition() {
   const p = new URLSearchParams({ date: S.date, approvedOnly: S.approvedOnly ? '1' : '0', uncertain: S.uncertain ? '1' : '0' });
-  try { S.pos = await api(`/api/position?${p}`); render(); }
-  catch (e) { if (S.user) app.replaceChildren(h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again'))); }
+  S.pos = await api(`/api/position?${p}`);
+  render();
 }
 
 function render() {
@@ -113,9 +133,7 @@ function render() {
   const tile = (cls, label, p, sub) => h('div', { class: `tile ${cls}` }, h('div', { class: 'tile-lbl' }, label), h('div', { class: `tile-amt ${p < 0 ? 'neg' : ''}` }, inr(p)), sub && h('div', { class: 'tile-sub' }, sub));
   const hero = h('header', { class: 'hero' },
     h('div', { class: 'hero-top' },
-      h('div', {}, h('div', { class: 'eyebrow' }, isToday ? `Today · ${nice(P.date)}` : `Looking ahead to ${nice(P.date)}`), h('h1', {}, isToday ? 'Today’s bank position' : 'Bank position')),
-      h('div', { class: 'who' }, h('span', { class: 'avatar' }, S.user.name.trim().slice(0, 1).toUpperCase()), h('span', { class: 'who-name' }, S.user.name, h('small', {}, S.user.role)),
-        h('button', { class: 'ghost', onclick: async () => { await api('/api/logout', {}); S.user = null; boot(); } }, 'Sign out'))),
+      h('div', {}, h('div', { class: 'eyebrow' }, isToday ? `Today · ${nice(P.date)}` : `Looking ahead to ${nice(P.date)}`), h('h1', {}, isToday ? 'Today’s bank position' : 'Bank position'))),
     h('div', { class: 'tiles' },
       tile('t-bal', 'Bank balance now', T.today, `${P.rows.filter((r) => r.id != null).length} account(s)`),
       tile('t-pay', '− Payments to make', T.pay, `${count('OUT')} payment(s)`),
@@ -174,7 +192,7 @@ function render() {
       rows.length ? rows.map((i) => itemRow(i, bankOpts)) : h('p', { class: 'empty' }, empty));
   };
 
-  app.replaceChildren(...[hero, controls, alertBox, h('div', { class: 'cols' },
+  app.replaceChildren(...[topBar(), hero, controls, alertBox, h('div', { class: 'cols' },
     list('OUT', 'd-red', isToday ? 'Payments to make today' : 'Payments to make', 'Nothing to pay.'),
     list('IN', 'd-green', isToday ? 'Receipts due today' : 'Receipts due', 'Nothing expected.')), accounts].filter(Boolean));
 }
@@ -300,6 +318,189 @@ async function usersDialog() {
     { name: 'role', label: 'Role', type: 'select', value: 'editor', options: [['viewer', 'Viewer — can only look'], ['editor', 'Editor — adds and updates entries'], ['admin', 'Admin — also approves payments, adds accounts and users']] },
     { name: 'password', label: 'First password', type: 'password', required: true, autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers. Share it with them privately.' },
   ], 'Add user', (v) => api('/api/users', v), users.map((u) => `${u.name} (${u.role})`).join(' · '));
+}
+
+// ── People ──
+const when = (t) => (t ? new Date(t).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' }) : '');
+const pageHead = (title, sub, ...actions) => h('header', { class: 'page-head' }, h('div', {}, h('h1', {}, title), sub && h('div', { class: 'muted' }, sub)), h('div', { class: 'bar' }, actions));
+const statusChip = (active) => h('span', { class: `chip ${active ? 'c-green' : ''}` }, active ? 'Active' : 'Inactive');
+// keep the cursor in a search box when its page re-renders
+const keepFocus = (render) => {
+  const a = document.activeElement, name = a?.name, pos = a?.selectionStart;
+  render();
+  const n = name && app.querySelector(`input[name="${name}"]`);
+  if (n && a?.tagName === 'INPUT' && a.type === 'search') { n.focus(); n.setSelectionRange(pos, pos); }
+};
+let searchTimer;
+const onSearch = (apply) => (e) => { clearTimeout(searchTimer); const v = e.target.value; searchTimer = setTimeout(() => { apply(v); load(); }, 250); };
+
+async function loadPeople() {
+  const p = new URLSearchParams(S.pf);
+  const [{ people, contactsHidden }, { positions }] = await Promise.all([api(`/api/people?${p}`), api('/api/positions')]);
+  keepFocus(() => renderPeople(people, positions, contactsHidden));
+}
+
+function renderPeople(people, positions, hidden) {
+  const filters = h('div', { class: 'card toolbar' },
+    h('div', { class: 'bar grow' },
+      h('input', { type: 'search', name: 'q', class: 'search', placeholder: hidden ? 'Search name or position' : 'Search name, email, phone or position', value: S.pf.q, oninput: onSearch((v) => { S.pf.q = v; }), 'aria-label': 'Search people' }),
+      h('select', { 'aria-label': 'Status', onchange: (e) => { S.pf.status = e.target.value; load(); } },
+        [['active', 'Active'], ['inactive', 'Inactive'], ['all', 'Everyone']].map(([v, t]) => h('option', { value: v, selected: S.pf.status === v }, t))),
+      h('select', { 'aria-label': 'Position', onchange: (e) => { S.pf.position = e.target.value; load(); } },
+        [['', 'All positions'], ['none', 'No position'], ...positions.map((x) => [String(x.id), x.name + (x.active ? '' : ' (inactive)')])].map(([v, t]) => h('option', { value: v, selected: S.pf.position === v }, t)))));
+  const table = people.length
+    ? h('div', { class: 'scroll' }, h('table', { class: 'people' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Position'), !hidden && h('th', {}, 'Email'), !hidden && h('th', {}, 'Phone'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
+      h('tbody', {}, people.map((x) => h('tr', { class: x.active ? '' : 'inactive' },
+        h('td', {}, h('button', { class: 'link', onclick: () => personView(x, positions, hidden) }, x.name)),
+        h('td', {}, x.position ? h('span', { class: `chip ${x.position_active ? 'c-violet' : ''}` }, x.position) : h('span', { class: 'muted' }, '—')),
+        !hidden && h('td', {}, x.email || h('span', { class: 'muted' }, '—')),
+        !hidden && h('td', { class: 'nowrap' }, x.phone || h('span', { class: 'muted' }, '—')),
+        h('td', {}, statusChip(x.active)),
+        can('editor') && h('td', { class: 'acts-cell' },
+          h('button', { class: 'small', onclick: () => personForm(x, positions) }, 'Edit'),
+          h('button', { class: 'small', onclick: () => setPersonActive(x, !x.active) }, x.active ? 'Deactivate' : 'Activate')))))))
+    : h('p', { class: 'empty' }, S.pf.q || S.pf.position || S.pf.status !== 'active' ? 'No one matches.' : 'No people yet.');
+  app.replaceChildren(topBar(),
+    pageHead('People', `${people.length} shown${hidden ? ' · contact details are visible to editors and admins' : ''}`,
+      can('editor') && h('button', { class: 'primary', onclick: () => personForm(null, positions) }, '+ Person')),
+    filters, h('section', { class: 'card' }, table));
+}
+
+function personView(x, positions, hidden) {
+  const row = (k, v) => v !== undefined && h('div', { class: 'kv' }, h('span', { class: 'muted' }, k), h('span', {}, v || '—'));
+  dlg.className = '';
+  dlg.replaceChildren(h('h2', {}, x.name, ' ', statusChip(x.active)),
+    h('div', { class: 'kvs' },
+      row('Position', x.position ? `${x.position}${x.position_active ? '' : ' (inactive position)'}` : ''),
+      !hidden && row('Email', x.email), !hidden && row('Phone', x.phone), !hidden && row('Notes', x.notes),
+      row('Added', `${when(x.created_at)}${x.created_by ? ` by ${x.created_by}` : ''}`),
+      row('Last changed', `${when(x.updated_at)}${x.updated_by ? ` by ${x.updated_by}` : ''}`)),
+    h('div', { class: 'bar' },
+      can('editor') && h('button', { class: 'primary', onclick: () => personForm(x, positions) }, 'Edit'),
+      h('button', { onclick: () => dlg.close() }, 'Close')));
+  dlg.showModal();
+}
+
+function personForm(x, positions) {
+  // a person keeps an inactive position until it is changed; new choices are active positions only
+  const opts = [['', 'No position'], ...positions.filter((p) => p.active || p.id === x?.position_id).map((p) => [p.id, p.name + (p.active ? '' : ' (inactive)')])];
+  openDialog(x ? `Edit ${x.name}` : 'Add a person', [
+    { name: 'name', label: 'Full name', value: x?.name, required: true },
+    { name: 'position_id', label: 'Position', type: 'select', value: x?.position_id ?? '', options: opts, hint: positions.length ? null : 'No positions yet — an admin adds them under Positions.' },
+    { name: 'email', label: 'Email (optional)', type: 'email', value: x?.email },
+    { name: 'phone', label: 'Phone (optional)', type: 'tel', value: x?.phone, placeholder: '+91 98765 43210' },
+    { name: 'notes', label: 'Notes (optional)', value: x?.notes },
+  ], x ? 'Save changes' : 'Add person', (v) => api(x ? `/api/people/${x.id}` : '/api/people', v));
+}
+
+const setPersonActive = (x, active) => {
+  if (!active && !confirm(`Deactivate ${x.name}? They stay on record and can be activated again.`)) return;
+  act(`/api/people/${x.id}/active`, { active });
+};
+
+// ── Positions ──
+async function loadPositions() {
+  const [{ positions }, people] = await Promise.all([api('/api/positions'), can('editor') ? api('/api/people?status=active') : null]);
+  renderPositions(positions, people?.people ?? []);
+}
+
+function renderPositions(positions, people) {
+  const list = positions.length
+    ? positions.map((p) => h('div', { class: `pos-row ${p.active ? '' : 'inactive'}` },
+      h('div', { class: 'item-main' },
+        h('div', {}, h('strong', {}, p.name), ' ', statusChip(p.active)),
+        p.description && h('div', { class: 'muted small' }, p.description),
+        h('div', { class: 'muted small' }, `${p.people} active ${p.people === 1 ? 'person' : 'people'}`)),
+      h('div', { class: 'acts' },
+        can('editor') && p.active && h('button', { class: 'small c-violet', onclick: () => assignDialog(p, people) }, 'Assign'),
+        h('button', { class: 'small', onclick: () => { S.view = 'people'; S.pf = { status: 'active', position: String(p.id), q: '' }; load(); } }, 'View people'),
+        can('admin') && h('button', { class: 'small', onclick: () => positionForm(p) }, 'Edit'),
+        can('admin') && h('button', { class: 'small', onclick: () => setPositionActive(p, !p.active) }, p.active ? 'Deactivate' : 'Activate'))))
+    : h('p', { class: 'empty' }, can('admin') ? 'No positions yet. Add the ones your team uses, e.g. Accountant, Manager, Director.' : 'No positions yet — an admin adds them.');
+  app.replaceChildren(topBar(),
+    pageHead('Positions', can('admin') ? 'Create the positions your team uses and assign them to people.' : 'The positions people can hold.',
+      can('admin') && h('button', { class: 'primary', onclick: () => positionForm(null) }, '+ Position')),
+    h('section', { class: 'card' }, list));
+}
+
+function positionForm(p) {
+  openDialog(p ? `Edit ${p.name}` : 'Add a position', [
+    { name: 'name', label: 'Position name', value: p?.name, placeholder: 'e.g. Accountant', required: true },
+    { name: 'description', label: 'Description (optional)', value: p?.description },
+  ], p ? 'Save changes' : 'Add position', (v) => api(p ? `/api/positions/${p.id}` : '/api/positions', v));
+}
+
+const setPositionActive = (p, active) => {
+  if (!active && !confirm(`Deactivate “${p.name}”? People keep it, but it can’t be given to anyone new until it is activated again.`)) return;
+  act(`/api/positions/${p.id}`, { active });
+};
+
+function assignDialog(p, people) {
+  const others = people.filter((x) => x.position_id !== p.id);
+  if (!others.length) return alert(people.length ? `Everyone active already holds “${p.name}”.` : 'There are no active people yet. Add them under People.');
+  openDialog(`Assign “${p.name}”`, [
+    { name: 'person_id', label: 'Person', type: 'select', options: others.map((x) => [x.id, x.name + (x.position ? ` — now ${x.position}` : '')]), required: true },
+  ], 'Assign', (v) => api(`/api/positions/${p.id}/assign`, v), 'Their current position, if any, is replaced.');
+}
+
+// ── Activity log (admins) ──
+const ACTION_LABELS = {
+  login: 'Signed in', 'login.failed': 'Failed sign-in', 'login.locked': 'Locked out (too many wrong passwords)', logout: 'Signed out',
+  setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user',
+  'person.add': 'Added a person', 'person.edit': 'Edited a person', 'person.activate': 'Activated a person', 'person.deactivate': 'Deactivated a person', 'person.assign': 'Assigned a position',
+  'position.add': 'Added a position', 'position.edit': 'Edited a position', 'position.activate': 'Activated a position', 'position.deactivate': 'Deactivated a position',
+  'payment.add': 'Added a payment', 'payment.paid': 'Marked a payment paid', 'payment.approve': 'Approved a payment', 'payment.cancel': 'Cancelled a payment',
+  'receipt.add': 'Added a receipt', 'receipt.received': 'Marked a receipt received', 'receipt.cancel': 'Cancelled a receipt',
+  'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account',
+};
+const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|setup|admin)/.test(a) ? 'c-blue' : /^(person|position|user)/.test(a) ? 'c-violet' : /cancel|deactivate|stop/.test(a) ? 'c-red' : 'c-amber');
+// a short, readable summary of what was recorded
+function describe(a, positions) {
+  const d = a.detail || {}, out = [];
+  const fmt = (k, v) => (v == null || v === '' ? '—' : k === 'position_id' ? positions.get(v) ?? `#${v}` : /amount/i.test(k) && typeof v === 'number' ? inr(v) : String(v));
+  for (const k of ['name', 'payee', 'party', 'lender', 'email', 'role', 'reason']) if (d[k]) out.push(String(d[k]));
+  if (d.amount != null && typeof d.amount === 'number') out.push(inr(d.amount));
+  for (const k of ['date', 'asOf', 'ref']) if (d[k]) out.push(String(d[k]));
+  if (d.changes) out.push(Object.entries(d.changes).map(([k, [b, n]]) => `${k.replace('_id', '')}: ${fmt(k, b)} → ${fmt(k, n)}`).join(', '));
+  if (d.position_id && !d.changes) out.push(`position: ${fmt('position_id', d.position_id)}`);
+  return out.join(' · ');
+}
+
+async function loadActivity(more = false) {
+  const p = new URLSearchParams(Object.entries(S.af).filter(([, v]) => v));
+  if (more && S.act?.rows.length) p.set('before', S.act.rows.at(-1).id);
+  const [{ activity, more: hasMore }, users, positions] = await Promise.all([
+    api(`/api/activity?${p}`), more ? S.act.users : api('/api/users').then((x) => x.users), more ? S.act.positions : api('/api/positions').then((x) => new Map(x.positions.map((y) => [y.id, y.name]))),
+  ]);
+  S.act = { rows: more ? [...S.act.rows, ...activity] : activity, more: hasMore, users, positions };
+  keepFocus(renderActivity);
+}
+
+function renderActivity() {
+  const { rows, more, users, positions } = S.act, f = S.af;
+  const set = (k) => (e) => { S.af = { ...S.af, [k]: e.target.value }; load(); };
+  const filters = h('div', { class: 'card toolbar' }, h('div', { class: 'bar grow' },
+    h('input', { type: 'search', name: 'aq', class: 'search', placeholder: 'Search actions, names, references', value: f.q ?? '', oninput: onSearch((v) => { S.af = { ...S.af, q: v }; }), 'aria-label': 'Search activity' }),
+    h('select', { 'aria-label': 'Who', onchange: set('user') }, [['', 'Everyone'], ...users.map((u) => [String(u.id), `${u.name} (${u.role})`]), ['none', 'Not signed in']].map(([v, t]) => h('option', { value: v, selected: (f.user ?? '') === v }, t))),
+    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'All activity'], ['signin', 'Sign-ins'], ['people', 'People'], ['positions', 'Positions'], ['payments', 'Payments'], ['receipts', 'Receipts'], ['emis', 'EMIs'], ['balances', 'Bank balances'], ['accounts', 'Bank accounts'], ['users', 'Users']]
+      .map(([v, t]) => h('option', { value: v, selected: (f.type ?? '') === v }, t))),
+    h('label', { class: 'check' }, 'From', h('input', { type: 'date', value: f.from ?? '', max: S.today, onchange: set('from') })),
+    h('label', { class: 'check' }, 'To', h('input', { type: 'date', value: f.to ?? '', max: S.today, onchange: set('to') })),
+    Object.values(f).some(Boolean) && h('button', { class: 'small', onclick: () => { S.af = {}; load(); } }, 'Clear')));
+  const table = rows.length
+    ? h('div', { class: 'scroll' }, h('table', { class: 'activity' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'When (IST)'), h('th', {}, 'Who'), h('th', {}, 'What'), h('th', {}, 'Details'))),
+      h('tbody', {}, rows.map((a) => h('tr', {},
+        h('td', { class: 'nowrap' }, when(a.at)),
+        h('td', {}, a.user_name ? h('span', {}, a.user_name, h('div', { class: 'muted small' }, a.user_role)) : h('span', { class: 'muted' }, 'Not signed in')),
+        h('td', {}, h('span', { class: `chip ${actionTone(a.action)}` }, ACTION_LABELS[a.action] ?? a.action)),
+        h('td', { class: 'small' }, describe(a, positions)))))))
+    : h('p', { class: 'empty' }, 'Nothing matches.');
+  app.replaceChildren(topBar(),
+    pageHead('Activity log', 'Everything people do in the app: sign-ins (including failed ones), changes, approvals and cancellations — who did it and when.'),
+    filters, h('section', { class: 'card' }, table,
+      more && h('div', { class: 'more' }, h('button', { onclick: () => loadActivity(true).catch((e) => alert(e.message)) }, 'Load older activity'))));
 }
 
 async function boot() {

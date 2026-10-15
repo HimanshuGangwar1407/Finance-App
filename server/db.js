@@ -122,6 +122,35 @@ const MIGRATIONS = [
    );
    ALTER TABLE payments ADD COLUMN emi_id integer REFERENCES emis(id);
    CREATE UNIQUE INDEX payments_emi_date ON payments (emi_id, due_date) WHERE emi_id IS NOT NULL;`,
+  // people (staff, contacts) and the positions an admin defines for them; nothing is deleted, only deactivated
+  `CREATE TABLE positions (
+     id          serial PRIMARY KEY,
+     name        text NOT NULL,
+     description text NOT NULL DEFAULT '',
+     active      boolean NOT NULL DEFAULT true,
+     created_by  integer REFERENCES users(id),
+     created_at  timestamptz NOT NULL DEFAULT now(),
+     updated_by  integer REFERENCES users(id),
+     updated_at  timestamptz NOT NULL DEFAULT now()
+   );
+   CREATE UNIQUE INDEX positions_name ON positions (lower(name));
+   CREATE TABLE people (
+     id          serial PRIMARY KEY,
+     name        text NOT NULL,
+     email       text NOT NULL DEFAULT '',
+     phone       text NOT NULL DEFAULT '',
+     position_id integer REFERENCES positions(id),
+     notes       text NOT NULL DEFAULT '',
+     active      boolean NOT NULL DEFAULT true,
+     created_by  integer REFERENCES users(id),
+     created_at  timestamptz NOT NULL DEFAULT now(),
+     updated_by  integer REFERENCES users(id),
+     updated_at  timestamptz NOT NULL DEFAULT now()
+   );
+   CREATE UNIQUE INDEX people_email ON people (lower(email)) WHERE email <> '';
+   CREATE INDEX people_position ON people (position_id);
+   CREATE INDEX audit_user ON audit (user_id, id DESC);
+   CREATE INDEX audit_action ON audit (action, id DESC);`,
 ];
 
 let ready;
