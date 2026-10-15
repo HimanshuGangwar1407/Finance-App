@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --test \"test/**/*.test.js\""
+    "test": "node --test \"test/**/*.test.js\"",
+    "create-admin": "node scripts/create-admin.js"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.10",

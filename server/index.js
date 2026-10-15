@@ -27,6 +27,26 @@ const email = (v) => { const s = str(v, 200).toLowerCase(); if (!/^[^@\s]+@[^@\s
 const optBank = (v) => (v === '' || v == null ? null : intId(v, 'Account'));
 const notFuture = (d, label) => { if (d > todayIST()) bad(`${label} can’t be in the future.`); return d; };
 async function bankExists(c, id) { if (id != null && !(await c.query('SELECT 1 FROM banks WHERE id = $1', [id])).rowCount) bad('That account doesn’t exist.'); return id; }
+const log = (uid, action, detail) => audit({ query: q }, uid, action, detail); // outside a transaction
+
+// people & positions: input checks, and what changed (kept in the activity log as {field: [before, after]})
+const optEmail = (v) => (str(v, 200) ? email(v) : '');
+const phone = (v) => { const s = str(v, 30); if (s && !/^\+?[\d\s()-]{6,20}$/.test(s)) bad('Phone: use digits, spaces, + or -, e.g. +91 98765 43210.'); return s; };
+const optPosition = (v) => (v === '' || v == null ? null : intId(v, 'Position'));
+async function usablePosition(c, id) {
+  if (id == null) return null;
+  const { rows: [p] } = await c.query('SELECT active FROM positions WHERE id = $1', [id]);
+  if (!p) bad('That position doesn’t exist.');
+  if (!p.active) bad('That position is inactive. Activate it first, or choose another.');
+  return id;
+}
+const changes = (before, after) => Object.fromEntries(Object.keys(after).filter((k) => before[k] !== after[k]).map((k) => [k, [before[k], after[k]]]));
+// a unique name/email clash becomes a readable message
+const unique = (message) => (e) => { throw e.code === 'conflict' ? err(409, 'conflict', message) : e; };
+const likeTerm = (s) => `%${s.replace(/[\\%_]/g, '\\$&')}%`;
+// activity log filters: a type is the part of the action before the dot
+const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user'] };
+const istStart = (d) => new Date(`${d}T00:00:00+05:30`).toISOString();
 
 // makes each active EMI's instalments into payments, up to `through` (once each: a cancelled one stays cancelled)
 async function syncEmis(c, through) {
@@ -94,18 +114,31 @@ const routes = [
   ['POST', /^\/api\/login$/, null, async (ctx) => {
     const e = str(ctx.body.email, 200).toLowerCase(), pw = String(ctx.body.password ?? '');
     const { rows: [u] } = await q('SELECT * FROM users WHERE email = $1 AND active', [e]);
-    if (u && Number(u.lock_until) > Date.now()) throw err(429, 'locked', `Too many wrong attempts. Try again in ${Math.ceil((Number(u.lock_until) - Date.now()) / 60000)} minutes.`);
+    // every attempt is logged with the email typed — never the password
+    if (u && Number(u.lock_until) > Date.now()) {
+      await log(u.id, 'login.failed', { email: e, reason: 'locked' });
+      throw err(429, 'locked', `Too many wrong attempts. Try again in ${Math.ceil((Number(u.lock_until) - Date.now()) / 60000)} minutes.`);
+    }
     if (!A.checkPassword(pw, u ? u.pw : DUMMY_HASH) || !u) {
-      if (u) await q('UPDATE users SET fails = CASE WHEN fails + 1 >= $2 THEN 0 ELSE fails + 1 END, lock_until = CASE WHEN fails + 1 >= $2 THEN $3 ELSE lock_until END WHERE id = $1', [u.id, MAX_FAILS, Date.now() + LOCK_MS]);
+      if (u) {
+        const { rows: [x] } = await q('UPDATE users SET fails = CASE WHEN fails + 1 >= $2 THEN 0 ELSE fails + 1 END, lock_until = CASE WHEN fails + 1 >= $2 THEN $3 ELSE lock_until END WHERE id = $1 RETURNING lock_until',
+          [u.id, MAX_FAILS, Date.now() + LOCK_MS]);
+        await log(u.id, Number(x.lock_until) > Date.now() ? 'login.locked' : 'login.failed', { email: e, reason: 'wrong password' });
+      } else await log(null, 'login.failed', { email: e, reason: 'unknown email' });
       throw err(401, 'unauthenticated', 'Email or password is wrong.');
     }
     await q('UPDATE users SET fails = 0, lock_until = 0 WHERE id = $1', [u.id]);
+    await log(u.id, 'login', { email: u.email });
     const user = { id: u.id, email: u.email, name: u.name, role: u.role, ver: u.ver };
     signIn(ctx, user);
     return { user };
   }],
 
-  ['POST', /^\/api\/logout$/, null, async (ctx) => { ctx.headers.push(['Set-Cookie', A.cookieHeader('', ctx.secure, 0)]); return {}; }],
+  ['POST', /^\/api\/logout$/, null, async (ctx) => {
+    if (ctx.user) await log(ctx.user.id, 'logout', { email: ctx.user.email });
+    ctx.headers.push(['Set-Cookie', A.cookieHeader('', ctx.secure, 0)]);
+    return {};
+  }],
 
   ['GET', /^\/api\/position$/, 'viewer', async ({ url }) => {
     const today = todayIST(), p = url.searchParams;
@@ -281,6 +314,139 @@ const routes = [
       throw x;
     }
   }],
+
+  // ── positions: admins define them; editors assign them to people ──
+  ['GET', /^\/api\/positions$/, 'viewer', async () => ({
+    positions: (await q(`SELECT p.id, p.name, p.description, p.active, p.updated_at,
+        (SELECT count(*)::int FROM people x WHERE x.position_id = p.id AND x.active) AS people
+      FROM positions p ORDER BY p.active DESC, lower(p.name), p.id`)).rows,
+  })],
+
+  ['POST', /^\/api\/positions$/, 'admin', async ({ body, user }) => {
+    const v = { name: need(str(body.name, 80), 'Position name'), description: str(body.description, 300) };
+    return withTx(async (c) => {
+      const { rows: [x] } = await c.query('INSERT INTO positions (name, description, created_by, updated_by) VALUES ($1, $2, $3, $3) RETURNING id', [v.name, v.description, user.id]);
+      await audit(c, user.id, 'position.add', { id: x.id, ...v });
+      return x;
+    }).catch(unique('A position with that name already exists.'));
+  }],
+
+  // edit the name / description, or activate / deactivate (send only what changes)
+  ['POST', /^\/api\/positions\/(\d+)$/, 'admin', async ({ body, user, m }) => {
+    const id = intId(m[1]);
+    return withTx(async (c) => {
+      const { rows: [old] } = await c.query('SELECT name, description, active FROM positions WHERE id = $1 FOR UPDATE', [id]);
+      if (!old) notFound('That position doesn’t exist.');
+      const next = {
+        name: 'name' in body ? need(str(body.name, 80), 'Position name') : old.name,
+        description: 'description' in body ? str(body.description, 300) : old.description,
+        active: 'active' in body ? body.active === true : old.active,
+      };
+      const diff = changes(old, next);
+      if (!Object.keys(diff).length) return {};
+      await c.query('UPDATE positions SET name = $2, description = $3, active = $4, updated_by = $5, updated_at = now() WHERE id = $1', [id, next.name, next.description, next.active, user.id]);
+      const only = Object.keys(diff).join() === 'active';
+      await audit(c, user.id, only ? (next.active ? 'position.activate' : 'position.deactivate') : 'position.edit', { id, name: next.name, changes: diff });
+      return {};
+    }).catch(unique('A position with that name already exists.'));
+  }],
+
+  ['POST', /^\/api\/positions\/(\d+)\/assign$/, 'editor', async ({ body, user, m }) => withTx(async (c) => {
+    const positionId = await usablePosition(c, intId(m[1], 'Position')), personId = intId(body.person_id, 'Person');
+    const { rows: [p] } = await c.query('SELECT name, position_id, active FROM people WHERE id = $1 FOR UPDATE', [personId]);
+    if (!p) notFound('That person doesn’t exist.');
+    if (!p.active) bad(`${p.name} is inactive. Activate them first.`);
+    if (p.position_id === positionId) return {};
+    await c.query('UPDATE people SET position_id = $2, updated_by = $3, updated_at = now() WHERE id = $1', [personId, positionId, user.id]);
+    await audit(c, user.id, 'person.assign', { id: personId, name: p.name, changes: { position_id: [p.position_id, positionId] } });
+    return {};
+  })],
+
+  // ── people ──
+  // viewers see names and positions; contact details and notes are for editors and admins
+  ['GET', /^\/api\/people$/, 'viewer', async ({ url, user }) => {
+    const p = url.searchParams, where = [], args = [], arg = (v) => { args.push(v); return `$${args.length}`; };
+    const hide = RANK[user.role] < RANK.editor;
+    const status = p.get('status') || 'active';
+    if (status === 'active') where.push('x.active');
+    else if (status === 'inactive') where.push('NOT x.active');
+    else if (status !== 'all') bad('Status: choose active, inactive or all.');
+    const pos = p.get('position');
+    if (pos === 'none') where.push('x.position_id IS NULL');
+    else if (pos) where.push(`x.position_id = ${arg(intId(pos, 'Position'))}`);
+    const term = str(p.get('q'), 100);
+    if (term) {
+      const t = arg(likeTerm(term));
+      where.push(`(x.name ILIKE ${t} OR coalesce(ps.name, '') ILIKE ${t}${hide ? '' : ` OR x.email ILIKE ${t} OR x.phone ILIKE ${t}`})`);
+    }
+    const { rows } = await q(`SELECT x.id, x.name, x.email, x.phone, x.notes, x.position_id, ps.name AS position, ps.active AS position_active, x.active,
+        x.created_at, cu.name AS created_by, x.updated_at, uu.name AS updated_by
+      FROM people x LEFT JOIN positions ps ON ps.id = x.position_id LEFT JOIN users cu ON cu.id = x.created_by LEFT JOIN users uu ON uu.id = x.updated_by
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY lower(x.name), x.id LIMIT 500`, args);
+    return { contactsHidden: hide, people: hide ? rows.map(({ email: _e, phone: _p, notes: _n, ...r }) => r) : rows };
+  }],
+
+  ['POST', /^\/api\/people$/, 'editor', async ({ body, user }) => {
+    const v = { name: need(str(body.name, 120), 'Name'), email: optEmail(body.email), phone: phone(body.phone), position_id: optPosition(body.position_id), notes: str(body.notes, 500) };
+    return withTx(async (c) => {
+      await usablePosition(c, v.position_id);
+      const { rows: [x] } = await c.query('INSERT INTO people (name, email, phone, position_id, notes, created_by, updated_by) VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING id',
+        [v.name, v.email, v.phone, v.position_id, v.notes, user.id]);
+      await audit(c, user.id, 'person.add', { id: x.id, name: v.name, position_id: v.position_id });
+      return x;
+    }).catch(unique('Someone in People already has that email.'));
+  }],
+
+  ['POST', /^\/api\/people\/(\d+)$/, 'editor', async ({ body, user, m }) => {
+    const id = intId(m[1]);
+    return withTx(async (c) => {
+      const { rows: [old] } = await c.query('SELECT name, email, phone, position_id, notes FROM people WHERE id = $1 FOR UPDATE', [id]);
+      if (!old) notFound('That person doesn’t exist.');
+      const next = {
+        name: 'name' in body ? need(str(body.name, 120), 'Name') : old.name,
+        email: 'email' in body ? optEmail(body.email) : old.email,
+        phone: 'phone' in body ? phone(body.phone) : old.phone,
+        position_id: 'position_id' in body ? optPosition(body.position_id) : old.position_id,
+        notes: 'notes' in body ? str(body.notes, 500) : old.notes,
+      };
+      const diff = changes(old, next);
+      if (!Object.keys(diff).length) return {};
+      if ('position_id' in diff) await usablePosition(c, next.position_id);
+      await c.query('UPDATE people SET name = $2, email = $3, phone = $4, position_id = $5, notes = $6, updated_by = $7, updated_at = now() WHERE id = $1',
+        [id, next.name, next.email, next.phone, next.position_id, next.notes, user.id]);
+      // the log says which contact fields changed, not their values
+      for (const k of ['email', 'phone', 'notes']) if (diff[k]) diff[k] = ['…', 'changed'];
+      await audit(c, user.id, 'person.edit', { id, name: next.name, changes: diff });
+      return {};
+    }).catch(unique('Someone in People already has that email.'));
+  }],
+
+  ['POST', /^\/api\/people\/(\d+)\/active$/, 'editor', async ({ body, user, m }) => withTx(async (c) => {
+    const id = intId(m[1]), active = body.active === true;
+    const { rows: [p] } = await c.query('UPDATE people SET active = $2, updated_by = $3, updated_at = now() WHERE id = $1 AND active <> $2 RETURNING name', [id, active, user.id]);
+    if (!p) notFound(active ? 'That person is already active.' : 'That person is already inactive.');
+    await audit(c, user.id, active ? 'person.activate' : 'person.deactivate', { id, name: p.name });
+    return {};
+  })],
+
+  // ── activity log: who did what and when, newest first, 50 at a time (admins only) ──
+  ['GET', /^\/api\/activity$/, 'admin', async ({ url }) => {
+    const p = url.searchParams, where = [], args = [], arg = (v) => { args.push(v); return `$${args.length}`; };
+    const who = p.get('user');
+    if (who === 'none') where.push('a.user_id IS NULL');
+    else if (who) where.push(`a.user_id = ${arg(intId(who, 'User'))}`);
+    const type = p.get('type');
+    if (type) where.push(`split_part(a.action, '.', 1) = ANY(${arg(ACTIVITY_TYPES[type] ?? bad('Type: choose one of the options.'))}::text[])`);
+    const from = ymd(p.get('from'), 'From', { optional: true }), to = ymd(p.get('to'), 'To', { optional: true });
+    if (from) where.push(`a.at >= ${arg(istStart(from))}::timestamptz`);
+    if (to) where.push(`a.at < ${arg(istStart(addDays(to, 1)))}::timestamptz`);
+    const term = str(p.get('q'), 100);
+    if (term) { const t = arg(likeTerm(term)); where.push(`(a.action ILIKE ${t} OR a.detail::text ILIKE ${t} OR coalesce(u.name, '') ILIKE ${t} OR coalesce(u.email, '') ILIKE ${t})`); }
+    if (p.get('before')) where.push(`a.id < ${arg(intId(p.get('before'), 'Page'))}`);
+    const { rows } = await q(`SELECT a.id, a.at, a.action, a.detail, a.user_id, u.name AS user_name, u.email AS user_email, u.role AS user_role
+      FROM audit a LEFT JOIN users u ON u.id = a.user_id ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY a.id DESC LIMIT 51`, args);
+    return { activity: rows.slice(0, 50), more: rows.length > 50 };
+  }],
 ];
 
 async function readJson(req) {
@@ -333,7 +499,7 @@ export async function handler(req, res) {
   }
 }
 
-async function localSetup() {
+export async function localSetup() {
   if (process.env.DATABASE_URL || process.env.POSTGRES_URL) return;
   const dir = path.resolve(process.env.DATA_DIR || path.join(ROOT, 'data'));
   await fs.mkdir(dir, { recursive: true });
