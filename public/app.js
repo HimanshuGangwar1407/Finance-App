@@ -4,7 +4,7 @@
 const app = document.getElementById('app'), dlg = document.getElementById('dlg');
 const S = { user: null, today: '', date: '', approvedOnly: false, uncertain: true, pos: null };
 // what one signed-in person was looking at; cleared on sign-out so the next person starts fresh
-const fresh = () => Object.assign(S, { view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, approvedOnly: false, uncertain: true });
+const fresh = () => Object.assign(S, { view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, tf: null, approvedOnly: false, uncertain: true });
 fresh();
 
 function h(tag, attrs, ...kids) {
@@ -87,12 +87,12 @@ function authScreen(needsSetup) {
 // ── the page shown: the day's position, People, Positions, or the activity log ──
 async function load() {
   if (S.view === 'activity' && !can('admin')) S.view = 'position';
-  try { await ({ position: loadPosition, people: loadPeople, positions: loadPositions, activity: loadActivity })[S.view](); }
+  try { await ({ position: loadPosition, transactions: loadTransactions, people: loadPeople, positions: loadPositions, activity: loadActivity })[S.view](); }
   catch (e) { if (S.user) app.replaceChildren(topBar(), h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again'))); }
 }
 
 function topBar() {
-  const tabs = [['position', 'Bank position'], ['people', 'People'], ['positions', 'Positions'], can('admin') && ['activity', 'Activity log']].filter(Boolean);
+  const tabs = [['position', 'Bank position'], ['transactions', 'Transactions'], ['people', 'People'], ['positions', 'Positions'], can('admin') && ['activity', 'Activity log']].filter(Boolean);
   return h('div', { class: 'topbar' },
     h('nav', { class: 'tabs', 'aria-label': 'Sections' }, tabs.map(([v, t]) => h('button', {
       class: `tab ${v === S.view ? 'on' : ''}`, 'aria-current': v === S.view ? 'page' : null, onclick: () => { if (S.view !== v) { S.view = v; load(); } },
@@ -259,7 +259,7 @@ function settleDialog(i, bankOpts) {
   openDialog(out ? `Mark paid: ${i.name}` : `Mark received: ${i.name}`, [
     { name: 'amount', label: 'Amount (₹)', type: 'money', value: rupees(i.amount), required: true, hint: `Still ${out ? 'to pay' : 'to receive'}: ${inr(i.amount)}. Enter less for a part ${out ? 'payment' : 'receipt'}.` },
     { name: 'bank_id', label: out ? 'Paid from' : 'Received in', type: 'select', value: i.bankId ?? (bankOpts.length === 1 ? bankOpts[0][0] : ''), options: [['', 'Choose…'], ...bankOpts], required: true },
-    { name: 'date', label: 'Date in the bank', type: 'date', value: S.pos.today, max: S.pos.today, required: true },
+    { name: 'date', label: 'Date in the bank', type: 'date', value: S.today, max: S.today, required: true },
     { name: 'ref', label: 'Bank reference (UTR / cheque no.)', required: true },
   ], 'Save', (v) => api(`/api/${out ? 'payments' : 'receipts'}/${i.id}/settle`, v));
 }
@@ -298,7 +298,7 @@ function receiptDialog(anyBank) {
     { name: 'bank_id', label: 'Into account', type: 'select', options: anyBank },
     { name: 'ref', label: 'Invoice no. (optional)' },
     { name: 'note', label: 'Note (optional)' },
-  ], 'Add receipt', (v) => api('/api/receipts', v));
+  ], 'Add receipt', (v) => confirmDup((dup) => api('/api/receipts', { ...v, confirmDuplicate: dup })));
 }
 
 function bankDialog() {
@@ -318,6 +318,146 @@ async function usersDialog() {
     { name: 'role', label: 'Role', type: 'select', value: 'editor', options: [['viewer', 'Viewer — can only look'], ['editor', 'Editor — adds and updates entries'], ['admin', 'Admin — also approves payments, adds accounts and users']] },
     { name: 'password', label: 'First password', type: 'password', required: true, autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers. Share it with them privately.' },
   ], 'Add user', (v) => api('/api/users', v), users.map((u) => `${u.name} (${u.role})`).join(' · '));
+}
+
+// ── Transactions: money received and paid, bank statements for a period, reports and exports ──
+// Only money actually received or paid moves a balance; pending receipts and payments are shown apart.
+const monthStart = (d) => `${d.slice(0, 8)}01`;
+function period(preset, today = S.today) {
+  const [y, m] = today.split('-').map(Number);
+  if (preset === 'today') return { from: today, to: today };
+  if (preset === 'lastmonth') { const end = addDays(monthStart(today), -1); return { from: monthStart(end), to: end }; }
+  if (preset === 'fy') return { from: `${m >= 4 ? y : y - 1}-04-01`, to: today }; // Indian financial year, April to March
+  return { from: monthStart(today), to: today };
+}
+const txQuery = (extra = {}) => {
+  const f = S.tf;
+  return new URLSearchParams(Object.entries({ view: f.view, from: f.from, to: f.to, bank: f.bank, type: f.type, status: f.view === 'records' ? f.status : '', q: f.q, ...extra }).filter(([, v]) => v));
+};
+
+async function loadTransactions() {
+  if (!S.tf) S.tf = { preset: 'month', ...period('month'), bank: '', type: '', status: '', q: '', view: 'history' };
+  const [sum, list] = await Promise.all([api(`/api/transactions/summary?${txQuery({ view: '' })}`), api(`/api/transactions?${txQuery()}`)]);
+  keepFocus(() => renderTransactions(sum, list.rows));
+}
+
+const STATE_LABEL = { pending: 'Pending', partial: 'Partly settled', completed: 'Completed', cancelled: 'Cancelled' };
+const STATE_TONE = { pending: 'c-amber', partial: 'c-blue', completed: 'c-green', cancelled: '' };
+
+function renderTransactions(sum, rows) {
+  const f = S.tf, T = sum.total, accounts = sum.accounts;
+  const bankOpts = accounts.map((b) => [b.id, `${b.name} — ${b.bank} XXXX${b.last4}`]);
+  const set = (k) => (e) => { S.tf = { ...S.tf, [k]: e.target.value }; load(); };
+  const setDate = (k) => (e) => { if (e.target.value) { S.tf = { ...S.tf, [k]: e.target.value, preset: 'custom' }; load(); } };
+
+  const filters = h('div', { class: 'card toolbar' }, h('div', { class: 'bar grow' },
+    h('select', { 'aria-label': 'Period', onchange: (e) => { const p = e.target.value; S.tf = { ...S.tf, preset: p, ...(p === 'custom' ? {} : period(p)) }; load(); } },
+      [['today', 'Today'], ['month', 'This month'], ['lastmonth', 'Last month'], ['fy', 'This financial year'], ['custom', 'Custom dates']].map(([v, t]) => h('option', { value: v, selected: f.preset === v }, t))),
+    h('label', { class: 'check' }, 'From', h('input', { type: 'date', name: 'from', value: f.from, max: f.to, onchange: setDate('from') })),
+    h('label', { class: 'check' }, 'To', h('input', { type: 'date', name: 'to', value: f.to, min: f.from, onchange: setDate('to') })),
+    h('select', { 'aria-label': 'Bank account', onchange: set('bank') }, [['', 'All bank accounts'], ...accounts.map((b) => [String(b.id), b.name])].map(([v, t]) => h('option', { value: v, selected: f.bank === v }, t))),
+    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'Receipts and payments'], ['IN', 'Receipts only'], ['OUT', 'Payments only']].map(([v, t]) => h('option', { value: v, selected: f.type === v }, t))),
+    f.view === 'records' && h('select', { 'aria-label': 'Status', onchange: set('status') }, [['', 'Any status'], ['pending', 'Pending'], ['partial', 'Partly settled'], ['completed', 'Completed'], ['cancelled', 'Cancelled']].map(([v, t]) => h('option', { value: v, selected: f.status === v }, t))),
+    h('input', { type: 'search', name: 'txq', class: 'search', placeholder: 'Search party, reference, description', value: f.q, oninput: onSearch((v) => { S.tf = { ...S.tf, q: v }; }), 'aria-label': 'Search transactions' })));
+
+  const tile = (cls, label, p, sub) => h('div', { class: `tile ${cls}` }, h('div', { class: 'tile-lbl' }, label), h('div', { class: `tile-amt ${p < 0 ? 'neg' : ''}` }, inr(p)), sub && h('div', { class: 'tile-sub' }, sub));
+  const P = sum.pending;
+  const summary = h('header', { class: 'hero' },
+    h('div', { class: 'hero-top' }, h('div', {},
+      h('div', { class: 'eyebrow' }, sum.from === sum.to ? nice(sum.from) : `${nice(sum.from)} – ${nice(sum.to)}`),
+      h('h1', {}, f.bank ? `${accounts.find((b) => String(b.id) === f.bank)?.name ?? 'Bank'} balance` : 'Combined bank balance'))),
+    h('div', { class: 'tiles' },
+      tile('t-fin', sum.to === sum.today ? 'Balance now' : `Balance on ${nice(sum.to)}`, T.closing, `Opening ${inr(T.opening)} on ${nice(addDays(sum.from, -1))}`),
+      tile('t-rec', '+ Total received', T.received, `${sum.banks.reduce((n, b) => n + b.count, 0)} transaction(s) in the period`),
+      tile('t-pay', '− Total paid', T.paid, 'Money that left the bank'),
+      tile('t-bal', 'Net for the period', T.received - T.paid, T.corrections ? `Balance corrections ${inr(T.corrections)}` : 'Received − paid')),
+    (P.IN.count > 0 || P.OUT.count > 0) && h('div', { class: 'hold-strip pending-strip' },
+      h('span', { class: 'badge-emi' }, 'PENDING'),
+      h('span', {}, 'Not in the balances above until received or paid: ', h('strong', { class: 'pos' }, inr(P.IN.amount)), ` to receive (${P.IN.count}) · `, h('strong', { class: 'red' }, inr(P.OUT.amount)), ` to pay (${P.OUT.count}).`)));
+
+  const line = (label, p, cls = '', title) => h('div', { class: 'bc-line', title }, h('span', { class: 'muted' }, label), money(p, cls));
+  const cards = sum.banks.length
+    ? h('div', { class: 'bank-cards' }, sum.banks.map((b) => h('section', { class: 'bank-card' },
+      h('div', { class: 'bc-head' }, h('div', {}, h('strong', {}, b.name), h('div', { class: 'muted small' }, b.bank)),
+        !b.balanceEntered && h('span', { class: 'chip c-amber', title: 'Enter a bank balance on the Bank position page so this starts from the right figure.' }, 'no balance entered')),
+      h('div', { class: `bc-amt ${b.closing < 0 ? 'neg' : ''}` }, inr(b.closing)),
+      line(`Opening (${nice(addDays(sum.from, -1))})`, b.opening),
+      line('+ Received', b.received, 'pos'),
+      line('− Paid', b.paid, 'red'),
+      b.corrections !== 0 && line('± Balance corrections', b.corrections, 'amber', 'A balance entered during the period differs from the running figure — e.g. bank charges or interest not recorded here.'),
+      h('div', { class: 'bc-line total' }, h('span', {}, sum.to === sum.today ? '= Current balance' : `= Balance on ${nice(sum.to)}`), money(b.closing)))))
+    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add them on the Bank position page (“+ Account”).' : 'No bank accounts yet.'));
+
+  const exportBtn = (format, label) => h('button', { class: 'small', onclick: () => {
+    const a = h('a', { href: `/api/transactions/export?${txQuery({ format })}`, download: '' });
+    document.body.append(a); a.click(); a.remove();
+  } }, label);
+  const seg = h('div', { class: 'toolbar-row' },
+    h('div', { class: 'seg', role: 'tablist' }, [['history', 'Transaction history'], ['records', 'All receipts & payments']].map(([v, t]) =>
+      h('button', { class: f.view === v ? 'on' : '', role: 'tab', 'aria-selected': f.view === v ? 'true' : 'false', onclick: () => { if (f.view !== v) { S.tf = { ...S.tf, view: v }; load(); } } }, t))),
+    h('div', { class: 'bar' }, h('span', { class: 'muted small' }, `${rows.length} row(s)`), exportBtn('csv', 'Export CSV'), exportBtn('xlsx', 'Export Excel')));
+
+  const table = f.view === 'history' ? historyTableEl(rows) : recordsTableEl(rows, bankOpts);
+  app.replaceChildren(topBar(),
+    pageHead('Receipts, payments & balances', 'Balances move only when money is received or paid. Pending items are shown separately.',
+      can('editor') && h('button', { class: 'c-green', onclick: () => txDialog('IN', accounts) }, '+ Receipt'),
+      can('editor') && h('button', { class: 'c-red', onclick: () => txDialog('OUT', accounts) }, '+ Payment')),
+    filters, summary, cards, h('section', { class: 'card' }, seg, table));
+}
+
+const txDesc = (r) => r.note || (r.emi ? 'EMI' : r.category) || '';
+function historyTableEl(rows) {
+  if (!rows.length) return h('p', { class: 'empty' }, 'No money received or paid in this period.');
+  const inSum = rows.filter((r) => r.kind === 'IN').reduce((s, r) => s + r.amount, 0), outSum = rows.filter((r) => r.kind === 'OUT').reduce((s, r) => s + r.amount, 0);
+  return h('div', { class: 'scroll' }, h('table', { class: 'tx' },
+    h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Type'), h('th', {}, 'Party / description'), h('th', {}, 'Bank account'), h('th', {}, 'Bank ref.'), h('th', {}, 'Invoice / bill'), h('th', { class: 'num' }, 'Amount'))),
+    h('tbody', {}, rows.map((r) => h('tr', {},
+      h('td', { class: 'nowrap' }, nice(r.date)),
+      h('td', {}, h('span', { class: `chip ${r.kind === 'IN' ? 'c-green' : 'c-red'}` }, r.kind === 'IN' ? 'Received' : 'Paid')),
+      h('td', {}, h('strong', {}, r.name), txDesc(r) && h('div', { class: 'muted small' }, txDesc(r))),
+      h('td', {}, r.bank_name, h('div', { class: 'muted small' }, `${r.bank_label} XXXX${r.last4}`)),
+      h('td', { class: 'nowrap' }, r.bank_ref),
+      h('td', {}, r.doc_ref || h('span', { class: 'muted' }, '—')),
+      h('td', { class: 'num' }, h('strong', {}, money(r.kind === 'IN' ? r.amount : -r.amount, r.kind === 'IN' ? 'pos' : '')))))),
+    h('tfoot', {}, h('tr', {}, h('td', { colspan: '6' }, 'Received ', money(inSum, 'pos'), ' · Paid ', money(outSum, 'red')), h('td', { class: 'num' }, money(inSum - outSum))))));
+}
+
+function recordsTableEl(rows, bankOpts) {
+  if (!rows.length) return h('p', { class: 'empty' }, 'Nothing matches these filters.');
+  return h('div', { class: 'scroll' }, h('table', { class: 'tx' },
+    h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Type'), h('th', {}, 'Party / description'), h('th', {}, 'Bank account'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'Settled'), h('th', { class: 'num' }, 'Outstanding'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
+    h('tbody', {}, rows.map((r) => {
+      const open = r.state === 'pending' || r.state === 'partial', left = r.amount - r.settled, out = r.kind === 'OUT';
+      return h('tr', { class: r.state === 'cancelled' ? 'inactive' : '' },
+        h('td', { class: 'nowrap' }, nice(r.date)),
+        h('td', {}, h('span', { class: `chip ${out ? 'c-red' : 'c-green'}` }, out ? 'Payment' : 'Receipt')),
+        h('td', {}, h('strong', {}, r.name), h('div', { class: 'muted small' }, [r.ref, txDesc(r), r.bank_refs && `bank ref. ${r.bank_refs}`].filter(Boolean).join(' · '))),
+        h('td', {}, r.bank_name ?? h('span', { class: 'muted' }, 'Not decided')),
+        h('td', { class: 'num' }, money(r.amount)),
+        h('td', { class: 'num' }, r.settled ? money(r.settled, out ? 'red' : 'pos') : '—'),
+        h('td', { class: 'num' }, open ? money(left, 'amber') : '—'),
+        h('td', {}, h('span', { class: `chip ${STATE_TONE[r.state]}` }, STATE_LABEL[r.state]), r.last_date && r.state !== 'pending' && h('div', { class: 'muted small' }, `last ${nice(r.last_date)}`)),
+        can('editor') && h('td', { class: 'acts-cell' }, open && [
+          h('button', { class: `small ${out ? 'solid-red' : 'solid-green'}`, onclick: () => settleDialog({ kind: r.kind, id: r.id, name: r.name, amount: left, bankId: r.bank_id }, bankOpts) }, out ? 'Mark paid' : 'Mark received'),
+          h('button', { class: 'small', onclick: () => { if (confirm(`Cancel “${r.name}”? ${r.settled ? 'What was already settled stays in the balances; the rest' : 'It'} will no longer be expected.`)) act(`/api/${out ? 'payments' : 'receipts'}/${r.id}/cancel`, {}); } }, 'Cancel')]));
+    }))));
+}
+
+function txDialog(kind, accounts) {
+  const out = kind === 'OUT';
+  if (!accounts.length) return alert('Add a bank account first (Bank position → “+ Account”).');
+  openDialog(out ? 'Record a payment' : 'Record a receipt', [
+    { name: out ? 'payee' : 'party', label: out ? 'Paid to' : 'Received from', required: true },
+    { name: 'amount', label: 'Amount (₹)', type: 'money', required: true },
+    { name: 'status', label: 'Status', type: 'select', value: 'completed', options: [['completed', out ? 'Paid — the money has left the bank' : 'Received — the money is in the bank'], ['pending', out ? 'Pending — still to pay (balances not affected)' : 'Pending — still to come (balances not affected)']] },
+    { name: 'date', label: 'Date', type: 'date', value: S.today, required: true, hint: 'For a received / paid item, the date it went through the bank (today or earlier). For a pending one, the date it is due.' },
+    { name: 'bank_id', label: 'Bank account', type: 'select', options: [...accounts.map((b) => [b.id, `${b.name} — ${b.bank} XXXX${b.last4}`]), ['', 'Not decided yet (pending only)']], required: false },
+    { name: 'bank_ref', label: 'Bank reference (UTR / cheque no.)', hint: 'Needed when it is received or paid. The same reference can’t be used twice on one account.' },
+    ...(out ? [{ name: 'category', label: 'Category', type: 'select', options: CATEGORIES.map((c) => [c, c]), required: true }] : []),
+    { name: 'ref', label: out ? 'Invoice / bill no. (optional)' : 'Invoice no. (optional)' },
+    { name: 'note', label: 'Description (optional)' },
+    ...(out && can('admin') ? [{ name: 'approved', label: 'Approved', type: 'checkbox', value: true }] : []),
+  ], out ? 'Record payment' : 'Record receipt', (v) => confirmDup((dup) => api('/api/transactions', { ...v, kind, confirmDuplicate: dup })));
 }
 
 // ── People ──
@@ -446,6 +586,7 @@ function assignDialog(p, people) {
 
 // ── Activity log (admins) ──
 const ACTION_LABELS = {
+  'report.export': 'Exported a report',
   login: 'Signed in', 'login.failed': 'Failed sign-in', 'login.locked': 'Locked out (too many wrong passwords)', logout: 'Signed out',
   setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user',
   'person.add': 'Added a person', 'person.edit': 'Edited a person', 'person.activate': 'Activated a person', 'person.deactivate': 'Deactivated a person', 'person.assign': 'Assigned a position',
@@ -459,6 +600,7 @@ const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|s
 function describe(a, positions) {
   const d = a.detail || {}, out = [];
   const fmt = (k, v) => (v == null || v === '' ? '—' : k === 'position_id' ? positions.get(v) ?? `#${v}` : /amount/i.test(k) && typeof v === 'number' ? inr(v) : String(v));
+  if (a.action === 'report.export') return `${String(d.format).toUpperCase()} · ${d.view === 'history' ? 'transaction history' : 'receipts & payments'} · ${d.from} to ${d.to} · ${d.rows} row(s)`;
   for (const k of ['name', 'payee', 'party', 'lender', 'email', 'role', 'reason']) if (d[k]) out.push(String(d[k]));
   if (d.amount != null && typeof d.amount === 'number') out.push(inr(d.amount));
   for (const k of ['date', 'asOf', 'ref']) if (d[k]) out.push(String(d[k]));
@@ -483,7 +625,7 @@ function renderActivity() {
   const filters = h('div', { class: 'card toolbar' }, h('div', { class: 'bar grow' },
     h('input', { type: 'search', name: 'aq', class: 'search', placeholder: 'Search actions, names, references', value: f.q ?? '', oninput: onSearch((v) => { S.af = { ...S.af, q: v }; }), 'aria-label': 'Search activity' }),
     h('select', { 'aria-label': 'Who', onchange: set('user') }, [['', 'Everyone'], ...users.map((u) => [String(u.id), `${u.name} (${u.role})`]), ['none', 'Not signed in']].map(([v, t]) => h('option', { value: v, selected: (f.user ?? '') === v }, t))),
-    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'All activity'], ['signin', 'Sign-ins'], ['people', 'People'], ['positions', 'Positions'], ['payments', 'Payments'], ['receipts', 'Receipts'], ['emis', 'EMIs'], ['balances', 'Bank balances'], ['accounts', 'Bank accounts'], ['users', 'Users']]
+    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'All activity'], ['signin', 'Sign-ins'], ['people', 'People'], ['positions', 'Positions'], ['payments', 'Payments'], ['receipts', 'Receipts'], ['emis', 'EMIs'], ['balances', 'Bank balances'], ['accounts', 'Bank accounts'], ['users', 'Users'], ['reports', 'Report exports']]
       .map(([v, t]) => h('option', { value: v, selected: (f.type ?? '') === v }, t))),
     h('label', { class: 'check' }, 'From', h('input', { type: 'date', value: f.from ?? '', max: S.today, onchange: set('from') })),
     h('label', { class: 'check' }, 'To', h('input', { type: 'date', value: f.to ?? '', max: S.today, onchange: set('to') })),
