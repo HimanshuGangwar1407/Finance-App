@@ -165,3 +165,19 @@ tr.inactive td, .pos-row.inactive { opacity: .6; }
 .kv { display: grid; grid-template-columns: 120px 1fr; gap: 10px; }
 .kv span:last-child { overflow-wrap: anywhere; }
 .more { text-align: center; margin-top: 12px; }
+
+/* ── Transactions: bank cards, period summary, history and report tables ── */
+.bank-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; margin-bottom: 16px; }
+.bank-card { background: var(--card); border: 1px solid var(--line); border-top: 4px solid var(--blue); border-radius: 16px; padding: 16px; box-shadow: var(--shadow); }
+.bc-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.bc-amt { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--blue); margin: 8px 0 10px; white-space: nowrap; }
+.bc-amt.neg { color: var(--red); }
+.bc-line { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; font-size: 14px; border-top: 1px dashed var(--line); }
+.bc-line.total { font-weight: 700; border-top: 1px solid var(--line); margin-top: 2px; }
+.pending-strip strong.pos { color: var(--green); } .pending-strip strong.red { color: var(--red); }
+.toolbar-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.seg { display: inline-flex; gap: 4px; background: var(--bg); border-radius: 11px; padding: 4px; }
+.seg button { border: 0; background: transparent; color: var(--muted); }
+.seg button.on { background: var(--card); color: var(--text); box-shadow: var(--shadow); }
+table.tx { min-width: 760px; }
+table.tx tfoot td { font-weight: 600; }

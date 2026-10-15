@@ -12,6 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { q, withTx, ensureSchema, setPool } from './db.js';
 import { finalBalance } from './balance.js';
 import { emiDates } from './emi.js';
+import { bankStatements } from './ledger.js';
+import { toCsv, toXlsx } from './export.js';
 import * as A from './auth.js';
 import { bad, deny, notFound, toPaise, normRef, str, need, ymd, oneOf, intId, todayIST, addDays, inr } from './money.js';
 
@@ -45,7 +47,7 @@ const changes = (before, after) => Object.fromEntries(Object.keys(after).filter(
 const unique = (message) => (e) => { throw e.code === 'conflict' ? err(409, 'conflict', message) : e; };
 const likeTerm = (s) => `%${s.replace(/[\\%_]/g, '\\$&')}%`;
 // activity log filters: a type is the part of the action before the dot
-const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user'] };
+const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user'], reports: ['report'] };
 const istStart = (d) => new Date(`${d}T00:00:00+05:30`).toISOString();
 
 // makes each active EMI's instalments into payments, up to `through` (once each: a cancelled one stays cancelled)
@@ -79,6 +81,159 @@ async function position(db, { today, upTo, approvedOnly = false, uncertain = tru
   return { banks: banks.rows, ...result };
 }
 const HORIZON = 62; // EMI payments are made this many days ahead, enough for any hold to have started
+
+// ── receipts & payments: one set of rules for their own routes and for POST /api/transactions ──
+const REF_TAKEN = 'That bank reference is already recorded on this account.';
+// the same party, amount and date already recorded (and not cancelled) is most likely the same transaction
+async function noDuplicate(c, kind, name, amount, date) {
+  const t = kind === 'IN' ? ['receipts', 'party', 'expected_date', 'A receipt from'] : ['payments', 'payee', 'due_date', 'A payment to'];
+  const { rows: [d] } = await c.query(`SELECT ${t[1]} AS name FROM ${t[0]} WHERE status <> 'CANCELLED' AND lower(${t[1]}) = lower($1) AND amount = $2 AND ${t[2]} = $3 LIMIT 1`, [name, amount, date]);
+  if (d) throw err(409, 'duplicate', `${t[3]} ${d.name} for ${inr(amount)} on ${date} is already recorded. Add it anyway?`);
+}
+
+async function addReceipt(c, body, user) {
+  const r = {
+    party: need(str(body.party, 120), 'Received from'), ref: str(body.ref, 80),
+    amount: toPaise(body.amount, 'Amount', { allowZero: false }), date: ymd(body.expected_date, 'Expected date'),
+    certainty: oneOf(body.certainty || 'LIKELY', ['FIRM', 'LIKELY', 'UNCERTAIN'], 'Certainty'), bankId: optBank(body.bank_id), note: str(body.note, 300),
+  };
+  await bankExists(c, r.bankId);
+  if (!body.confirmDuplicate) {
+    const refNorm = normRef(r.ref);
+    if (refNorm) {
+      const { rows } = await c.query("SELECT party, ref, expected_date FROM receipts WHERE status = 'OPEN' AND ref <> ''");
+      const d = rows.find((x) => normRef(x.ref) === refNorm);
+      if (d) throw err(409, 'duplicate', `A receipt with reference “${r.ref}” is already open (${d.party}, expected ${d.expected_date}). Add it anyway?`);
+    }
+    await noDuplicate(c, 'IN', r.party, r.amount, r.date);
+  }
+  const { rows: [x] } = await c.query('INSERT INTO receipts (party, ref, amount, expected_date, certainty, bank_id, note, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
+    [r.party, r.ref, r.amount, r.date, r.certainty, r.bankId, r.note, user.id]);
+  await audit(c, user.id, 'receipt.add', { id: x.id, ...r });
+  return x;
+}
+
+async function addPayment(c, body, user) {
+  const p = {
+    payee: need(str(body.payee, 120), 'Pay to'), ref: str(body.ref, 80), category: need(str(body.category, 40), 'Category'),
+    amount: toPaise(body.amount, 'Amount', { allowZero: false }), date: ymd(body.due_date, 'Due date'), bankId: optBank(body.bank_id),
+    approved: user.role === 'admin' && body.approved === true, note: str(body.note, 300),
+  };
+  const refNorm = normRef(p.ref);
+  await bankExists(c, p.bankId);
+  if (!body.confirmDuplicate) {
+    if (refNorm) {
+      const { rows: [d] } = await c.query("SELECT payee, amount, due_date FROM payments WHERE ref_norm = $1 AND status = 'OPEN' LIMIT 1", [refNorm]);
+      if (d) throw err(409, 'duplicate', `A payment with reference “${p.ref}” is already open (${d.payee}, due ${d.due_date}). Add it anyway?`);
+    }
+    await noDuplicate(c, 'OUT', p.payee, p.amount, p.date);
+  }
+  const { rows: [x] } = await c.query('INSERT INTO payments (payee, ref, ref_norm, category, amount, due_date, bank_id, approved, note, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id',
+    [p.payee, p.ref, refNorm, p.category, p.amount, p.date, p.bankId, p.approved, p.note, user.id]);
+  await audit(c, user.id, 'payment.add', { id: x.id, ...p });
+  return x;
+}
+
+// money that actually arrived / left: all of what is left on a receipt or payment, or part of it. Only this moves balances.
+async function settle(c, { table, id, body, user }) {
+  const isIn = table === 'receipts';
+  const ref = need(str(body.ref, 80), 'Bank reference (UTR / cheque no.)'), refNorm = normRef(ref);
+  if (!refNorm) bad('Bank reference: use letters or numbers.');
+  const date = notFuture(ymd(body.date || todayIST(), 'Date'), 'Date');
+  const { rows: [x] } = await c.query(`SELECT id, amount, bank_id, status, ${isIn ? 'NULL' : 'emi_id'} AS emi_id FROM ${table} WHERE id = $1 FOR UPDATE`, [id]);
+  if (!x) notFound('That record doesn’t exist.');
+  if (x.status !== 'OPEN') bad('It was cancelled.');
+  const { rows: [{ done }] } = await c.query(`SELECT coalesce(sum(amount), 0)::bigint AS done FROM entries WHERE ${isIn ? 'receipt_id' : 'payment_id'} = $1`, [id]);
+  const left = Number(x.amount) - Number(done);
+  if (left <= 0) bad(isIn ? 'It is already fully received.' : 'It is already fully paid.');
+  const amount = body.amount === '' || body.amount == null ? left : toPaise(body.amount, 'Amount', { allowZero: false });
+  if (amount > left) bad(`Only ${(left / 100).toFixed(2)} is left on it.`);
+  const bankId = await bankExists(c, body.bank_id ? intId(body.bank_id, 'Account') : x.bank_id ?? bad('Choose the account.'));
+  if (!isIn && !x.emi_id) {
+    // money held for EMIs can't go to anyone else; one payment per account checks at a time
+    const today = todayIST();
+    await c.query('SELECT pg_advisory_xact_lock(2, $1)', [bankId]);
+    await syncEmis(c, addDays(today, HORIZON));
+    const row = (await position(c, { today, upTo: today })).rows.find((r) => r.id === bankId);
+    if (row && row.held > 0 && amount > row.free) {
+      throw err(409, 'emi_hold', `Not allowed: ${inr(row.held)} in ${row.name} is held for EMIs. Of its ${inr(row.today)} balance, only ${inr(Math.max(row.free, 0))} can be paid to others. Bring in money or pay from another account.`);
+    }
+  }
+  const { rows: [e] } = await c.query(`INSERT INTO entries (kind, ${isIn ? 'receipt_id' : 'payment_id'}, bank_id, amount, date, ref, ref_norm, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    [isIn ? 'IN' : 'OUT', id, bankId, amount, date, ref, refNorm, user.id]);
+  await audit(c, user.id, isIn ? 'receipt.received' : 'payment.paid', { id, entry: e.id, bankId, amount, date, ref });
+  return { id: e.id, left: left - amount };
+}
+
+// filters shared by the transaction lists, the summary and the exports; the period defaults to this month so far
+function txFilters(url) {
+  const p = url.searchParams, today = todayIST();
+  const f = {
+    view: oneOf(p.get('view') || 'history', ['history', 'records'], 'View'),
+    from: ymd(p.get('from') || `${today.slice(0, 8)}01`, 'From'), to: ymd(p.get('to') || today, 'To'),
+    bank: p.get('bank') ? intId(p.get('bank'), 'Bank account') : null,
+    type: oneOf(p.get('type') || '', ['', 'IN', 'OUT'], 'Type'),
+    status: oneOf(p.get('status') || '', ['', 'pending', 'partial', 'completed', 'cancelled'], 'Status'),
+    q: str(p.get('q'), 100),
+  };
+  if (f.from > f.to) bad('The “from” date must be on or before the “to” date.');
+  if (f.to > addDays(f.from, 3700)) bad('Pick a period of ten years or less.');
+  return f;
+}
+
+// money actually received and paid in the period (newest first)
+async function history(f) {
+  const where = ['e.date BETWEEN $1 AND $2'], args = [f.from, f.to], arg = (v) => { args.push(v); return `$${args.length}`; };
+  if (f.bank) where.push(`e.bank_id = ${arg(f.bank)}`);
+  if (f.type) where.push(`e.kind = ${arg(f.type)}`);
+  if (f.q) { const t = arg(likeTerm(f.q)); where.push(`(coalesce(r.party, p.payee) ILIKE ${t} OR e.ref ILIKE ${t} OR coalesce(r.ref, p.ref) ILIKE ${t} OR coalesce(r.note, p.note) ILIKE ${t} OR coalesce(p.category, '') ILIKE ${t})`); }
+  const { rows } = await q(`SELECT e.id, e.kind, e.date, e.amount, e.bank_id, b.name AS bank_name, b.bank AS bank_label, b.last4, e.ref AS bank_ref,
+      coalesce(r.party, p.payee) AS name, coalesce(r.ref, p.ref) AS doc_ref, coalesce(r.note, p.note) AS note, coalesce(p.category, '') AS category,
+      p.emi_id IS NOT NULL AS emi, coalesce(e.receipt_id, e.payment_id) AS record_id, e.created_at, u.name AS recorded_by
+    FROM entries e JOIN banks b ON b.id = e.bank_id LEFT JOIN receipts r ON r.id = e.receipt_id LEFT JOIN payments p ON p.id = e.payment_id LEFT JOIN users u ON u.id = e.created_by
+    WHERE ${where.join(' AND ')} ORDER BY e.date DESC, e.id DESC LIMIT 5000`, args);
+  return rows;
+}
+
+// every receipt and payment that is dated in the period or had money move in it, with how much has been settled:
+// pending (nothing yet), partial, completed, or cancelled
+async function records(f) {
+  const where = [`(t.date BETWEEN $1 AND $2 OR EXISTS (SELECT 1 FROM entries e WHERE (CASE WHEN t.kind = 'IN' THEN e.receipt_id ELSE e.payment_id END) = t.id AND e.date BETWEEN $1 AND $2))`];
+  const args = [f.from, f.to], arg = (v) => { args.push(v); return `$${args.length}`; };
+  if (f.bank) { const b = arg(f.bank); where.push(`(t.bank_id = ${b} OR ${b} = ANY(t.banks))`); }
+  if (f.type) where.push(`t.kind = ${arg(f.type)}`);
+  if (f.status) where.push(`t.state = ${arg(f.status)}`);
+  if (f.q) { const s = arg(likeTerm(f.q)); where.push(`(t.name ILIKE ${s} OR t.ref ILIKE ${s} OR t.note ILIKE ${s} OR t.category ILIKE ${s} OR coalesce(t.bank_refs, '') ILIKE ${s})`); }
+  const { rows } = await q(`SELECT * FROM (
+      SELECT x.*, coalesce(d.settled, 0)::bigint AS settled, d.last_date, d.bank_refs, coalesce(d.banks, '{}') AS banks, b.name AS bank_name,
+        CASE WHEN x.status = 'CANCELLED' THEN 'cancelled' WHEN coalesce(d.settled, 0) >= x.amount THEN 'completed' WHEN coalesce(d.settled, 0) > 0 THEN 'partial' ELSE 'pending' END AS state
+      FROM (
+        SELECT 'IN' AS kind, r.id, r.expected_date AS date, r.party AS name, r.ref, r.note, '' AS category, r.amount, r.bank_id, r.status, false AS emi FROM receipts r
+        UNION ALL
+        SELECT 'OUT', p.id, p.due_date, p.payee, p.ref, p.note, p.category, p.amount, p.bank_id, p.status, p.emi_id IS NOT NULL FROM payments p
+      ) x
+      LEFT JOIN (
+        SELECT CASE WHEN receipt_id IS NULL THEN 'OUT' ELSE 'IN' END AS kind, coalesce(receipt_id, payment_id) AS id, sum(amount) AS settled, max(date) AS last_date,
+          string_agg(ref, ', ' ORDER BY id) AS bank_refs, array_agg(DISTINCT bank_id) AS banks
+        FROM entries GROUP BY 1, 2
+      ) d ON d.kind = x.kind AND d.id = x.id
+      LEFT JOIN banks b ON b.id = coalesce(x.bank_id, d.banks[1])
+    ) t WHERE ${where.join(' AND ')} ORDER BY t.date DESC, t.kind, t.id DESC LIMIT 5000`, args);
+  return rows;
+}
+
+// export tables: a header row, then rows; amounts in rupees as numbers so spreadsheets can add them up
+const rupeeNum = (p) => Math.round(Number(p)) / 100;
+const TYPE = { IN: 'Receipt', OUT: 'Payment' };
+const STATE = { pending: 'Pending', partial: 'Partly settled', completed: 'Completed', cancelled: 'Cancelled' };
+const historyTable = (rows) => [
+  ['Date', 'Type', 'Party', 'Amount (₹)', 'Bank account', 'Bank reference', 'Invoice / bill no.', 'Description', 'Recorded by'],
+  ...rows.map((r) => [r.date, TYPE[r.kind], r.name, rupeeNum(r.amount), `${r.bank_name} (${r.bank_label} XXXX${r.last4})`, r.bank_ref, r.doc_ref, r.note || (r.emi ? 'EMI' : r.category), r.recorded_by ?? '']),
+];
+const recordsTable = (rows) => [
+  ['Date', 'Type', 'Party', 'Amount (₹)', 'Settled (₹)', 'Outstanding (₹)', 'Status', 'Bank account', 'Bank references', 'Last settled on', 'Invoice / bill no.', 'Description'],
+  ...rows.map((r) => [r.date, TYPE[r.kind], r.name, rupeeNum(r.amount), rupeeNum(r.settled), r.state === 'cancelled' ? 0 : rupeeNum(r.amount - r.settled), STATE[r.state], r.bank_name ?? 'Not decided', r.bank_refs ?? '', r.last_date ?? '', r.ref, r.note || (r.emi ? 'EMI' : r.category)]),
+];
 
 async function currentUser(req) {
   const t = A.readToken(A.cookieValue(req.headers));
@@ -211,77 +366,55 @@ const routes = [
     });
   }],
 
-  ['POST', /^\/api\/receipts$/, 'editor', async ({ body, user }) => {
-    const r = {
-      party: need(str(body.party, 120), 'Received from'), ref: str(body.ref, 80),
-      amount: toPaise(body.amount, 'Amount', { allowZero: false }), date: ymd(body.expected_date, 'Expected date'),
-      certainty: oneOf(body.certainty || 'LIKELY', ['FIRM', 'LIKELY', 'UNCERTAIN'], 'Certainty'), bankId: optBank(body.bank_id), note: str(body.note, 300),
-    };
-    return withTx(async (c) => {
-      await bankExists(c, r.bankId);
-      const { rows: [x] } = await c.query('INSERT INTO receipts (party, ref, amount, expected_date, certainty, bank_id, note, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
-        [r.party, r.ref, r.amount, r.date, r.certainty, r.bankId, r.note, user.id]);
-      await audit(c, user.id, 'receipt.add', { id: x.id, ...r });
-      return x;
-    });
-  }],
+  ['POST', /^\/api\/receipts$/, 'editor', async ({ body, user }) => withTx((c) => addReceipt(c, body, user))],
 
-  ['POST', /^\/api\/payments$/, 'editor', async ({ body, user }) => {
-    const p = {
-      payee: need(str(body.payee, 120), 'Pay to'), ref: str(body.ref, 80), category: need(str(body.category, 40), 'Category'),
-      amount: toPaise(body.amount, 'Amount', { allowZero: false }), date: ymd(body.due_date, 'Due date'), bankId: optBank(body.bank_id),
-      approved: user.role === 'admin' && body.approved === true, note: str(body.note, 300),
-    };
-    const refNorm = normRef(p.ref);
-    return withTx(async (c) => {
-      await bankExists(c, p.bankId);
-      if (refNorm && !body.confirmDuplicate) {
-        const { rows: [d] } = await c.query("SELECT payee, amount, due_date FROM payments WHERE ref_norm = $1 AND status = 'OPEN' LIMIT 1", [refNorm]);
-        if (d) throw err(409, 'duplicate', `A payment with reference “${p.ref}” is already open (${d.payee}, due ${d.due_date}). Add it anyway?`);
-      }
-      const { rows: [x] } = await c.query('INSERT INTO payments (payee, ref, ref_norm, category, amount, due_date, bank_id, approved, note, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id',
-        [p.payee, p.ref, refNorm, p.category, p.amount, p.date, p.bankId, p.approved, p.note, user.id]);
-      await audit(c, user.id, 'payment.add', { id: x.id, ...p });
-      return x;
-    });
-  }],
+  ['POST', /^\/api\/payments$/, 'editor', async ({ body, user }) => withTx((c) => addPayment(c, body, user))],
 
   // record money that actually left / arrived in the bank — all of what is left, or part of it
-  ['POST', /^\/api\/(receipts|payments)\/(\d+)\/settle$/, 'editor', async ({ body, user, m }) => {
-    const isIn = m[1] === 'receipts', table = m[1], id = intId(m[2]);
-    const ref = need(str(body.ref, 80), 'Bank reference (UTR / cheque no.)'), refNorm = normRef(ref);
-    if (!refNorm) bad('Bank reference: use letters or numbers.');
-    const date = notFuture(ymd(body.date || todayIST(), 'Date'), 'Date');
-    try {
-      return await withTx(async (c) => {
-        const { rows: [x] } = await c.query(`SELECT id, amount, bank_id, status, ${isIn ? 'NULL' : 'emi_id'} AS emi_id FROM ${table} WHERE id = $1 FOR UPDATE`, [id]);
-        if (!x) notFound('That record doesn’t exist.');
-        if (x.status !== 'OPEN') bad('It was cancelled.');
-        const { rows: [{ done }] } = await c.query(`SELECT coalesce(sum(amount), 0)::bigint AS done FROM entries WHERE ${isIn ? 'receipt_id' : 'payment_id'} = $1`, [id]);
-        const left = Number(x.amount) - Number(done);
-        if (left <= 0) bad(isIn ? 'It is already fully received.' : 'It is already fully paid.');
-        const amount = body.amount === '' || body.amount == null ? left : toPaise(body.amount, 'Amount', { allowZero: false });
-        if (amount > left) bad(`Only ${(left / 100).toFixed(2)} is left on it.`);
-        const bankId = await bankExists(c, body.bank_id ? intId(body.bank_id, 'Account') : x.bank_id ?? bad('Choose the account.'));
-        if (!isIn && !x.emi_id) {
-          // money held for EMIs can't go to anyone else; one payment per account checks at a time
-          const today = todayIST();
-          await c.query('SELECT pg_advisory_xact_lock(2, $1)', [bankId]);
-          await syncEmis(c, addDays(today, HORIZON));
-          const row = (await position(c, { today, upTo: today })).rows.find((r) => r.id === bankId);
-          if (row && row.held > 0 && amount > row.free) {
-            throw err(409, 'emi_hold', `Not allowed: ${inr(row.held)} in ${row.name} is held for EMIs. Of its ${inr(row.today)} balance, only ${inr(Math.max(row.free, 0))} can be paid to others. Bring in money or pay from another account.`);
-          }
-        }
-        const { rows: [e] } = await c.query(`INSERT INTO entries (kind, ${isIn ? 'receipt_id' : 'payment_id'}, bank_id, amount, date, ref, ref_norm, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-          [isIn ? 'IN' : 'OUT', id, bankId, amount, date, ref, refNorm, user.id]);
-        await audit(c, user.id, isIn ? 'receipt.received' : 'payment.paid', { id, entry: e.id, bankId, amount, date, ref });
-        return { id: e.id, left: left - amount };
-      });
-    } catch (e) {
-      if (e.code === 'conflict') throw err(409, 'conflict', 'That bank reference is already recorded on this account.');
-      throw e;
-    }
+  ['POST', /^\/api\/(receipts|payments)\/(\d+)\/settle$/, 'editor', async ({ body, user, m }) =>
+    withTx((c) => settle(c, { table: m[1], id: intId(m[2]), body, user })).catch(unique(REF_TAKEN))],
+
+  // ── transactions: money actually received / paid, bank statements for a period, and reports ──
+  // add a receipt or payment as pending (no effect on balances), or as already received / paid in one step
+  ['POST', /^\/api\/transactions$/, 'editor', async ({ body, user }) => {
+    const kind = oneOf(body.kind, ['IN', 'OUT'], 'Type'), status = oneOf(body.status || 'pending', ['pending', 'completed'], 'Status');
+    const date = ymd(body.date, 'Date'), b = { ...body, expected_date: date, due_date: date };
+    if (status === 'completed' && !b.bank_id) bad('Choose the bank account the money went through.');
+    return withTx(async (c) => {
+      const x = kind === 'IN' ? await addReceipt(c, b, user) : await addPayment(c, b, user);
+      if (status === 'completed') await settle(c, { table: kind === 'IN' ? 'receipts' : 'payments', id: x.id, body: { bank_id: b.bank_id, date, ref: b.bank_ref }, user });
+      return { id: x.id, kind, status };
+    }).catch(unique(REF_TAKEN));
+  }],
+
+  ['GET', /^\/api\/transactions\/summary$/, 'viewer', async ({ url }) => {
+    const f = txFilters(url), today = todayIST();
+    await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
+    const [banks, balances, entries, open] = await Promise.all([
+      q('SELECT id, name, bank, last4 FROM banks ORDER BY name, id'), q('SELECT id, bank_id, amount, as_of FROM balances'),
+      q('SELECT kind, bank_id, amount, date FROM entries'), records({ ...f, status: '', type: '', q: '' }),
+    ]);
+    const st = bankStatements({ banks: banks.rows, balances: balances.rows, entries: entries.rows, from: f.from, to: f.to, only: f.bank });
+    const pending = { IN: { count: 0, amount: 0 }, OUT: { count: 0, amount: 0 } };
+    for (const r of open) if ((r.state === 'pending' || r.state === 'partial') && r.date >= f.from && r.date <= f.to) { pending[r.kind].count++; pending[r.kind].amount += r.amount - r.settled; }
+    return { today, from: f.from, to: f.to, accounts: banks.rows, banks: st.rows, total: st.total, pending };
+  }],
+
+  // view=history: money actually received and paid · view=records: every receipt and payment with its status
+  ['GET', /^\/api\/transactions$/, 'viewer', async ({ url }) => {
+    const f = txFilters(url);
+    return { from: f.from, to: f.to, view: f.view, rows: f.view === 'history' ? await history(f) : await records(f) };
+  }],
+
+  ['GET', /^\/api\/transactions\/export$/, 'viewer', async ({ url, user }) => {
+    const f = txFilters(url), format = oneOf(url.searchParams.get('format') || 'csv', ['csv', 'xlsx'], 'Format');
+    const rows = f.view === 'history' ? await history(f) : await records(f);
+    const table = f.view === 'history' ? historyTable(rows) : recordsTable(rows);
+    await log(user.id, 'report.export', { view: f.view, format, from: f.from, to: f.to, bank: f.bank, type: f.type, status: f.status, q: f.q, rows: rows.length });
+    const name = `${f.view === 'history' ? 'transactions' : 'receipts-payments'}-${f.from}-to-${f.to}.${format}`;
+    return format === 'csv'
+      ? { file: { type: 'text/csv; charset=utf-8', name, body: toCsv(table) } }
+      : { file: { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', name, body: toXlsx(table, f.view === 'history' ? 'Transactions' : 'Receipts & payments') } };
   }],
 
   ['POST', /^\/api\/(receipts|payments)\/(\d+)\/cancel$/, 'editor', async ({ body, user, m }) => withTx(async (c) => {
@@ -467,7 +600,9 @@ export async function handler(req, res) {
   const ctx = { req, url, headers: [], secure: req.headers['x-forwarded-proto'] === 'https' || !!req.socket.encrypted };
   const send = (status, type, data) => {
     for (const [k, v] of ctx.headers) res.appendHeader(k, v);
-    res.writeHead(status, { ...SECURITY, 'Content-Type': `${type}; charset=utf-8` });
+    // text and JSON say they are UTF-8; downloads (Excel) and types that already name a charset go as they are
+    const textual = /^(text\/|application\/json)/.test(type) && !type.includes(';');
+    res.writeHead(status, { ...SECURITY, 'Content-Type': textual ? `${type}; charset=utf-8` : type });
     res.end(data);
   };
   try {
@@ -491,7 +626,12 @@ export async function handler(req, res) {
       if (RANK[ctx.user.role] < RANK[route[2]]) deny('Your role can’t do that.');
     }
     ctx.m = route[1].exec(url.pathname);
-    send(200, 'application/json', JSON.stringify(await route[3](ctx)));
+    const out = await route[3](ctx);
+    if (out?.file) { // a download
+      ctx.headers.push(['Content-Disposition', `attachment; filename="${out.file.name}"`]);
+      return send(200, out.file.type, out.file.body);
+    }
+    send(200, 'application/json', JSON.stringify(out));
   } catch (e) {
     const status = e.status || 500;
     if (status >= 500) console.error(e);
