@@ -1,32 +1,63 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { dueReminders, projectDates } from '../server/reminders.js';
+import { dueReminders, projectDates, coverage } from '../server/reminders.js';
 import { setPool, q } from '../server/db.js';
 import { pglitePool } from '../server/local-db.js';
 import { todayIST, addDays } from '../server/money.js';
 
 // ── reminder rules (pure) ──
-const T = '2026-10-15';
-const inst = (o) => ({ payment_id: 1, emi_id: 1, lender: 'Car loan', bank_id: 1, bank_name: 'HDFC', due_date: '2026-10-20', left: 50_000, remind_days: 3, hold_days: 0, ...o });
-const kinds = (i, free = new Map([[1, 100_000]]), today = T) => dueReminders({ instalments: [inst(i)], free, today }).map((r) => r.kind);
+const T = '2026-10-15', D = (n) => addDays(T, n);
+const inst = (o) => ({ payment_id: 1, emi_id: 1, lender: 'Car loan', bank_id: 1, bank_name: 'HDFC', due_date: D(5), left: 50_000, remind_before: [7, 3, 1], remind_due: true, remind_overdue: true, hold_days: 0, ...o });
+const run = (i, balances = new Map([[1, 100_000]]), today = T) => dueReminders({ instalments: [inst(i)], balances, today });
+const keys = (i, balances) => run(i, balances).map((r) => r.key.split(':')[2]);
 
-test('reminders: upcoming from N days before, due on the day, overdue after, never once paid', () => {
-  assert.deepEqual(kinds({ due_date: '2026-10-19' }), []); // 4 days ahead, reminder window is 3
-  assert.deepEqual(kinds({ due_date: '2026-10-18' }), ['upcoming']);
-  assert.deepEqual(kinds({ due_date: T }), ['due']);
-  assert.deepEqual(kinds({ due_date: '2026-10-10' }), ['overdue']);
-  assert.deepEqual(kinds({ due_date: '2026-10-16', remind_days: 0 }), []); // no advance reminder
-  assert.deepEqual(kinds({ due_date: T, left: 0 }), []);
-  assert.equal(dueReminders({ instalments: [inst({ due_date: T, payment_id: 7 })], free: new Map(), today: T })[0].key, 'emi:7:due');
+test('reminders: 7, 3 and 1 days before, on the due date, and when overdue', () => {
+  assert.deepEqual(keys({ due_date: D(8) }), []);
+  assert.deepEqual(keys({ due_date: D(7) }), ['before7']);
+  assert.deepEqual(keys({ due_date: D(5) }), ['before7']); // a missed day sends only the latest point reached
+  assert.deepEqual(keys({ due_date: D(3) }), ['before3']);
+  assert.deepEqual(keys({ due_date: D(2) }), ['before3']);
+  assert.deepEqual(keys({ due_date: D(1) }), ['before1']);
+  assert.deepEqual(keys({ due_date: T }), ['due']);
+  assert.deepEqual(keys({ due_date: D(-4) }), ['overdue']);
+  assert.deepEqual(keys({ due_date: T, left: 0 }), []); // paid
+  assert.match(run({ due_date: D(1) })[0].title, /^In 1 day: Car loan EMI of ₹500 from HDFC is due on/);
+  assert.equal(run({ due_date: T, payment_id: 9 })[0].key, 'emi:9:due');
 });
 
-test('reminders: a shortfall warning when the account can’t cover what is held, within the hold or reminder window', () => {
-  const short = new Map([[1, -5_000]]);
-  assert.deepEqual(kinds({ due_date: '2026-10-17' }, short), ['upcoming', 'shortfall']);
-  assert.deepEqual(kinds({ due_date: '2026-10-25', hold_days: 10 }, short), ['shortfall']); // held from the 15th
-  assert.deepEqual(kinds({ due_date: '2026-11-25' }, short), []); // too far ahead
-  assert.match(dueReminders({ instalments: [inst({ due_date: '2026-10-17' })], free: short, today: T })[1].title, /short by ₹50/);
+test('reminders: each kind can be switched off; custom points work', () => {
+  assert.deepEqual(keys({ due_date: T, remind_due: false }), []);
+  assert.deepEqual(keys({ due_date: D(-1), remind_overdue: false }), []);
+  assert.deepEqual(keys({ due_date: D(2), remind_before: [] }), []);
+  assert.deepEqual(keys({ due_date: D(10), remind_before: [14, 10] }), ['before10']);
+  assert.deepEqual(keys({ due_date: D(3), remind_before: [7, 1] }), ['before7']);
+});
+
+test('coverage: each EMI needs the balance to cover it and every earlier unpaid EMI of the same account', () => {
+  const c = coverage([
+    { payment_id: 1, bank_id: 1, due_date: D(-2), left: 20_000 }, // overdue still needs paying
+    { payment_id: 2, bank_id: 1, due_date: D(3), left: 60_000 },
+    { payment_id: 3, bank_id: 1, due_date: D(9), left: 40_000 },
+    { payment_id: 4, bank_id: 2, due_date: D(1), left: 10_000 },
+    { payment_id: 5, bank_id: 1, due_date: D(1), left: 0 }, // paid: ignored
+  ], new Map([[1, 100_000], [2, 5_000]]));
+  assert.deepEqual(c.get(1), { needed: 20_000, covered: true, shortBy: 0 });
+  assert.deepEqual(c.get(2), { needed: 80_000, covered: true, shortBy: 0 });
+  assert.deepEqual(c.get(3), { needed: 120_000, covered: false, shortBy: 20_000 });
+  assert.deepEqual(c.get(4), { needed: 10_000, covered: false, shortBy: 5_000 });
+  assert.equal(c.has(5), false);
+});
+
+test('insufficient funds alert: from 7 days before (or earlier if reminders or the reservation start earlier), once', () => {
+  const low = new Map([[1, 30_000]]);
+  assert.deepEqual(keys({ due_date: D(6) }, low), ['before7', 'shortfall']);
+  assert.deepEqual(keys({ due_date: D(12) }, low), []); // too far ahead to warn
+  assert.deepEqual(keys({ due_date: D(12), hold_days: 15, remind_before: [] }, low), ['shortfall']);
+  assert.deepEqual(keys({ due_date: D(6) }, new Map([[1, 50_000]])), ['before7']); // exactly enough
+  const s = run({ due_date: D(6) }, low).find((r) => r.kind === 'shortfall');
+  assert.match(s.title, /^Not enough in HDFC: short by ₹200 for the Car loan EMI on/);
+  assert.equal(s.key, 'emi:1:shortfall');
 });
 
 test('schedule: monthly dates, the last day in short months, stopping at the last EMI date', () => {
@@ -79,6 +110,14 @@ test('setup: users and an account with ₹1,00,000', async () => {
   await editor('/api/balances', { bank_id: bank, amount: '1,00,000', as_of: addDays(today, -1) });
 });
 
+test('dashboard: with no EMIs yet, everything is available', async () => {
+  const d = (await viewer('/api/dashboard')).body;
+  assert.deepEqual([d.balance, d.reserved, d.available], [10_000_000, 0, 10_000_000]);
+  assert.deepEqual([d.next7, d.next30, d.overdue], [{ count: 0, amount: 0 }, { count: 0, amount: 0 }, { count: 0, amount: 0 }]);
+  assert.deepEqual([d.received, d.paid, d.shortfalls], [0, 0, []]);
+  assert.equal(d.from, `${today.slice(0, 8)}01`);
+});
+
 test('recurring schedule: an EMI repeats monthly; the next 12 months are projected', async () => {
   const r = await editor('/api/emis', { lender: 'Car loan', amount: '30,000', bank_id: bank, start_date: addDays(today, 2), hold_days: '3', remind_days: '3', remind_in_app: true, remind_email: true, remind_to: 'Ops@X.in' });
   assert.equal(r.status, 200); carLoan = r.body.id;
@@ -91,7 +130,7 @@ test('recurring schedule: an EMI repeats monthly; the next 12 months are project
   assert.ok(rows.some((x) => x.projected) && rows.some((x) => !x.projected));
   assert.equal(rows[0].state, 'upcoming'); assert.equal(rows[0].reserved, true); // held from 3 days before
   const e = (await editor('/api/emis')).body.emis.find((x) => x.id === carLoan);
-  assert.deepEqual([e.hold_days, e.remind_days, e.remind_in_app, e.remind_email, e.remind_to], [3, 3, true, true, 'ops@x.in']);
+  assert.deepEqual([e.hold_days, e.remind_before, e.remind_due, e.remind_overdue, e.remind_in_app, e.remind_email, e.remind_to], [3, [3], true, true, true, true, 'ops@x.in']);
 });
 
 test('duplicate prevention: the same loan twice is caught; instalments are never doubled', async () => {
@@ -131,7 +170,7 @@ test('reminders: in-app for editors and admins, email to the chosen address — 
   assert.equal(mail.length, 1);
   assert.deepEqual(mail[0].to, ['ops@x.in']);
   assert.equal(mail[0].auth, 'Bearer test-key');
-  assert.match(mail[0].subject, /^Upcoming: Car loan EMI of ₹30,000/);
+  assert.match(mail[0].subject, /^In 2 days: Car loan EMI of ₹30,000/);
 
   const again = (await admin('/api/reminders/run', {})).body;
   assert.deepEqual([again.inApp, again.queued, again.sent], [0, 0, 0]);
@@ -151,6 +190,13 @@ test('reminders: in-app for editors and admins, email to the chosen address — 
 test('insufficient balance: a shortfall reminder, and confirming the payment asks first', async () => {
   const big = (await editor('/api/emis', { lender: 'Machine loan', amount: '1,50,000', bank_id: bank, start_date: addDays(today, 1), hold_days: '2', remind_email: true, remind_to: 'fail@x.in' })).body.id;
   assert.ok((await overview()).totals.available < 0);
+  // the schedule says which instalments the account can't cover, and by how much
+  const open = await schedule('status=open');
+  const machine = open.find((x) => x.emi_id === big);
+  assert.deepEqual([machine.covered, machine.short_by], [false, 7_000_000]); // needs ₹20,000 overdue + ₹1,50,000 = ₹1,70,000 of ₹1,00,000
+  assert.equal(open.find((x) => x.lender === 'Old loan' && x.state === 'overdue').covered, true);
+  const dash = (await viewer('/api/dashboard')).body;
+  assert.ok(dash.shortfalls.some((x) => x.lender === 'Machine loan' && x.short_by === 7_000_000));
   mailFails = new Set(['fail@x.in']);
   const r = (await admin('/api/reminders/run', {})).body;
   const notes = (await editor('/api/notifications')).body.items;
@@ -198,14 +244,24 @@ test('payment confirmation: a paid instalment is marked paid and its money is no
 });
 
 test('settings: reminders and holds can be changed, with checks and an audit entry', async () => {
-  assert.equal((await editor(`/api/emis/${carLoan}`, { remind_days: '7', remind_email: false })).status, 200);
-  const e = (await editor('/api/emis')).body.emis.find((x) => x.id === carLoan);
-  assert.deepEqual([e.remind_days, e.remind_email, e.hold_days], [7, false, 3]); // hold unchanged
+  assert.equal((await editor(`/api/emis/${carLoan}`, { remind_days: '7', remind_email: false })).status, 200); // an older form
+  let e = (await editor('/api/emis')).body.emis.find((x) => x.id === carLoan);
+  assert.deepEqual([e.remind_before, e.remind_email, e.hold_days], [[7], false, 3]); // hold unchanged
+  assert.equal((await editor(`/api/emis/${carLoan}`, { remind_before: [1, 7, 3, 3], remind_due: false, remind_overdue: false })).status, 200);
+  e = (await editor('/api/emis')).body.emis.find((x) => x.id === carLoan);
+  assert.deepEqual([e.remind_before, e.remind_due, e.remind_overdue], [[7, 3, 1], false, false]);
+  assert.equal((await editor(`/api/emis/${carLoan}`, { remind_before: '7, 3' })).status, 200);
+  assert.deepEqual((await editor('/api/emis')).body.emis.find((x) => x.id === carLoan).remind_before, [7, 3]);
+  for (const bad of ['0', '31', 'soon', [1, 2, 3, 4, 5, 6, 7]]) assert.equal((await editor(`/api/emis/${carLoan}`, { remind_before: bad })).status, 400, String(bad));
+  const fresh = (await editor('/api/emis', { lender: 'New default', amount: '1,000', bank_id: bank, start_date: addDays(today, 20) })).body.id;
+  assert.deepEqual((await editor('/api/emis')).body.emis.find((x) => x.id === fresh).remind_before, [7, 3, 1]); // new EMIs: 7, 3 and 1 days
+  await editor(`/api/emis/${fresh}/stop`, {});
   assert.equal((await editor(`/api/emis/${carLoan}`, { remind_to: 'not-an-email' })).status, 400);
   assert.equal((await editor(`/api/emis/${carLoan}`, { hold_days: '40' })).status, 400);
   assert.equal((await editor(`/api/emis/${carLoan}`, { remind_to: 'a@x.in b@x.in c@x.in d@x.in e@x.in f@x.in' })).status, 400);
   const a = (await admin('/api/activity?type=emis')).body.activity.find((x) => x.action === 'emi.edit');
-  assert.deepEqual(a.detail.changes.remind_days, [3, 7]);
+  const edits = (await admin('/api/activity?type=emis')).body.activity.filter((x) => x.action === 'emi.edit').reverse();
+  assert.deepEqual(edits.find((x) => x.detail.changes.remind_before)?.detail.changes.remind_before, [[3], [7]]);
   assert.equal(a.user_name, 'Eli');
 });
 
@@ -229,4 +285,19 @@ test('permissions: viewers see EMIs but can’t add, change, run reminders or se
   assert.equal((await editor('/api/reminders/status')).status, 403);
   for (const p of ['/api/emis/overview', '/api/emis/schedule', '/api/notifications']) assert.equal((await anon(p)).status, 401);
   assert.equal((await editor('/api/emis/schedule?status=bogus')).status, 400);
+});
+
+test('dashboard: the figures agree with the EMI page, the schedule and the bank statements', async () => {
+  const d = (await viewer('/api/dashboard')).body, ov = await overview(), open = await schedule('status=open');
+  assert.deepEqual([d.balance, d.reserved, d.available], [ov.totals.balance, ov.totals.reserved, ov.totals.available]);
+  assert.equal(d.available, d.balance - d.reserved);
+  const due = (days) => open.filter((x) => x.due_date >= today && x.due_date <= addDays(today, days));
+  assert.deepEqual(d.next7, { count: due(7).length, amount: due(7).reduce((n, x) => n + x.left, 0) });
+  assert.deepEqual(d.next30, { count: due(30).length, amount: due(30).reduce((n, x) => n + x.left, 0) });
+  assert.deepEqual(d.overdue, { count: ov.totals.overdue.count, amount: ov.totals.overdue.amount });
+  const month = (await editor(`/api/transactions/summary?from=${d.from}&to=${today}`)).body.total;
+  assert.deepEqual([d.received, d.paid], [month.received, month.paid]);
+  assert.ok(d.paid > 0); // the EMI payments confirmed above
+  assert.equal(d.shortfalls.length, open.filter((x) => x.covered === false && x.due_date <= addDays(today, 30)).length);
+  assert.equal((await anon('/api/dashboard')).status, 401);
 });

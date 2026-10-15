@@ -183,6 +183,15 @@ const MIGRATIONS = [
      created_at  timestamptz NOT NULL DEFAULT now(),
      sent_at     timestamptz
    );`,
+  // several reminder points before the due date (7, 3 and 1 days by default), and switches for the due-date and
+  // overdue reminders. remind_days (one point) is no longer used: an EMI that still has its default of 3 gets the new
+  // 7, 3 and 1; one set to another number keeps that single point; 0 (no advance reminder) stays off.
+  `ALTER TABLE emis
+     ADD COLUMN remind_before  smallint[] NOT NULL DEFAULT '{7,3,1}',
+     ADD COLUMN remind_due     boolean NOT NULL DEFAULT true,
+     ADD COLUMN remind_overdue boolean NOT NULL DEFAULT true;
+   UPDATE emis SET remind_before = CASE WHEN remind_days = 3 THEN '{7,3,1}'::smallint[]
+                                        WHEN remind_days > 0 THEN ARRAY[remind_days]::smallint[] ELSE '{}'::smallint[] END;`,
 ];
 
 let ready;

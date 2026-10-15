@@ -4,7 +4,7 @@
 const app = document.getElementById('app'), dlg = document.getElementById('dlg');
 const S = { user: null, today: '', date: '', approvedOnly: false, uncertain: true, pos: null };
 // what one signed-in person was looking at; cleared on sign-out so the next person starts fresh
-const fresh = () => Object.assign(S, { view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, tf: null, ef: null, notes: null, notesAt: 0, approvedOnly: false, uncertain: true });
+const fresh = () => Object.assign(S, { view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, tf: null, ef: null, dash: null, notes: null, notesAt: 0, approvedOnly: false, uncertain: true });
 fresh();
 
 function h(tag, attrs, ...kids) {
@@ -101,6 +101,8 @@ const ICONS = {
   calendar: 'M3 5h18v16H3zM16 3v4M8 3v4M3 10h18', users: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8',
   badge: 'M3 7h18v13H3zM9 7V4h6v3M3 13h18', shield: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z', bell: 'M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0',
   menu: 'M3 6h18M3 12h18M3 18h18', wallet: 'M3 7h18v13H3zM16 14h2M3 7l3-4h12l3 4',
+  lock: 'M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4', check: 'M20 6L9 17l-5-5', alert: 'M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z',
+  down: 'M12 4v14M6 12l6 6 6-6', up: 'M12 20V6M6 12l6-6 6 6', clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2',
 };
 function icon(name) {
   const ns = 'http://www.w3.org/2000/svg', svg = document.createElementNS(ns, 'svg'), p = document.createElementNS(ns, 'path');
@@ -170,7 +172,7 @@ function fillNotes(p) {
 // ── the day's position ──
 async function loadPosition() {
   const p = new URLSearchParams({ date: S.date, approvedOnly: S.approvedOnly ? '1' : '0', uncertain: S.uncertain ? '1' : '0' });
-  S.pos = await api(`/api/position?${p}`);
+  [S.pos, S.dash] = await Promise.all([api(`/api/position?${p}`), api('/api/dashboard')]);
   render();
 }
 
@@ -206,8 +208,8 @@ function render() {
       tile('t-rec', '+ Receipts due', T.receive, `${count('IN')} receipt(s)`),
       tile(T.final < 0 ? 't-fin bad' : 't-fin', isToday ? '= Closing position today' : '= Closing position', T.final, T.final < 0 ? `Short by ${inr(-T.final)}` : 'After all of the above')),
     T.held > 0 && h('div', { class: 'hold-strip' },
-      h('span', { class: 'badge-emi' }, 'EMI HOLD'),
-      h('span', {}, h('strong', {}, inr(T.held)), ' is held for EMIs and can’t be paid to anyone else: ',
+      h('span', { class: 'badge-emi' }, 'EMI RESERVE'),
+      h('span', {}, h('strong', {}, inr(T.held)), ' is reserved for EMIs in this app (your bank isn’t holding it) — the app won’t let it be paid to anyone else: ',
         P.rows.flatMap((r) => r.holds.map((x) => `${x.name} ${inr(x.amount)} (${x.date < P.today ? 'overdue' : x.date === P.today ? 'due today' : 'due ' + nice(x.date)}, ${r.name})`)).join(' · ')),
       h('span', { class: 'grow' }),
       h('span', {}, 'Free to pay others now: ', h('strong', { class: T.free < 0 ? 'neg' : '' }, inr(T.free)))));
@@ -228,8 +230,8 @@ function render() {
 
   const alerts = [
     ...P.rows.filter((r) => r.id != null && r.final < 0 && T.final >= 0).map((r) => ['bad', `${r.name} will be short by ${inr(-r.final)}. Transfer money into it before the payments go out.`]),
-    ...P.rows.filter((r) => r.held > 0 && r.free < 0).map((r) => ['bad', `${r.name} doesn’t have enough for its EMIs: ${inr(r.held)} is held but the balance is ${inr(r.today)}. Bring in ${inr(-r.free)}.`]),
-    needsEmi.size > 0 && ['warn', `${needsEmi.size} payment(s) can only be paid with money held for EMIs, so they will be refused until money comes in.`],
+    ...shortfallAlerts(S.dash?.shortfalls ?? []).map((t) => ['bad', t]),
+    needsEmi.size > 0 && ['warn', `${needsEmi.size} payment(s) can only be paid with money reserved for EMIs, so the app will refuse them until money comes in.`],
     ...warnings.map((w) => ['warn', w]),
   ].filter(Boolean);
   const alertBox = alerts.length > 0 && h('div', { class: 'alerts' }, alerts.map(([k, t]) => h('div', { class: `alert ${k}` }, t)));
@@ -237,7 +239,7 @@ function render() {
   const hasHold = P.rows.some((r) => r.held > 0);
   const accounts = h('section', { class: 'card' }, h('h2', {}, h('span', { class: 'dot d-blue' }), 'By account'), h('div', { class: 'scroll' }, h('table', {},
     h('thead', {}, h('tr', {}, h('th', {}, 'Account'), h('th', { class: 'num' }, 'Balance now'),
-      hasHold && h('th', { class: 'num' }, 'Held for EMI'), hasHold && h('th', { class: 'num' }, 'Free now'),
+      hasHold && h('th', { class: 'num' }, 'Reserved for EMI'), hasHold && h('th', { class: 'num' }, 'Free now'),
       h('th', { class: 'num' }, '− To pay'), h('th', { class: 'num' }, '+ To receive'), h('th', { class: 'num' }, '= Closing'))),
     h('tbody', {}, P.rows.map((r) => h('tr', {},
       h('td', {}, h('strong', {}, r.name), h('div', { class: 'muted small' }, r.id == null ? 'Choose an account for these items' : `${r.bank}${r.asOf ? ` · balance for ${nice(r.asOf)}` : ' · no balance yet'}`)),
@@ -258,7 +260,7 @@ function render() {
       rows.length ? rows.map((i) => itemRow(i, bankOpts)) : h('p', { class: 'empty' }, empty));
   };
 
-  app.replaceChildren(...[topBar(), hero, controls, alertBox, h('div', { class: 'cols' },
+  app.replaceChildren(...[topBar(), summaryCards(S.dash), hero, controls, alertBox, h('div', { class: 'cols' },
     list('OUT', 'd-red', isToday ? 'Payments to make today' : 'Payments to make', 'Nothing to pay.'),
     list('IN', 'd-green', isToday ? 'Receipts due today' : 'Receipts due', 'Nothing expected.')), accounts].filter(Boolean));
 }
@@ -274,7 +276,7 @@ function itemRow(i, bankOpts) {
         !i.overdue && i.date !== S.pos.today && h('span', { class: 'chip c-blue' }, nice(i.date)),
         out && !i.approved && h('span', { class: 'chip c-violet' }, 'not approved'),
         i.uncertain && h('span', { class: 'chip c-violet' }, 'uncertain'),
-        i.needsEmi && h('span', { class: 'chip c-red', title: 'Paying this now would use money held for EMIs, so it will be refused.' }, 'blocked by EMI hold'),
+        i.needsEmi && h('span', { class: 'chip c-red', title: 'Paying this now would use money reserved for EMIs, so the app will refuse it.' }, 'blocked: EMI reserve'),
         h('span', { class: 'muted small' }, i.account)),
       h('div', { class: 'acts' },
         can('editor') && h('button', { class: `small ${out ? 'solid-red' : 'solid-green'}`, onclick: () => settleDialog(i, bankOpts) }, out ? 'Mark paid' : 'Mark received'),
@@ -493,10 +495,38 @@ function txDialog(kind, accounts) {
   ], out ? 'Record payment' : 'Record receipt', (v) => confirmDup((dup) => api('/api/transactions', { ...v, kind, confirmDuplicate: dup })));
 }
 
-// ── EMI management: loans, the money held for them, the schedule, and reminders ──
+// one alert per account that can't cover its EMIs in the next 30 days: the first one it misses, and the total it needs
+function shortfallAlerts(list) {
+  const byBank = new Map();
+  for (const x of list) byBank.set(x.bank_id, [...(byBank.get(x.bank_id) ?? []), x]);
+  return [...byBank.values()].map((xs) => {
+    const first = xs[0], all = xs.at(-1);
+    return xs.length === 1
+      ? `${first.bank_name} can’t cover the ${first.lender} EMI of ${inr(first.left)} due ${nice(first.due_date)} — short by ${inr(first.short_by)}. Move money in before then.`
+      : `${first.bank_name} can’t cover ${xs.length} EMIs due in the next 30 days. The first is the ${first.lender} EMI of ${inr(first.left)} on ${nice(first.due_date)} (short by ${inr(first.short_by)}); to cover them all it needs ${inr(all.short_by)} more by ${nice(all.due_date)}.`;
+  });
+}
+
+// ── dashboard summary cards ──
+function summaryCards(d) {
+  if (!d) return null;
+  const card = (tone, ic, label, amount, sub, target) => h(target ? 'button' : 'div', { class: `sum-card ${tone}`, onclick: target ? () => go(target) : null },
+    h('span', { class: 'sum-ic' }, icon(ic)), h('span', { class: 'sum-lbl' }, label), h('strong', { class: `sum-amt ${amount < 0 ? 'neg' : ''}` }, inr(amount)), h('span', { class: 'sum-sub' }, sub));
+  const n = (x) => `${x.count} EMI${x.count === 1 ? '' : 's'}`;
+  return h('section', { class: 'sum-cards', 'aria-label': 'Summary' },
+    card('k-blue', 'wallet', 'Total bank balance', d.balance, 'All accounts, now'),
+    card('k-amber', 'lock', 'Reserved for EMIs', d.reserved, 'Set aside in this app', 'emis'),
+    card(d.available < 0 ? 'k-red' : 'k-green', 'check', 'Available balance', d.available, 'Balance − reserved'),
+    card('k-violet', 'clock', 'EMIs next 7 days', d.next7.amount, n(d.next7), 'emis'),
+    card('k-violet', 'calendar', 'EMIs next 30 days', d.next30.amount, n(d.next30), 'emis'),
+    card(d.overdue.count ? 'k-red' : 'k-plain', 'alert', 'Overdue EMIs', d.overdue.amount, d.overdue.count ? n(d.overdue) : 'None', 'emis'),
+    card('k-green', 'down', 'Receipts this month', d.received, `Received since ${nice(d.from)}`, 'transactions:history'),
+    card('k-red', 'up', 'Payments this month', d.paid, `Paid since ${nice(d.from)}`, 'transactions:history'));
+}
+
+// ── EMI management: loans, the money reserved for them, the schedule, and reminders ──
 const EMI_STATE = { overdue: ['Overdue', 'c-red'], due: ['Due today', 'c-amber'], upcoming: ['Upcoming', 'c-blue'], scheduled: ['Scheduled', ''], paid: ['Paid', 'c-green'], cancelled: ['Cancelled', ''] };
-const HOLD_OPTS = [['0', 'The EMI day only'], ['1', '1 day before'], ['2', '2 days before'], ['3', '3 days before'], ['5', '5 days before'], ['7', '7 days before'], ['10', '10 days before'], ['15', '15 days before']];
-const REMIND_OPTS = [['0', 'No advance reminder'], ['1', '1 day before'], ['2', '2 days before'], ['3', '3 days before'], ['5', '5 days before'], ['7', '7 days before'], ['10', '10 days before'], ['15', '15 days before']];
+const HOLD_OPTS = [['0', 'The EMI day'], ['1', '1 day before'], ['2', '2 days before'], ['3', '3 days before'], ['5', '5 days before'], ['7', '7 days before'], ['10', '10 days before'], ['15', '15 days before']];
 
 async function loadEmis() {
   if (!S.ef) S.ef = { status: 'open', emi: '', bank: '' };
@@ -512,14 +542,14 @@ function renderEmis(ov, emis, rows, rem) {
   const summary = h('header', { class: 'hero' },
     h('div', { class: 'hero-top' }, h('div', {}, h('div', { class: 'eyebrow' }, `Today · ${nice(ov.today)}`), h('h1', {}, 'EMIs at a glance'))),
     h('div', { class: 'tiles' },
-      tile('t-hold', 'Reserved for EMIs', T.reserved, 'Held in the accounts — can’t be paid to anyone else'),
+      tile('t-hold', 'Reserved for EMIs', T.reserved, 'Set aside in this app — not frozen at the bank'),
       tile(T.available < 0 ? 't-fin bad' : 't-fin', 'Available to spend', T.available, `Balance ${inr(T.balance)} − reserved`),
       tile('t-pay', `Overdue (${T.overdue.count})`, T.overdue.amount, T.overdue.count ? 'Unpaid after the due date' : 'Nothing overdue'),
       tile('t-bal', `Due in 30 days (${T.due.count + T.upcoming.count})`, T.due.amount + T.upcoming.amount, `${T.active} active EMI(s) · ${inr(T.monthly)} a month`)));
 
   const accounts = ov.accounts.length > 0 && h('div', { class: 'bank-cards' }, ov.accounts.map((a) => h('section', { class: `bank-card ${a.available < 0 ? 'short' : ''}` },
     h('div', { class: 'bc-head' }, h('div', {}, h('strong', {}, a.name), h('div', { class: 'muted small' }, a.bank)),
-      a.available < 0 ? h('span', { class: 'chip c-red' }, `short by ${inr(-a.available)}`) : a.reserved > 0 ? h('span', { class: 'chip c-amber' }, 'money held') : null),
+      a.available < 0 ? h('span', { class: 'chip c-red' }, `short by ${inr(-a.available)}`) : a.reserved > 0 ? h('span', { class: 'chip c-amber' }, 'reserved') : null),
     h('div', { class: `bc-amt ${a.available < 0 ? 'neg' : ''}` }, inr(a.available)),
     h('div', { class: 'muted small bc-cap' }, 'available to spend'),
     h('div', { class: 'bc-line' }, h('span', { class: 'muted' }, 'Balance now'), money(a.balance)),
@@ -531,7 +561,7 @@ function renderEmis(ov, emis, rows, rem) {
   const loans = h('section', { class: 'card' },
     h('h2', {}, h('span', { class: 'dot d-amber' }), 'Loans', h('span', { class: 'count' }, emis.filter((e) => e.active).length)),
     emis.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'Loan'), h('th', {}, 'Account'), h('th', { class: 'num' }, 'EMI'), h('th', {}, 'Every month'), h('th', {}, 'Money held'), h('th', {}, 'Reminders'), h('th', {}, 'Next due'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
+      h('thead', {}, h('tr', {}, h('th', {}, 'Loan'), h('th', {}, 'Account'), h('th', { class: 'num' }, 'EMI'), h('th', {}, 'Every month'), h('th', {}, 'Reserved from'), h('th', {}, 'Reminders'), h('th', {}, 'Next due'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
       h('tbody', {}, emis.map((e) => h('tr', { class: e.active ? '' : 'inactive' },
         h('td', {}, h('strong', {}, e.lender), e.ref && h('div', { class: 'muted small' }, e.ref)),
         h('td', {}, e.bank_name),
@@ -539,7 +569,7 @@ function renderEmis(ov, emis, rows, rem) {
         h('td', { class: 'nowrap' }, `Day ${e.day}`, e.end_date && h('div', { class: 'muted small' }, `until ${nice(e.end_date)}`)),
         h('td', {}, e.hold_days ? `${e.hold_days} day(s) before` : 'On the EMI day'),
         h('td', {}, h('div', { class: 'chips' },
-          e.remind_in_app ? h('span', { class: 'chip c-blue' }, `In-app${e.remind_days ? ` · ${e.remind_days}d before` : ''}`) : null,
+          e.remind_in_app ? h('span', { class: 'chip c-blue' }, `In-app · ${remindSummary(e)}`) : null,
           e.remind_email ? h('span', { class: 'chip c-violet', title: e.remind_to || 'All admins' }, `Email · ${e.remind_to ? e.remind_to.split(', ').length + ' address(es)' : 'admins'}`) : null,
           !e.remind_in_app && !e.remind_email && h('span', { class: 'muted small' }, 'Off'))),
         h('td', { class: 'nowrap' }, e.next_due ? nice(e.next_due) : '—'),
@@ -568,7 +598,8 @@ function renderEmis(ov, emis, rows, rem) {
           h('td', { class: 'num' }, money(r.amount)),
           h('td', { class: 'num' }, r.paid ? money(r.paid, 'pos') : '—', r.refs && h('div', { class: 'muted small' }, r.refs)),
           h('td', {}, h('div', { class: 'chips' }, h('span', { class: `chip ${tone}` }, label), r.paid > 0 && r.left > 0 && h('span', { class: 'chip c-blue' }, `${inr(r.left)} left`),
-            r.reserved && h('span', { class: 'chip c-amber', title: `Held since ${nice(r.hold_from)}` }, 'reserved'), r.projected && h('span', { class: 'muted small' }, 'projected'))),
+            r.reserved && h('span', { class: 'chip c-amber', title: `Reserved in this app since ${nice(r.hold_from)}` }, 'reserved'),
+            r.covered === false && h('span', { class: 'chip c-red', title: 'The account’s balance can’t pay this together with its earlier EMIs.' }, `not covered · short ${inr(r.short_by)}`), r.projected && h('span', { class: 'muted small' }, 'projected'))),
           can('editor') && h('td', { class: 'acts-cell' }, open && h('button', { class: 'small solid-red', onclick: () => settleDialog({ kind: 'OUT', id: r.payment_id, name: `${r.lender} EMI (${nice(r.due_date)})`, amount: r.left, bankId: r.bank_id }, bankOpts) }, 'Confirm payment')));
       }))))
       : h('p', { class: 'empty' }, 'Nothing matches.'));
@@ -589,7 +620,7 @@ function renderEmis(ov, emis, rows, rem) {
       : h('p', { class: 'empty' }, 'No email reminders yet.'));
 
   app.replaceChildren(...[topBar(),
-    pageHead('EMI management', 'Monthly loan instalments, the money held for them, and reminders.',
+    pageHead('EMI management', 'Monthly loan instalments, the money reserved for them in this app, and reminders.',
       can('admin') && h('button', { onclick: async (e) => {
         e.target.disabled = true;
         try { const r = await api('/api/reminders/run', {}); alert(`${r.reminders} reminder(s) due: ${r.inApp} new in-app, ${r.queued} email(s) queued, ${r.sent} sent${r.skipped ? `, ${r.skipped} not sent (email not set up)` : ''}${r.failed ? `, ${r.failed} failed` : ''}.`); S.notesAt = 0; await load(); }
@@ -599,13 +630,26 @@ function renderEmis(ov, emis, rows, rem) {
     summary, accounts, loans, schedule, reminders].filter(Boolean));
 }
 
+// "7, 3, 1 days before · due · overdue"
+const remindSummary = (e) => [e.remind_before?.length ? `${e.remind_before.join('/')}d before` : '', e.remind_due && 'due', e.remind_overdue && 'overdue'].filter(Boolean).join(' · ') || 'off';
+// the reminder points offered: 7, 3 and 1 days, plus any other point an EMI already has
+const pointsFor = (e) => [...new Set([7, 3, 1, ...(e?.remind_before ?? [])])].sort((a, b) => b - a);
 const reminderFields = (e) => [
-  { name: 'hold_days', label: 'Hold the money from', type: 'select', value: String(e?.hold_days ?? 0), options: HOLD_OPTS, hint: 'While held, that money can’t be paid to anyone else from this account.' },
-  { name: 'remind_days', label: 'Remind me', type: 'select', value: String(e?.remind_days ?? 3), options: REMIND_OPTS, hint: 'Reminders also come on the due date, and if it becomes overdue or the account is short.' },
+  { name: 'hold_days', label: 'Reserve the money from', type: 'select', value: String(e?.hold_days ?? 0), options: HOLD_OPTS,
+    hint: 'A reservation inside this app: the app won’t let reserved money be paid to anyone else from this account. Your bank isn’t asked to hold it.' },
+  ...pointsFor(e).map((d) => ({ name: `before_${d}`, label: `Remind ${d} day${d === 1 ? '' : 's'} before`, type: 'checkbox', value: e ? e.remind_before.includes(d) : true })),
+  { name: 'remind_due', label: 'Remind on the due date', type: 'checkbox', value: e?.remind_due ?? true },
+  { name: 'remind_overdue', label: 'Remind if it becomes overdue', type: 'checkbox', value: e?.remind_overdue ?? true },
   { name: 'remind_in_app', label: 'In-app reminder (the bell)', type: 'checkbox', value: e?.remind_in_app ?? true },
   { name: 'remind_email', label: 'Email reminder', type: 'checkbox', value: e?.remind_email ?? false },
   { name: 'remind_to', label: 'Email to (optional)', value: e?.remind_to ?? '', placeholder: 'accounts@firm.in, owner@firm.in', hint: 'Leave blank to email all admins. Up to 5 addresses.' },
 ];
+
+const reminderBody = (v) => {
+  const out = { ...v, remind_before: [] };
+  for (const k of Object.keys(v)) if (k.startsWith('before_')) { if (v[k]) out.remind_before.push(Number(k.slice(7))); delete out[k]; }
+  return out;
+};
 
 function emiForm(bankOpts) {
   if (!bankOpts.length) return alert('Add a bank account first (Dashboard → “+ Account”).');
@@ -617,11 +661,11 @@ function emiForm(bankOpts) {
     { name: 'end_date', label: 'Last EMI date (optional)', type: 'date' },
     { name: 'ref', label: 'Loan account no. (optional)' },
     ...reminderFields(null),
-  ], 'Add EMI', (v) => confirmDup((dup) => api('/api/emis', { ...v, confirmDuplicate: dup })), null, true);
+  ], 'Add EMI', (v) => confirmDup((dup) => api('/api/emis', { ...reminderBody(v), confirmDuplicate: dup })), null, true);
 }
 
 function emiSettingsDialog(e) {
-  openDialog(`Settings: ${e.lender}`, reminderFields(e), 'Save', (v) => api(`/api/emis/${e.id}`, v), `${inr(e.amount)} from ${e.bank_name}, every month on day ${e.day}.`);
+  openDialog(`Settings: ${e.lender}`, reminderFields(e), 'Save', (v) => api(`/api/emis/${e.id}`, reminderBody(v)), `${inr(e.amount)} from ${e.bank_name}, every month on day ${e.day}.`);
 }
 
 // ── People ──
