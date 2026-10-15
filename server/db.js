@@ -192,6 +192,26 @@ const MIGRATIONS = [
      ADD COLUMN remind_overdue boolean NOT NULL DEFAULT true;
    UPDATE emis SET remind_before = CASE WHEN remind_days = 3 THEN '{7,3,1}'::smallint[]
                                         WHEN remind_days > 0 THEN ARRAY[remind_days]::smallint[] ELSE '{}'::smallint[] END;`,
+  // app access for people: a person can have a sign-in account, which they create from a one-time link (an invite)
+  // with their own password; the same kind of link resets a forgotten password. Only a hash of each link is kept.
+  // People whose email already matches a user are linked to that user.
+  `ALTER TABLE people ADD COLUMN user_id integer UNIQUE REFERENCES users(id);
+   UPDATE people p SET user_id = u.id FROM users u WHERE p.email <> '' AND lower(p.email) = u.email;
+   CREATE TABLE invites (
+     id          serial PRIMARY KEY,
+     kind        text NOT NULL CHECK (kind IN ('invite', 'reset')),
+     person_id   integer REFERENCES people(id),
+     user_id     integer REFERENCES users(id),
+     email       text NOT NULL,
+     role        text CHECK (role IN ('viewer', 'editor', 'admin')),
+     token_hash  text NOT NULL UNIQUE,
+     expires_at  timestamptz NOT NULL,
+     created_by  integer REFERENCES users(id),
+     created_at  timestamptz NOT NULL DEFAULT now(),
+     used_at     timestamptz,
+     revoked_at  timestamptz
+   );
+   CREATE INDEX invites_person ON invites (person_id, id DESC);`,
 ];
 
 let ready;
