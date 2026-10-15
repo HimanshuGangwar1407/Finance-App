@@ -233,3 +233,8 @@ button.sum-card:hover { filter: none; border-color: var(--brand); }
 .k-plain .sum-ic { background: var(--bg); color: var(--muted); }
 .k-blue { border-top: 3px solid var(--blue); } .k-amber { border-top: 3px solid var(--amber); } .k-green { border-top: 3px solid var(--green); }
 .k-red { border-top: 3px solid var(--red); } .k-violet { border-top: 3px solid var(--violet); } .k-plain { border-top: 3px solid var(--line); }
+
+/* ── app access: the link to copy ── */
+.link-box { font-family: ui-monospace, Consolas, monospace; font-size: 13px; margin: 6px 0 10px; }
+.link-acts { margin-bottom: 8px; }
+.narrow .kv { margin: 4px 0 14px; }

@@ -138,6 +138,7 @@ function topBar() {
         h('button', { class: 'icon-btn bell', id: 'bell', 'aria-label': `Reminders${unread ? `, ${unread} unread` : ''}`, onclick: toggleNotes }, icon('bell'), h('span', { class: 'badge', id: 'bell-badge', hidden: !unread }, unread > 99 ? '99+' : unread)),
         h('div', { class: 'notes-panel', id: 'notes', hidden: true })),
       h('div', { class: 'who' }, h('span', { class: 'avatar' }, S.user.name.trim().slice(0, 1).toUpperCase()), h('span', { class: 'who-name' }, S.user.name, h('small', {}, S.user.role)),
+        h('button', { class: 'small', onclick: passwordDialog }, 'Change password'),
         h('button', { class: 'small', onclick: async () => { await api('/api/logout', {}); S.user = null; fresh(); document.body.classList.remove('has-shell', 'nav-open'); boot(); } }, 'Sign out'))));
 }
 
@@ -698,16 +699,18 @@ function renderPeople(people, positions, hidden) {
         [['', 'All positions'], ['none', 'No position'], ...positions.map((x) => [String(x.id), x.name + (x.active ? '' : ' (inactive)')])].map(([v, t]) => h('option', { value: v, selected: S.pf.position === v }, t)))));
   const table = people.length
     ? h('div', { class: 'scroll' }, h('table', { class: 'people' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Position'), !hidden && h('th', {}, 'Email'), !hidden && h('th', {}, 'Phone'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
+      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Position'), !hidden && h('th', {}, 'Email'), !hidden && h('th', {}, 'Phone'), h('th', {}, 'Status'), !hidden && h('th', {}, 'App access'), can('editor') && h('th', {}, ''))),
       h('tbody', {}, people.map((x) => h('tr', { class: x.active ? '' : 'inactive' },
         h('td', {}, h('button', { class: 'link', onclick: () => personView(x, positions, hidden) }, x.name)),
         h('td', {}, x.position ? h('span', { class: `chip ${x.position_active ? 'c-violet' : ''}` }, x.position) : h('span', { class: 'muted' }, '—')),
         !hidden && h('td', {}, x.email || h('span', { class: 'muted' }, '—')),
         !hidden && h('td', { class: 'nowrap' }, x.phone || h('span', { class: 'muted' }, '—')),
         h('td', {}, statusChip(x.active)),
+        !hidden && h('td', {}, accessChip(x)),
         can('editor') && h('td', { class: 'acts-cell' },
           h('button', { class: 'small', onclick: () => personForm(x, positions) }, 'Edit'),
-          h('button', { class: 'small', onclick: () => setPersonActive(x, !x.active) }, x.active ? 'Deactivate' : 'Activate')))))))
+          h('button', { class: 'small', onclick: () => setPersonActive(x, !x.active) }, x.active ? 'Deactivate' : 'Activate'),
+          ...accessButtons(x)))))))
     : h('p', { class: 'empty' }, S.pf.q || S.pf.position || S.pf.status !== 'active' ? 'No one matches.' : 'No people yet.');
   app.replaceChildren(topBar(),
     pageHead('People', `${people.length} shown${hidden ? ' · contact details are visible to editors and admins' : ''}`,
@@ -723,7 +726,8 @@ function personView(x, positions, hidden) {
       row('Position', x.position ? `${x.position}${x.position_active ? '' : ' (inactive position)'}` : ''),
       !hidden && row('Email', x.email), !hidden && row('Phone', x.phone), !hidden && row('Notes', x.notes),
       row('Added', `${when(x.created_at)}${x.created_by ? ` by ${x.created_by}` : ''}`),
-      row('Last changed', `${when(x.updated_at)}${x.updated_by ? ` by ${x.updated_by}` : ''}`)),
+      row('Last changed', `${when(x.updated_at)}${x.updated_by ? ` by ${x.updated_by}` : ''}`),
+      !hidden && h('div', { class: 'kv' }, h('span', { class: 'muted' }, 'App access'), h('span', {}, accessChip(x)))),
     h('div', { class: 'bar' },
       can('editor') && h('button', { class: 'primary', onclick: () => personForm(x, positions) }, 'Edit'),
       h('button', { onclick: () => dlg.close() }, 'Close')));
@@ -746,6 +750,92 @@ const setPersonActive = (x, active) => {
   if (!active && !confirm(`Deactivate ${x.name}? They stay on record and can be activated again.`)) return;
   act(`/api/people/${x.id}/active`, { active });
 };
+
+// ── app access: who can sign in, invites and password-reset links ──
+const ROLE = { viewer: 'Viewer', editor: 'Editor', admin: 'Admin' };
+function accessChip(x) {
+  if (x.user_id) return x.access_active ? h('span', { class: `chip ${x.access_role === 'admin' ? 'c-violet' : 'c-green'}` }, `${ROLE[x.access_role]} access`) : h('span', { class: 'chip c-red' }, 'Access removed');
+  if (x.open_link) return h('span', { class: 'chip c-amber', title: `Link valid until ${when(x.open_link.expires_at)}` }, `Invited · ${ROLE[x.open_link.role]}`);
+  return h('span', { class: 'muted small' }, 'No access');
+}
+function accessButtons(x) {
+  if (!can('admin') || !x.active) return [];
+  if (x.user_id) return x.access_active
+    ? [h('button', { class: 'small', onclick: () => linkAction(`/api/people/${x.id}/reset-link`, {}, `Password reset link for ${x.name}`, x) }, 'Reset password link'),
+      x.user_id !== S.user.id && h('button', { class: 'small', onclick: () => { if (confirm(`Remove ${x.name}’s access? They are signed out everywhere and can’t sign in until you restore it.`)) act(`/api/people/${x.id}/access`, { active: false }); } }, 'Remove access')].filter(Boolean)
+    : [h('button', { class: 'small', onclick: () => act(`/api/people/${x.id}/access`, { active: true }) }, 'Restore access')];
+  return [
+    h('button', { class: 'small c-violet', onclick: () => inviteDialog(x) }, x.open_link ? 'New invite link' : 'Invite'),
+    x.open_link && h('button', { class: 'small', onclick: () => { if (confirm(`Cancel ${x.name}’s invite link? It will stop working.`)) act(`/api/people/${x.id}/invite/cancel`, {}); } }, 'Cancel invite'),
+  ].filter(Boolean);
+}
+
+function inviteDialog(x) {
+  if (!x.email) return alert(`Add ${x.name}’s email address first (Edit). It is what they will sign in with.`);
+  openDialog(`Invite ${x.name} to the app`, [
+    { name: 'role', label: 'What can they do?', type: 'select', value: x.open_link?.role ?? 'viewer', options: [['viewer', 'Viewer — can look, can’t change anything'], ['editor', 'Editor — adds and updates records'], ['admin', 'Admin — everything, including users and approvals']] },
+  ], 'Create invite link', async (v) => { const r = await api(`/api/people/${x.id}/invite`, v); setTimeout(() => showLink(r, `Invite link for ${x.name}`, x), 0); },
+  `They will sign in with ${x.email} and choose their own password. The link works once, for 7 days${x.open_link ? ' — and replaces the link sent earlier' : ''}.`);
+}
+async function linkAction(path, body, title, x) {
+  try { const r = await api(path, body); await load(); showLink(r, title, x); } catch (e) { alert(e.message); }
+}
+// the link, ready to copy and send (WhatsApp, email…); it is shown only now and can't be looked up later
+function showLink(r, title, x) {
+  const box = h('input', { type: 'text', readonly: true, value: r.link, class: 'link-box', 'aria-label': 'Link', onfocus: (e) => e.target.select() });
+  const copied = h('span', { class: 'muted small', role: 'status' });
+  const sent = { sent: `Also emailed to ${x.email}.`, failed: `Emailing it to ${x.email} failed — send the link yourself.`, 'not set up': 'Email isn’t set up, so send the link yourself.' }[r.emailed];
+  dlg.className = '';
+  dlg.replaceChildren(h('h2', {}, title),
+    h('p', {}, `Send this link to ${x.name}. It works once, until ${when(r.expires_at)}. Anyone with the link can use it, so send it only to them.`),
+    box,
+    h('div', { class: 'bar link-acts' },
+      h('button', { class: 'primary', onclick: async () => {
+        try { await navigator.clipboard.writeText(r.link); copied.textContent = 'Copied.'; } catch { box.focus(); box.select(); copied.textContent = 'Press Ctrl+C to copy.'; }
+      } }, 'Copy link'), copied),
+    h('p', { class: 'muted small' }, sent, ' This link can’t be shown again; you can always make a new one.'),
+    h('div', { class: 'bar' }, h('button', { onclick: () => dlg.close() }, 'Done')));
+  if (!dlg.open) dlg.showModal();
+}
+
+function passwordDialog() {
+  openDialog('Change your password', [
+    { name: 'current', label: 'Current password', type: 'password', required: true, autocomplete: 'current-password' },
+    { name: 'password', label: 'New password', type: 'password', required: true, autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers.' },
+    { name: 'confirm', label: 'New password again', type: 'password', required: true, autocomplete: 'new-password' },
+  ], 'Change password', async (v) => {
+    if (v.password !== v.confirm) throw new Error('The two new passwords don’t match.');
+    await api('/api/me/password', { current: v.current, password: v.password });
+    setTimeout(() => alert('Your password is changed. You stay signed in here; other devices are signed out.'), 0);
+  });
+}
+
+// the page an invite or reset link opens: who it is for, then "choose your password"
+async function linkScreen(kind, token) {
+  document.body.classList.remove('has-shell', 'nav-open');
+  const clear = () => history.replaceState(null, '', location.pathname); // the secret leaves the address bar
+  let info;
+  try { info = await api('/api/invites/check', { token }); }
+  catch (e) {
+    clear();
+    return app.replaceChildren(h('div', { class: 'card narrow' }, h('h1', {}, 'This link can’t be used'), h('p', {}, e.message), h('button', { onclick: boot }, 'Go to sign in')));
+  }
+  const invite = kind === 'invite';
+  app.replaceChildren(h('div', { class: 'card narrow' },
+    h('h1', {}, invite ? `Welcome, ${info.name}` : 'Set a new password'),
+    h('p', { class: 'muted' }, invite ? `You’ve been given ${ROLE[info.role]} access to the Finance app. Choose a password to finish.` : `For ${info.name}. Your other devices will be signed out.`),
+    h('div', { class: 'kv' }, h('span', { class: 'muted' }, 'You sign in with'), h('strong', {}, info.email)),
+    form([
+      ...(invite ? [{ name: 'name', label: 'Your name', value: info.name, required: true }] : []),
+      { name: 'password', label: 'Choose a password', type: 'password', required: true, autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers.' },
+      { name: 'confirm', label: 'Type it again', type: 'password', required: true, autocomplete: 'new-password' },
+    ], invite ? 'Create my account' : 'Save new password', async (v) => {
+      if (v.password !== v.confirm) throw new Error('The two passwords don’t match.');
+      S.user = (await api('/api/invites/accept', { token, password: v.password, name: v.name })).user;
+      clear(); fresh();
+      await boot();
+    })));
+}
 
 // ── Positions ──
 async function loadPositions() {
@@ -798,6 +888,9 @@ const ACTION_LABELS = {
   'report.export': 'Exported a report',
   login: 'Signed in', 'login.failed': 'Failed sign-in', 'login.locked': 'Locked out (too many wrong passwords)', logout: 'Signed out',
   setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user',
+  'invite.create': 'Invited someone to the app', 'invite.reset_link': 'Made a password reset link', 'invite.cancel': 'Cancelled an invite link',
+  'invite.accept': 'Accepted an invite (set their password)', 'password.reset': 'Set a new password from a reset link', 'password.change': 'Changed their password',
+  'access.remove': 'Removed someone’s access', 'access.restore': 'Restored someone’s access',
   'person.add': 'Added a person', 'person.edit': 'Edited a person', 'person.activate': 'Activated a person', 'person.deactivate': 'Deactivated a person', 'person.assign': 'Assigned a position',
   'position.add': 'Added a position', 'position.edit': 'Edited a position', 'position.activate': 'Activated a position', 'position.deactivate': 'Deactivated a position',
   'payment.add': 'Added a payment', 'payment.paid': 'Marked a payment paid', 'payment.approve': 'Approved a payment', 'payment.cancel': 'Cancelled a payment',
@@ -835,7 +928,7 @@ function renderActivity() {
   const filters = h('div', { class: 'card toolbar' }, h('div', { class: 'bar grow' },
     h('input', { type: 'search', name: 'aq', class: 'search', placeholder: 'Search actions, names, references', value: f.q ?? '', oninput: onSearch((v) => { S.af = { ...S.af, q: v }; }), 'aria-label': 'Search activity' }),
     h('select', { 'aria-label': 'Who', onchange: set('user') }, [['', 'Everyone'], ...users.map((u) => [String(u.id), `${u.name} (${u.role})`]), ['none', 'Not signed in']].map(([v, t]) => h('option', { value: v, selected: (f.user ?? '') === v }, t))),
-    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'All activity'], ['signin', 'Sign-ins'], ['people', 'People'], ['positions', 'Positions'], ['payments', 'Payments'], ['receipts', 'Receipts'], ['emis', 'EMIs'], ['balances', 'Bank balances'], ['accounts', 'Bank accounts'], ['users', 'Users'], ['reports', 'Report exports']]
+    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'All activity'], ['signin', 'Sign-ins'], ['people', 'People'], ['positions', 'Positions'], ['payments', 'Payments'], ['receipts', 'Receipts'], ['emis', 'EMIs'], ['balances', 'Bank balances'], ['accounts', 'Bank accounts'], ['users', 'Users & access'], ['reports', 'Report exports']]
       .map(([v, t]) => h('option', { value: v, selected: (f.type ?? '') === v }, t))),
     h('label', { class: 'check' }, 'From', h('input', { type: 'date', value: f.from ?? '', max: S.today, onchange: set('from') })),
     h('label', { class: 'check' }, 'To', h('input', { type: 'date', value: f.to ?? '', max: S.today, onchange: set('to') })),
@@ -857,6 +950,8 @@ function renderActivity() {
 
 async function boot() {
   dlg.open && dlg.close();
+  const link = /^#(invite|reset)=([A-Za-z0-9_-]+)$/.exec(location.hash);
+  if (link) return linkScreen(link[1], link[2]);
   try {
     const s = await api('/api/state');
     S.today = s.today; S.date = S.date && S.date >= s.today ? S.date : s.today; S.user = s.user;
@@ -866,4 +961,6 @@ async function boot() {
     app.replaceChildren(h('div', { class: 'card narrow' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: boot }, 'Try again')));
   }
 }
+// opening an invite or reset link in a tab that already has the app open only changes the part after "#"
+window.addEventListener('hashchange', () => { if (/^#(invite|reset)=/.test(location.hash)) boot(); });
 boot();
