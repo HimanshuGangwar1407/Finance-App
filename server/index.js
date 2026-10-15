@@ -53,6 +53,16 @@ const likeTerm = (s) => `%${s.replace(/[\\%_]/g, '\\$&')}%`;
 // The secret goes after "#" in the link, so it is never sent to the server in a URL or written to server logs.
 const tokenHash = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 const appUrl = (req) => (process.env.APP_URL || `${req.headers['x-forwarded-proto'] === 'https' || req.socket.encrypted ? 'https' : 'http'}://${req.headers['x-forwarded-host'] || req.headers.host}`).replace(/\/+$/, '');
+// sign-up attempts per IP address: at most 5 in 15 minutes
+const signupTries = new Map();
+function signupLimit(req) {
+  // on Vercel its proxy sets x-real-ip (a visitor can't fake it); anywhere else, the connection's own address
+  const ip = String((process.env.VERCEL && req.headers['x-real-ip']) || req.socket.remoteAddress || ''), now = Date.now();
+  const recent = (signupTries.get(ip) ?? []).filter((t) => now - t < 15 * 60000);
+  if (recent.length >= 5) throw err(429, 'too_many', 'Too many tries. Wait a few minutes and try again.');
+  recent.push(now); signupTries.set(ip, recent);
+  if (signupTries.size > 5000) signupTries.clear();
+}
 // a person whose email is already someone's sign-in is linked to that account (unless another person already is)
 const linkUser = (c, personId) => c.query(`UPDATE people p SET user_id = u.id FROM users u
   WHERE p.id = $1 AND p.user_id IS NULL AND p.email <> '' AND u.email = lower(p.email) AND NOT EXISTS (SELECT 1 FROM people o WHERE o.user_id = u.id)`, [personId]);
@@ -82,14 +92,16 @@ async function openLink(db, token, lock = false) {
 // emails the link straight away when email is set up (the link itself is never stored); → 'sent' | 'failed' | 'not set up'
 async function emailLink({ kind, to, name, link, role, from }) {
   if (!emailConfigured()) return 'not set up';
-  const text = kind === 'invite'
-    ? `Hi ${name},\n\n${from} has given you ${role} access to the Finance app. Open this link to create your password — it works once, for 7 days:\n\n${link}\n\nIf you weren’t expecting this, you can ignore this email.`
-    : `Hi ${name},\n\n${from} has sent you a link to set a new password for the Finance app. It works once, for 7 days:\n\n${link}\n\nIf you didn’t ask for this, tell ${from}.`;
-  try { await sendEmail({ to, subject: kind === 'invite' ? 'Your invitation to the Finance app' : 'Set a new password for the Finance app', text }); return 'sent'; }
+  const mail = {
+    invite: ['Your invitation to the Finance app', `Hi ${name},\n\n${from} has given you ${role} access to the Finance app. Open this link to create your password — it works once, for 7 days:\n\n${link}\n\nIf you weren’t expecting this, you can ignore this email.`],
+    reset: ['Set a new password for the Finance app', `Hi ${name},\n\n${from} has sent you a link to set a new password for the Finance app. It works once, for 7 days:\n\n${link}\n\nIf you didn’t ask for this, tell ${from}.`],
+    signup: ['Finish signing up for the Finance app', `Hi ${name},\n\nSomeone — hopefully you — asked to sign up for the Finance app with this email address. Open this link to choose your password. It works once, for 7 days:\n\n${link}\n\nIf this wasn’t you, ignore this email: nothing changes until the link is used.`],
+  }[kind];
+  try { await sendEmail({ to, subject: mail[0], text: mail[1] }); return 'sent'; }
   catch { return 'failed'; }
 }
 // activity log filters: a type is the part of the action before the dot
-const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user', 'invite', 'password', 'access'], reports: ['report'] };
+const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user', 'invite', 'password', 'access', 'signup'], reports: ['report'] };
 const istStart = (d) => new Date(`${d}T00:00:00+05:30`).toISOString();
 
 // makes each active EMI's instalments into payments, up to `through` (once each: a cancelled one stays cancelled)
@@ -830,6 +842,19 @@ const routes = [
     return {};
   })],
 
+  ['POST', /^\/api\/people\/(\d+)\/role$/, 'admin', async ({ body, user, m }) => withTx(async (c) => {
+    const role = oneOf(body.role, ['viewer', 'editor', 'admin'], 'Role');
+    const { rows: [p] } = await c.query('SELECT x.id, x.name, x.user_id, u.role FROM people x LEFT JOIN users u ON u.id = x.user_id WHERE x.id = $1', [intId(m[1])]);
+    if (!p) notFound('That person doesn’t exist.');
+    if (!p.user_id) bad(`${p.name} doesn’t have access yet.`);
+    if (p.role === role) return {};
+    if (p.user_id === user.id) bad('You can’t change your own role.');
+    if (p.role === 'admin' && Number((await c.query("SELECT count(*) AS n FROM users WHERE role = 'admin' AND active")).rows[0].n) <= 1) bad('This is the only admin. Make someone else an admin first.');
+    await c.query('UPDATE users SET role = $2 WHERE id = $1', [p.user_id, role]);
+    await audit(c, user.id, 'access.role', { person_id: p.id, name: p.name, user_id: p.user_id, changes: { role: [p.role, role] } });
+    return {};
+  })],
+
   // remove (or give back) a person's access; removing signs them out everywhere and cancels open links
   ['POST', /^\/api\/people\/(\d+)\/access$/, 'admin', async ({ body, user, m }) => withTx(async (c) => {
     const active = body.active === true;
@@ -846,6 +871,39 @@ const routes = [
     await audit(c, user.id, active ? 'access.restore' : 'access.remove', { person_id: p.id, name: p.name, user_id: p.user_id });
     return {};
   })],
+
+  // sign up from the login page: only for someone in People whose email isn't signed up yet. The link goes to their
+  // email (proving it is theirs); without email set up, the admins are asked to send an invite instead. The answer is
+  // the same whatever the email, so nobody can use this to find out who is in People.
+  ['POST', /^\/api\/signup$/, null, async ({ body, req }) => {
+    const e = str(body.email, 200).toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)) bad('Enter a valid email address.');
+    signupLimit(req);
+    const { rows: [p] } = await q(`SELECT x.id, x.name, x.email, x.active, x.user_id, EXISTS (SELECT 1 FROM users u WHERE u.email = x.email) AS taken,
+        (SELECT max(i.created_at) FROM invites i WHERE i.person_id = x.id AND i.created_by IS NULL) AS last_signup,
+        (SELECT i.role FROM invites i WHERE i.person_id = x.id AND i.used_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > now() ORDER BY i.id DESC LIMIT 1) AS open_role
+      FROM people x WHERE x.email = $1 AND x.email <> ''`, [e]);
+    const eligible = p && p.active && !p.user_id && !p.taken;
+    if (!eligible) { await log(null, 'signup.request', { email: e, matched: false }); return { ok: true }; }
+    if (p.last_signup && Date.now() - new Date(p.last_signup) < 10 * 60000) return { ok: true }; // a link went out minutes ago
+    if (emailConfigured()) {
+      // an invite an admin already sent keeps its role; otherwise sign-ups start as viewers
+      const role = p.open_role ?? 'viewer';
+      const made = await withTx((c) => makeLink(c, { kind: 'invite', person: p, userId: null, role, by: null, req }));
+      const emailed = await emailLink({ kind: 'signup', to: p.email, name: p.name, link: made.link });
+      await log(null, 'signup.request', { email: e, person_id: p.id, name: p.name, matched: true, role, emailed });
+    } else {
+      await withTx(async (c) => {
+        const { rows: admins } = await c.query("SELECT id FROM users WHERE role = 'admin' AND active");
+        for (const a of admins) {
+          await c.query(`INSERT INTO notifications (user_id, kind, title, body, link, dedupe_key) VALUES ($1, 'signup', $2, $3, 'people', $4) ON CONFLICT (user_id, dedupe_key) DO NOTHING`,
+            [a.id, `${p.name} (${p.email}) wants to sign up`, 'Email isn’t set up, so the app can’t send them a link. Open People and use “Invite”.', `signup:${p.id}:${todayIST()}`]);
+        }
+        await audit(c, null, 'signup.request', { email: e, person_id: p.id, name: p.name, matched: true, emailed: 'not set up', admins: admins.length });
+      });
+    }
+    return { ok: true };
+  }],
 
   // the link's page asks who it is for, then the person sets their password (no sign-in needed: the link is the proof)
   ['POST', /^\/api\/invites\/check$/, null, async ({ body }) => {

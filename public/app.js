@@ -85,11 +85,34 @@ function authScreen(needsSetup) {
   app.replaceChildren(h('div', { class: 'card narrow' },
     h('h1', {}, needsSetup ? 'Set up the app' : 'Sign in'),
     needsSetup && h('p', { class: 'muted' }, 'Create the admin account. You can add other people after this.'),
-    form(fields, needsSetup ? 'Create account' : 'Sign in', async (v) => { S.user = (await api(needsSetup ? '/api/setup' : '/api/login', v)).user; await load(); })));
+    form(fields, needsSetup ? 'Create account' : 'Sign in', async (v) => { S.user = (await api(needsSetup ? '/api/setup' : '/api/login', v)).user; await load(); }),
+    !needsSetup && h('div', { class: 'signup-cta' }, h('span', { class: 'muted' }, 'First time here?'), h('button', { class: 'small', onclick: signupScreen }, 'Sign up'))));
+}
+
+// sign up: for people already added to the app (in People). The reply is the same for any email, on purpose.
+function signupScreen() {
+  const card = h('div', { class: 'card narrow' },
+    h('h1', {}, 'Sign up'),
+    h('p', { class: 'muted' }, 'For people already added to this app by an admin. Enter the email address they have for you, and you’ll choose your own password.'),
+    form([{ name: 'email', label: 'Your email', type: 'email', required: true, autocomplete: 'email' }], 'Continue', async (v) => {
+      await api('/api/signup', { email: v.email });
+      card.replaceChildren(
+        h('h1', {}, 'Check your email'),
+        h('p', {}, 'If ', h('strong', {}, v.email.trim().toLowerCase()), ' belongs to someone added to this app, we’ve emailed a link to choose your password. It works once, for 7 days.'),
+        h('p', { class: 'muted' }, 'If this app can’t send email yet, your admin has been told instead and will send you a link. Nothing arrived? Ask your admin.'),
+        h('button', { onclick: () => authScreen(false) }, 'Back to sign in'));
+    }, { onCancel: () => authScreen(false) }));
+  app.replaceChildren(card);
 }
 
 // ── the page shown: the dashboard, Transactions, EMIs, People, Positions, or the activity log ──
 async function load() {
+  // who is signed in, fresh each time a page opens: a changed role shows straight away, removed access signs out
+  try {
+    const st = await api('/api/state');
+    if (!st.user) { S.user = null; fresh(); return boot(); }
+    S.user = st.user;
+  } catch { /* offline for a moment: the page itself will say so */ }
   if (S.view === 'activity' && !can('admin')) S.view = 'position';
   try { await ({ position: loadPosition, transactions: loadTransactions, emis: loadEmis, people: loadPeople, positions: loadPositions, activity: loadActivity })[S.view](); }
   catch (e) { if (S.user) app.replaceChildren(topBar(), h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again'))); }
@@ -158,14 +181,14 @@ function toggleNotes() {
 }
 function fillNotes(p) {
   const items = S.notes?.items ?? [];
-  const tone = { overdue: 'c-red', shortfall: 'c-red', due: 'c-amber', upcoming: 'c-blue' };
+  const tone = { overdue: 'c-red', shortfall: 'c-red', due: 'c-amber', upcoming: 'c-blue', signup: 'c-violet' };
   p.replaceChildren(
     h('div', { class: 'notes-head' }, h('strong', {}, 'Reminders'),
       items.some((n) => !n.read_at) && h('button', { class: 'small', onclick: async () => { await api('/api/notifications/read', { all: true }); S.notesAt = 0; await refreshNotes(); } }, 'Mark all read')),
     // replaceChildren takes each element as its own argument, so the list is spread
     ...(items.length ? items.map((n) => h('button', { class: `note ${n.read_at ? '' : 'unread'}`, onclick: async () => {
       if (!n.read_at) await api('/api/notifications/read', { id: n.id }).catch(() => {});
-      S.notesAt = 0; go('emis');
+      S.notesAt = 0; go(n.link === 'people' ? 'people' : 'emis');
     } }, h('span', { class: `chip ${tone[n.kind] ?? ''}` }, n.kind), h('span', { class: 'note-title' }, n.title), h('span', { class: 'muted small' }, when(n.created_at))))
       : [h('p', { class: 'empty' }, 'No reminders yet.')]));
 }
@@ -761,13 +784,20 @@ function accessChip(x) {
 function accessButtons(x) {
   if (!can('admin') || !x.active) return [];
   if (x.user_id) return x.access_active
-    ? [h('button', { class: 'small', onclick: () => linkAction(`/api/people/${x.id}/reset-link`, {}, `Password reset link for ${x.name}`, x) }, 'Reset password link'),
+    ? [x.user_id !== S.user.id && h('button', { class: 'small', onclick: () => roleDialog(x) }, 'Change role'),
+      h('button', { class: 'small', onclick: () => linkAction(`/api/people/${x.id}/reset-link`, {}, `Password reset link for ${x.name}`, x) }, 'Reset password link'),
       x.user_id !== S.user.id && h('button', { class: 'small', onclick: () => { if (confirm(`Remove ${x.name}’s access? They are signed out everywhere and can’t sign in until you restore it.`)) act(`/api/people/${x.id}/access`, { active: false }); } }, 'Remove access')].filter(Boolean)
     : [h('button', { class: 'small', onclick: () => act(`/api/people/${x.id}/access`, { active: true }) }, 'Restore access')];
   return [
     h('button', { class: 'small c-violet', onclick: () => inviteDialog(x) }, x.open_link ? 'New invite link' : 'Invite'),
     x.open_link && h('button', { class: 'small', onclick: () => { if (confirm(`Cancel ${x.name}’s invite link? It will stop working.`)) act(`/api/people/${x.id}/invite/cancel`, {}); } }, 'Cancel invite'),
   ].filter(Boolean);
+}
+
+function roleDialog(x) {
+  openDialog(`Change ${x.name}’s role`, [
+    { name: 'role', label: 'What can they do?', type: 'select', value: x.access_role, options: [['viewer', 'Viewer — can look, can’t change anything'], ['editor', 'Editor — adds and updates records'], ['admin', 'Admin — everything, including users and approvals']] },
+  ], 'Save', (v) => api(`/api/people/${x.id}/role`, v), 'It applies the next time they open a page; they don’t need to sign in again.');
 }
 
 function inviteDialog(x) {
@@ -890,6 +920,7 @@ const ACTION_LABELS = {
   setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user',
   'invite.create': 'Invited someone to the app', 'invite.reset_link': 'Made a password reset link', 'invite.cancel': 'Cancelled an invite link',
   'invite.accept': 'Accepted an invite (set their password)', 'password.reset': 'Set a new password from a reset link', 'password.change': 'Changed their password',
+  'signup.request': 'Asked to sign up', 'access.role': 'Changed someone’s role',
   'access.remove': 'Removed someone’s access', 'access.restore': 'Restored someone’s access',
   'person.add': 'Added a person', 'person.edit': 'Edited a person', 'person.activate': 'Activated a person', 'person.deactivate': 'Deactivated a person', 'person.assign': 'Assigned a position',
   'position.add': 'Added a position', 'position.edit': 'Edited a position', 'position.activate': 'Activated a position', 'position.deactivate': 'Deactivated a position',
@@ -903,6 +934,7 @@ function describe(a, positions) {
   const d = a.detail || {}, out = [];
   const fmt = (k, v) => (v == null || v === '' ? '—' : k === 'position_id' ? positions.get(v) ?? `#${v}` : /amount/i.test(k) && typeof v === 'number' ? inr(v) : String(v));
   if (a.action === 'emi.reminders') return `${d.reminders ?? 0} due · ${d.inApp ?? 0} in-app · ${d.queued ?? 0} email(s) queued · ${d.sent ?? 0} sent${d.via ? ' · daily schedule' : ''}`;
+  if (a.action === 'signup.request') return `${d.email} · ${!d.matched ? 'not in People (nothing sent)' : d.emailed === 'sent' ? `link emailed (${d.role})` : d.emailed === 'not set up' ? 'email not set up: admins notified' : `email ${d.emailed}`}`;
   if (a.action === 'report.export') return `${String(d.format).toUpperCase()} · ${d.view === 'history' ? 'transaction history' : 'receipts & payments'} · ${d.from} to ${d.to} · ${d.rows} row(s)`;
   for (const k of ['name', 'payee', 'party', 'lender', 'email', 'role', 'reason']) if (d[k]) out.push(String(d[k]));
   if (d.amount != null && typeof d.amount === 'number') out.push(inr(d.amount));

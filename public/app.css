@@ -238,3 +238,4 @@ button.sum-card:hover { filter: none; border-color: var(--brand); }
 .link-box { font-family: ui-monospace, Consolas, monospace; font-size: 13px; margin: 6px 0 10px; }
 .link-acts { margin-bottom: 8px; }
 .narrow .kv { margin: 4px 0 14px; }
+.signup-cta { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
