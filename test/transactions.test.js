@@ -233,9 +233,9 @@ test('exports: CSV and Excel with the current filters, logged in the activity lo
   assert.equal(csv.headers.get('content-type'), 'text/csv; charset=utf-8');
   assert.match(csv.headers.get('content-disposition'), /attachment; filename="transactions-\d{4}-\d{2}-\d{2}-to-\d{4}-\d{2}-\d{2}\.csv"/);
   const lines = csv.body.toString('utf8').replace(/^\uFEFF/, '').trim().split('\r\n');
-  assert.equal(lines[0], 'Date,Type,Party,Amount (₹),Bank account,Bank reference,Invoice / bill no.,Description,Recorded by');
+  assert.equal(lines[0], 'ID,Date,Type,Party,Amount (₹),Bank account,Bank reference,Invoice / bill no.,Description,Recorded by');
   assert.ok(lines.slice(1).every((l) => l.includes('HDFC Current')));
-  assert.ok(lines.some((l) => l.startsWith(`${today},Receipt,Mehta Retail,25000,`)));
+  assert.ok(lines.some((l) => /^T-\d{5},/.test(l) && l.includes(`,${today},Receipt,Mehta Retail,25000,`)));
 
   const xl = await viewer('/api/transactions/export?view=records&format=xlsx&status=completed');
   assert.equal(xl.headers.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -266,4 +266,57 @@ test('audit: recording, receiving, paying and cancelling are all in the activity
   assert.ok(log.some((a) => a.action === 'receipt.received' && a.detail.ref === 'UTR-K1' && a.user_name === 'Eli'));
   assert.ok(log.some((a) => a.action === 'payment.paid' && a.detail.ref === 'UTR-OUT-1'));
   assert.ok(log.some((a) => a.action === 'payment.cancel'));
+});
+
+test('search: by name, transaction ID, bank reference, invoice, description, amount, bank and user — or everything', async () => {
+  const all = `from=2000-01-01&to=${today}`; // "All time"
+  const hist = (qs) => list(`view=history&${all}&${qs}`), recs = (qs) => list(`view=records&${all}&${qs}`);
+  const names = (rows) => rows.map((r) => r.name);
+
+  assert.ok((await hist('field=name&q=mehta')).every((r) => /mehta/i.test(r.name)));
+  assert.ok((await hist('field=name&q=mehta')).length >= 1);
+  assert.deepEqual(names(await hist('field=bank_ref&q=utr-out')), ['Steel Co']);
+  assert.deepEqual(names(await hist('field=doc_ref&q=INV-1')), ['Mehta Retail']);
+  assert.ok((await hist('field=note&q=vendor')).some((r) => r.name === 'Steel Co')); // the category counts as description
+  assert.ok((await hist('field=bank&q=ICICI')).every((r) => r.bank_name === 'ICICI Current'));
+  assert.ok((await hist('field=user&q=eli')).length > 0 && (await hist('field=user&q=eli')).every((r) => r.recorded_by === 'Eli'));
+  assert.deepEqual(await hist('field=user&q=nobody-at-all'), []);
+
+  // amounts, typed any way
+  for (const q of ['25000', '25,000', '₹25,000', '25000.00']) assert.ok((await hist(`field=amount&q=${encodeURIComponent(q)}`)).some((r) => r.name === 'Mehta Retail'), q);
+  assert.ok((await hist('field=amount&q=25000')).every((r) => r.amount === 2_500_000));
+
+  // transaction IDs as shown (T-00042), with or without the zeros and dash
+  const steel = (await hist('field=name&q=Steel'))[0];
+  for (const q of [`T-${String(steel.id).padStart(5, '0')}`, `t${steel.id}`, String(steel.id)]) {
+    assert.deepEqual((await hist(`field=id&q=${q}`)).map((r) => r.id), [steel.id], q);
+  }
+  // a receipt / payment number finds its money movements, and the record itself
+  const kumar = (await recs('field=name&q=Kumar'))[0];
+  assert.deepEqual(names(await hist(`field=id&q=R-${kumar.id}`)), ['Kumar Traders', 'Kumar Traders']);
+  assert.deepEqual(names(await recs(`field=id&q=R-${kumar.id}`)), ['Kumar Traders']);
+  assert.deepEqual(names(await recs(`field=id&q=T-${String(steel.id).padStart(5, '0')}`)), ['Steel Co']);
+  assert.deepEqual(await hist('field=id&q=mehta'), []); // not an ID: nothing, not everything
+
+  // "Everything" also understands IDs and amounts
+  assert.deepEqual((await hist(`q=T-${String(steel.id).padStart(5, '0')}`)).map((r) => r.id), [steel.id]);
+  assert.ok((await hist('q=25,000')).some((r) => r.name === 'Mehta Retail'));
+  assert.ok((await recs('field=bank_ref&q=UTR-K2')).every((r) => r.name === 'Kumar Traders'));
+
+  // search works together with the other filters, and is checked
+  assert.deepEqual(await hist('field=name&q=Steel&type=IN'), []);
+  assert.equal((await editor(`/api/transactions?field=colour&q=x`)).status, 400);
+  // exports use the same search
+  const csv = await editor(`/api/transactions/export?view=history&format=csv&${all}&field=bank_ref&q=UTR-OUT-1`);
+  const lines = csv.body.toString('utf8').replace(/^\uFEFF/, '').trim().split('\r\n');
+  assert.equal(lines.length, 2); assert.match(lines[1], /^T-\d{5},.*Steel Co/);
+});
+
+test('search never errors, whatever the field and whatever is typed', async () => {
+  const fields = ['', 'name', 'id', 'bank_ref', 'doc_ref', 'note', 'amount', 'bank', 'user'];
+  const terms = ['mehta', '5', 'T-00001', 'R-1', 'P-1', '25,000', '₹1,00,000.50', '%', "o'brien", 'x'.repeat(100)];
+  for (const view of ['history', 'records']) for (const field of fields) for (const q of terms) {
+    const r = await editor(`/api/transactions?view=${view}&from=2000-01-01&to=${today}&field=${field}&q=${encodeURIComponent(q)}`);
+    assert.equal(r.status, 200, `${view} ${field || 'everything'} "${q}" → ${r.status} ${r.body?.error?.message ?? ''}`);
+  }
 });
