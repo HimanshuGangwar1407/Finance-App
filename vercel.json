@@ -1,5 +1,5 @@
 {
   "rewrites": [{ "source": "/api/:path*", "destination": "/api?path=:path*" }],
   "crons": [{ "path": "/api/cron/reminders", "schedule": "30 3 * * *" }],
-  "git": { "deploymentEnabled": { "feature/add-people": false, "feature/finance-transactions": false, "additional-features": false, "feature/finance-automation": false, "feature/people-invites": false, "feature/people-signup": false, "feature/admin-accounts": false, "chore/launch-reset": false, "feature/delete-users": false } }
+  "git": { "deploymentEnabled": { "feature/add-people": false, "feature/finance-transactions": false, "additional-features": false, "feature/finance-automation": false, "feature/people-invites": false, "feature/people-signup": false, "feature/admin-accounts": false, "chore/launch-reset": false, "feature/delete-users": false, "feature/transaction-search": false } }
 }

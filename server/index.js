@@ -337,10 +337,30 @@ function txFilters(url) {
     type: oneOf(p.get('type') || '', ['', 'IN', 'OUT'], 'Type'),
     status: oneOf(p.get('status') || '', ['', 'pending', 'partial', 'completed', 'cancelled'], 'Status'),
     q: str(p.get('q'), 100),
+    field: oneOf(p.get('field') || '', ['', ...SEARCH_FIELDS], 'Search in'),
   };
   if (f.from > f.to) bad('The “from” date must be on or before the “to” date.');
-  if (f.to > addDays(f.from, 3700)) bad('Pick a period of ten years or less.');
+  if (f.to > addDays(f.from, 36600)) bad('Pick a period of a hundred years or less.');
   return f;
+}
+
+// ── search: in one field, or in everything (field '') ──
+const SEARCH_FIELDS = ['name', 'id', 'bank_ref', 'doc_ref', 'note', 'amount', 'bank', 'user'];
+// IDs as shown in the app: T-00042 (money received or paid), R-12 (a receipt), P-34 (a payment); a bare number works too
+const idTerm = (term) => { const m = /^\s*([TRP])?\s*-?\s*0*(\d{1,9})\s*$/i.exec(term); return m ? { prefix: (m[1] || '').toUpperCase(), n: Number(m[2]) } : null; };
+// an amount as typed: 25000, 25,000, ₹25,000.50
+const amountTerm = (term) => { try { return toPaise(term, 'Amount', { allowZero: false }); } catch { return null; } };
+// builds "(a OR b OR …)" from each field's condition. Each field is a function, called only if that field is searched,
+// so a query never carries a value it doesn't use. A field that can't match this term (an ID search for "mehta")
+// gives nothing.
+function searchWhere(f, arg, fields) {
+  let like;
+  const t = () => (like ??= arg(likeTerm(f.q))); // the "contains" pattern, added once if any field uses it
+  const ctx = { t, id: idTerm(f.q), amt: amountTerm(f.q), arg };
+  const conds = Object.entries(fields)
+    .filter(([k]) => !f.field || k === f.field)
+    .flatMap(([, make]) => [].concat(make(ctx) || []));
+  return conds.length ? `(${conds.join(' OR ')})` : 'false';
 }
 
 // money actually received and paid in the period (newest first)
@@ -348,7 +368,18 @@ async function history(f) {
   const where = ['e.date BETWEEN $1 AND $2'], args = [f.from, f.to], arg = (v) => { args.push(v); return `$${args.length}`; };
   if (f.bank) where.push(`e.bank_id = ${arg(f.bank)}`);
   if (f.type) where.push(`e.kind = ${arg(f.type)}`);
-  if (f.q) { const t = arg(likeTerm(f.q)); where.push(`(coalesce(r.party, p.payee) ILIKE ${t} OR e.ref ILIKE ${t} OR coalesce(r.ref, p.ref) ILIKE ${t} OR coalesce(r.note, p.note) ILIKE ${t} OR coalesce(p.category, '') ILIKE ${t})`); }
+  if (f.q) {
+    where.push(searchWhere(f, arg, {
+      name: ({ t }) => `coalesce(r.party, p.payee) ILIKE ${t()}`,
+      id: ({ id, arg }) => id && (id.prefix === 'R' ? `e.receipt_id = ${arg(id.n)}` : id.prefix === 'P' ? `e.payment_id = ${arg(id.n)}` : `e.id = ${arg(id.n)}`),
+      bank_ref: ({ t }) => `e.ref ILIKE ${t()}`,
+      doc_ref: ({ t }) => `coalesce(r.ref, p.ref) ILIKE ${t()}`,
+      note: ({ t }) => [`coalesce(r.note, p.note) ILIKE ${t()}`, `coalesce(p.category, '') ILIKE ${t()}`],
+      amount: ({ amt, arg }) => amt && `e.amount = ${arg(amt)}`,
+      bank: ({ t }) => [`b.name ILIKE ${t()}`, `b.bank ILIKE ${t()}`, `b.last4 ILIKE ${t()}`],
+      user: ({ t }) => `coalesce(u.name, '') ILIKE ${t()}`,
+    }));
+  }
   const { rows } = await q(`SELECT e.id, e.kind, e.date, e.amount, e.bank_id, b.name AS bank_name, b.bank AS bank_label, b.last4, e.ref AS bank_ref,
       coalesce(r.party, p.payee) AS name, coalesce(r.ref, p.ref) AS doc_ref, coalesce(r.note, p.note) AS note, coalesce(p.category, '') AS category,
       p.emi_id IS NOT NULL AS emi, coalesce(e.receipt_id, e.payment_id) AS record_id, e.created_at, u.name AS recorded_by
@@ -365,14 +396,27 @@ async function records(f) {
   if (f.bank) { const b = arg(f.bank); where.push(`(t.bank_id = ${b} OR ${b} = ANY(t.banks))`); }
   if (f.type) where.push(`t.kind = ${arg(f.type)}`);
   if (f.status) where.push(`t.state = ${arg(f.status)}`);
-  if (f.q) { const s = arg(likeTerm(f.q)); where.push(`(t.name ILIKE ${s} OR t.ref ILIKE ${s} OR t.note ILIKE ${s} OR t.category ILIKE ${s} OR coalesce(t.bank_refs, '') ILIKE ${s})`); }
+  if (f.q) {
+    where.push(searchWhere(f, arg, {
+      name: ({ t }) => `t.name ILIKE ${t()}`,
+      id: ({ id, arg }) => id && (id.prefix === 'R' ? `(t.kind = 'IN' AND t.id = ${arg(id.n)})` : id.prefix === 'P' ? `(t.kind = 'OUT' AND t.id = ${arg(id.n)})`
+        : id.prefix === 'T' ? `EXISTS (SELECT 1 FROM entries e WHERE e.id = ${arg(id.n)} AND (CASE WHEN t.kind = 'IN' THEN e.receipt_id ELSE e.payment_id END) = t.id)`
+        : `t.id = ${arg(id.n)}`),
+      bank_ref: ({ t }) => `coalesce(t.bank_refs, '') ILIKE ${t()}`,
+      doc_ref: ({ t }) => `t.ref ILIKE ${t()}`,
+      note: ({ t }) => [`t.note ILIKE ${t()}`, `t.category ILIKE ${t()}`],
+      amount: ({ amt, arg }) => amt && `t.amount = ${arg(amt)}`,
+      bank: ({ t }) => `coalesce(t.bank_name, '') ILIKE ${t()}`,
+      user: ({ t }) => `coalesce(t.recorded_by, '') ILIKE ${t()}`,
+    }));
+  }
   const { rows } = await q(`SELECT * FROM (
-      SELECT x.*, coalesce(d.settled, 0)::bigint AS settled, d.last_date, d.bank_refs, coalesce(d.banks, '{}') AS banks, b.name AS bank_name,
+      SELECT x.*, coalesce(d.settled, 0)::bigint AS settled, d.last_date, d.bank_refs, coalesce(d.banks, '{}') AS banks, b.name AS bank_name, cu.name AS recorded_by,
         CASE WHEN x.status = 'CANCELLED' THEN 'cancelled' WHEN coalesce(d.settled, 0) >= x.amount THEN 'completed' WHEN coalesce(d.settled, 0) > 0 THEN 'partial' ELSE 'pending' END AS state
       FROM (
-        SELECT 'IN' AS kind, r.id, r.expected_date AS date, r.party AS name, r.ref, r.note, '' AS category, r.amount, r.bank_id, r.status, false AS emi FROM receipts r
+        SELECT 'IN' AS kind, r.id, r.expected_date AS date, r.party AS name, r.ref, r.note, '' AS category, r.amount, r.bank_id, r.status, false AS emi, r.created_by FROM receipts r
         UNION ALL
-        SELECT 'OUT', p.id, p.due_date, p.payee, p.ref, p.note, p.category, p.amount, p.bank_id, p.status, p.emi_id IS NOT NULL FROM payments p
+        SELECT 'OUT', p.id, p.due_date, p.payee, p.ref, p.note, p.category, p.amount, p.bank_id, p.status, p.emi_id IS NOT NULL, p.created_by FROM payments p
       ) x
       LEFT JOIN (
         SELECT CASE WHEN receipt_id IS NULL THEN 'OUT' ELSE 'IN' END AS kind, coalesce(receipt_id, payment_id) AS id, sum(amount) AS settled, max(date) AS last_date,
@@ -380,6 +424,7 @@ async function records(f) {
         FROM entries GROUP BY 1, 2
       ) d ON d.kind = x.kind AND d.id = x.id
       LEFT JOIN banks b ON b.id = coalesce(x.bank_id, d.banks[1])
+      LEFT JOIN users cu ON cu.id = x.created_by
     ) t WHERE ${where.join(' AND ')} ORDER BY t.date DESC, t.kind, t.id DESC LIMIT 5000`, args);
   return rows;
 }
@@ -388,13 +433,16 @@ async function records(f) {
 const rupeeNum = (p) => Math.round(Number(p)) / 100;
 const TYPE = { IN: 'Receipt', OUT: 'Payment' };
 const STATE = { pending: 'Pending', partial: 'Partly settled', completed: 'Completed', cancelled: 'Cancelled' };
+// IDs as shown in the app
+const txId = (r) => `T-${String(r.id).padStart(5, '0')}`;
+const recId = (r) => `${r.kind === 'IN' ? 'R' : 'P'}-${r.id}`;
 const historyTable = (rows) => [
-  ['Date', 'Type', 'Party', 'Amount (₹)', 'Bank account', 'Bank reference', 'Invoice / bill no.', 'Description', 'Recorded by'],
-  ...rows.map((r) => [r.date, TYPE[r.kind], r.name, rupeeNum(r.amount), `${r.bank_name} (${r.bank_label} XXXX${r.last4})`, r.bank_ref, r.doc_ref, r.note || (r.emi ? 'EMI' : r.category), r.recorded_by ?? '']),
+  ['ID', 'Date', 'Type', 'Party', 'Amount (₹)', 'Bank account', 'Bank reference', 'Invoice / bill no.', 'Description', 'Recorded by'],
+  ...rows.map((r) => [txId(r), r.date, TYPE[r.kind], r.name, rupeeNum(r.amount), `${r.bank_name} (${r.bank_label} XXXX${r.last4})`, r.bank_ref, r.doc_ref, r.note || (r.emi ? 'EMI' : r.category), r.recorded_by ?? '']),
 ];
 const recordsTable = (rows) => [
-  ['Date', 'Type', 'Party', 'Amount (₹)', 'Settled (₹)', 'Outstanding (₹)', 'Status', 'Bank account', 'Bank references', 'Last settled on', 'Invoice / bill no.', 'Description'],
-  ...rows.map((r) => [r.date, TYPE[r.kind], r.name, rupeeNum(r.amount), rupeeNum(r.settled), r.state === 'cancelled' ? 0 : rupeeNum(r.amount - r.settled), STATE[r.state], r.bank_name ?? 'Not decided', r.bank_refs ?? '', r.last_date ?? '', r.ref, r.note || (r.emi ? 'EMI' : r.category)]),
+  ['ID', 'Date', 'Type', 'Party', 'Amount (₹)', 'Settled (₹)', 'Outstanding (₹)', 'Status', 'Bank account', 'Bank references', 'Last settled on', 'Invoice / bill no.', 'Description'],
+  ...rows.map((r) => [recId(r), r.date, TYPE[r.kind], r.name, rupeeNum(r.amount), rupeeNum(r.settled), r.state === 'cancelled' ? 0 : rupeeNum(r.amount - r.settled), STATE[r.state], r.bank_name ?? 'Not decided', r.bank_refs ?? '', r.last_date ?? '', r.ref, r.note || (r.emi ? 'EMI' : r.category)]),
 ];
 
 async function currentUser(req) {
@@ -693,7 +741,7 @@ const routes = [
     const f = txFilters(url), format = oneOf(url.searchParams.get('format') || 'csv', ['csv', 'xlsx'], 'Format');
     const rows = f.view === 'history' ? await history(f) : await records(f);
     const table = f.view === 'history' ? historyTable(rows) : recordsTable(rows);
-    await log(user.id, 'report.export', { view: f.view, format, from: f.from, to: f.to, bank: f.bank, type: f.type, status: f.status, q: f.q, rows: rows.length });
+    await log(user.id, 'report.export', { view: f.view, format, from: f.from, to: f.to, bank: f.bank, type: f.type, status: f.status, q: f.q, field: f.field, rows: rows.length });
     const name = `${f.view === 'history' ? 'transactions' : 'receipts-payments'}-${f.from}-to-${f.to}.${format}`;
     return format === 'csv'
       ? { file: { type: 'text/csv; charset=utf-8', name, body: toCsv(table) } }

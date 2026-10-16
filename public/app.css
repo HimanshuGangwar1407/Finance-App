@@ -248,3 +248,11 @@ button.sum-card:hover { filter: none; border-color: var(--brand); }
 table.users .chip, table.users th { white-space: nowrap; }
 table.users td.acts-cell { white-space: normal; min-width: 220px; }
 table.users td.acts-cell button { margin: 2px 0 2px 4px; }
+
+/* ── transaction search ── */
+.tx-filters { flex-direction: column; align-items: stretch; gap: 10px; }
+.tx-search { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.tx-search .search-in { width: auto; flex: none; font-weight: 600; }
+.tx-search input.search { flex: 1; min-width: 220px; font-size: 16px; padding: 10px 12px; }
+td.tx-id { font-family: ui-monospace, Consolas, monospace; font-size: 13px; color: var(--muted); }
+.result-count { font-weight: 600; }

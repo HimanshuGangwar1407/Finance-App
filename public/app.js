@@ -190,7 +190,7 @@ function render() {
   const anyBank = [...bankOpts, ['', 'Not decided yet']]; // the first account is picked unless changed
 
   const warnings = [];
-  if (!P.banks.length) warnings.push(can('admin') ? 'Add your bank accounts to start (“+ Account”).' : 'No bank accounts yet — ask an admin to add them.');
+  if (!P.banks.length) warnings.push(can('admin') ? 'Add your bank accounts to start: Banks → “+ Add bank account”.' : 'No bank accounts yet — ask an admin to add them.');
   for (const r of P.rows) {
     if (r.id == null) continue;
     if (r.balance == null) warnings.push(`${r.name}: no bank balance entered yet, so it counts as ₹0.`);
@@ -232,8 +232,7 @@ function render() {
       can('editor') && P.banks.length > 0 && h('button', { class: 'c-blue', onclick: () => balanceDialog(bankOpts) }, 'Enter bank balance'),
       can('editor') && h('button', { class: 'c-red', onclick: () => paymentDialog(anyBank) }, '+ Payment'),
       can('editor') && h('button', { class: 'c-green', onclick: () => receiptDialog(anyBank) }, '+ Receipt'),
-      P.banks.length > 0 && h('button', { class: 'c-amber', onclick: () => go('emis') }, 'EMIs'),
-      can('admin') && h('button', { onclick: bankDialog }, '+ Account')));
+      P.banks.length > 0 && h('button', { class: 'c-amber', onclick: () => go('emis') }, 'EMIs')));
 
   const alerts = [
     ...P.rows.filter((r) => r.id != null && r.final < 0 && T.final >= 0).map((r) => ['bad', `${r.name} will be short by ${inr(-r.final)}. Transfer money into it before the payments go out.`]),
@@ -347,7 +346,7 @@ function bankDialog() {
     { name: 'name', label: 'Name in this app', placeholder: 'e.g. Main current account', required: true },
     { name: 'bank', label: 'Bank', placeholder: 'e.g. HDFC Bank', required: true },
     { name: 'last4', label: 'Last 4 digits of the account number', required: true },
-  ], 'Add account', (v) => api('/api/banks', v));
+  ], 'Add account', (v) => api('/api/banks', v), 'Then enter its balance on the Dashboard (“Enter bank balance”), so its figures start from the right amount.');
 }
 
 // ── Transactions: money received and paid, bank statements for a period, reports and exports ──
@@ -358,12 +357,13 @@ function period(preset, today = S.today) {
   if (preset === 'today') return { from: today, to: today };
   if (preset === 'lastmonth') { const end = addDays(monthStart(today), -1); return { from: monthStart(end), to: end }; }
   if (preset === 'fy') return { from: `${m >= 4 ? y : y - 1}-04-01`, to: today }; // Indian financial year, April to March
+  if (preset === 'all') return { from: '2000-01-01', to: today };
   return { from: monthStart(today), to: today };
 }
-const txDefaults = () => ({ preset: 'month', ...period('month'), bank: '', type: '', status: '', q: '', view: 'history' });
+const txDefaults = () => ({ preset: 'month', ...period('month'), bank: '', type: '', status: '', q: '', field: '', view: 'history' });
 const txQuery = (extra = {}) => {
   const f = S.tf;
-  return new URLSearchParams(Object.entries({ view: f.view, from: f.from, to: f.to, bank: f.bank, type: f.type, status: f.view === 'records' ? f.status : '', q: f.q, ...extra }).filter(([, v]) => v));
+  return new URLSearchParams(Object.entries({ view: f.view, from: f.from, to: f.to, bank: f.bank, type: f.type, status: f.view === 'records' ? f.status : '', q: f.q, field: f.q ? f.field : '', ...extra }).filter(([, v]) => v));
 };
 
 async function loadTransactions() {
@@ -372,6 +372,10 @@ async function loadTransactions() {
   keepFocus(() => renderTransactions(sum, list.rows));
 }
 
+const txId = (r) => `T-${String(r.id).padStart(5, '0')}`;
+const recId = (r) => `${r.kind === 'IN' ? 'R' : 'P'}-${r.id}`;
+const SEARCH_IN = [['', 'Everything'], ['name', 'Name'], ['id', 'Transaction ID'], ['bank_ref', 'Bank reference (UTR / cheque)'], ['doc_ref', 'Invoice / bill no.'], ['note', 'Description'], ['amount', 'Amount'], ['bank', 'Bank account'], ['user', 'Recorded by']];
+const SEARCH_HINT = { '': 'Search name, ID, reference, invoice, amount…', name: 'e.g. Mehta Retail', id: 'e.g. T-00042, R-12 or P-34', bank_ref: 'e.g. UTR number or cheque no.', doc_ref: 'e.g. INV-2291', note: 'e.g. October order', amount: 'e.g. 25000 or 25,000', bank: 'e.g. HDFC', user: 'e.g. Ravi' };
 const STATE_LABEL = { pending: 'Pending', partial: 'Partly settled', completed: 'Completed', cancelled: 'Cancelled' };
 const STATE_TONE = { pending: 'c-amber', partial: 'c-blue', completed: 'c-green', cancelled: '' };
 
@@ -381,15 +385,20 @@ function renderTransactions(sum, rows) {
   const set = (k) => (e) => { S.tf = { ...S.tf, [k]: e.target.value }; load(); };
   const setDate = (k) => (e) => { if (e.target.value) { S.tf = { ...S.tf, [k]: e.target.value, preset: 'custom' }; load(); } };
 
-  const filters = h('div', { class: 'card toolbar' }, h('div', { class: 'bar grow' },
+  const searchBar = h('div', { class: 'tx-search', role: 'search' },
+    h('select', { 'aria-label': 'Search in', class: 'search-in', onchange: (e) => { S.tf = { ...S.tf, field: e.target.value }; if (S.tf.q) load(); else renderTransactions(sum, rows); } },
+      SEARCH_IN.map(([v, t]) => h('option', { value: v, selected: (f.field || '') === v }, t))),
+    h('input', { type: 'search', name: 'txq', class: 'search', placeholder: SEARCH_HINT[f.field || ''], value: f.q, oninput: onSearch((v) => { S.tf = { ...S.tf, q: v }; }), 'aria-label': 'Search transactions' }),
+    f.q && h('button', { class: 'small', 'aria-label': 'Clear search', onclick: () => { S.tf = { ...S.tf, q: '' }; load(); } }, '✕ Clear'),
+    f.preset !== 'all' && h('button', { class: 'small', title: 'Search every date, not only the period below', onclick: () => { S.tf = { ...S.tf, preset: 'all', ...period('all') }; load(); } }, 'Search all dates'));
+  const filters = h('div', { class: 'card toolbar tx-filters' }, searchBar, h('div', { class: 'bar grow' },
     h('select', { 'aria-label': 'Period', onchange: (e) => { const p = e.target.value; S.tf = { ...S.tf, preset: p, ...(p === 'custom' ? {} : period(p)) }; load(); } },
-      [['today', 'Today'], ['month', 'This month'], ['lastmonth', 'Last month'], ['fy', 'This financial year'], ['custom', 'Custom dates']].map(([v, t]) => h('option', { value: v, selected: f.preset === v }, t))),
+      [['today', 'Today'], ['month', 'This month'], ['lastmonth', 'Last month'], ['fy', 'This financial year'], ['all', 'All time'], ['custom', 'Custom dates']].map(([v, t]) => h('option', { value: v, selected: f.preset === v }, t))),
     h('label', { class: 'check' }, 'From', h('input', { type: 'date', name: 'from', value: f.from, max: f.to, onchange: setDate('from') })),
     h('label', { class: 'check' }, 'To', h('input', { type: 'date', name: 'to', value: f.to, min: f.from, onchange: setDate('to') })),
     h('select', { 'aria-label': 'Bank account', onchange: set('bank') }, [['', 'All bank accounts'], ...accounts.map((b) => [String(b.id), b.name])].map(([v, t]) => h('option', { value: v, selected: f.bank === v }, t))),
     h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'Receipts and payments'], ['IN', 'Receipts only'], ['OUT', 'Payments only']].map(([v, t]) => h('option', { value: v, selected: f.type === v }, t))),
-    f.view === 'records' && h('select', { 'aria-label': 'Status', onchange: set('status') }, [['', 'Any status'], ['pending', 'Pending'], ['partial', 'Partly settled'], ['completed', 'Completed'], ['cancelled', 'Cancelled']].map(([v, t]) => h('option', { value: v, selected: f.status === v }, t))),
-    h('input', { type: 'search', name: 'txq', class: 'search', placeholder: 'Search party, reference, description', value: f.q, oninput: onSearch((v) => { S.tf = { ...S.tf, q: v }; }), 'aria-label': 'Search transactions' })));
+    f.view === 'records' && h('select', { 'aria-label': 'Status', onchange: set('status') }, [['', 'Any status'], ['pending', 'Pending'], ['partial', 'Partly settled'], ['completed', 'Completed'], ['cancelled', 'Cancelled']].map(([v, t]) => h('option', { value: v, selected: f.status === v }, t)))));
 
   const tile = (cls, label, p, sub) => h('div', { class: `tile ${cls}` }, h('div', { class: 'tile-lbl' }, label), h('div', { class: `tile-amt ${p < 0 ? 'neg' : ''}` }, inr(p)), sub && h('div', { class: 'tile-sub' }, sub));
   const P = sum.pending;
@@ -410,14 +419,14 @@ function renderTransactions(sum, rows) {
   const cards = sum.banks.length
     ? h('div', { class: 'bank-cards' }, sum.banks.map((b) => h('section', { class: 'bank-card' },
       h('div', { class: 'bc-head' }, h('div', {}, h('strong', {}, b.name), h('div', { class: 'muted small' }, b.bank)),
-        !b.balanceEntered && h('span', { class: 'chip c-amber', title: 'Enter a bank balance on the Bank position page so this starts from the right figure.' }, 'no balance entered')),
+        !b.balanceEntered && h('span', { class: 'chip c-amber', title: 'Enter a bank balance on the Dashboard (“Enter bank balance”) so this starts from the right figure.' }, 'no balance entered')),
       h('div', { class: `bc-amt ${b.closing < 0 ? 'neg' : ''}` }, inr(b.closing)),
       line(`Opening (${nice(addDays(sum.from, -1))})`, b.opening),
       line('+ Received', b.received, 'pos'),
       line('− Paid', b.paid, 'red'),
       b.corrections !== 0 && line('± Balance corrections', b.corrections, 'amber', 'A balance entered during the period differs from the running figure — e.g. bank charges or interest not recorded here.'),
       h('div', { class: 'bc-line total' }, h('span', {}, sum.to === sum.today ? '= Current balance' : `= Balance on ${nice(sum.to)}`), money(b.closing)))))
-    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add them on the Bank position page (“+ Account”).' : 'No bank accounts yet.'));
+    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add them on the Banks page (“+ Add bank account”).' : 'No bank accounts yet.'));
 
   const exportBtn = (format, label) => h('button', { class: 'small', onclick: () => {
     const a = h('a', { href: `/api/transactions/export?${txQuery({ format })}`, download: '' });
@@ -426,14 +435,15 @@ function renderTransactions(sum, rows) {
   const seg = h('div', { class: 'toolbar-row' },
     h('div', { class: 'seg', role: 'tablist' }, [['history', 'Transaction history'], ['records', 'All receipts & payments']].map(([v, t]) =>
       h('button', { class: f.view === v ? 'on' : '', role: 'tab', 'aria-selected': f.view === v ? 'true' : 'false', onclick: () => { if (f.view !== v) { S.tf = { ...S.tf, view: v }; load(); } } }, t))),
-    h('div', { class: 'bar' }, h('span', { class: 'muted small' }, `${rows.length} row(s)`), exportBtn('csv', 'Export CSV'), exportBtn('xlsx', 'Export Excel')));
+    h('div', { class: 'bar' }, h('span', { class: 'muted small result-count' }, f.q ? `${rows.length} result${rows.length === 1 ? '' : 's'} for “${f.q}”${f.field ? ` in ${SEARCH_IN.find(([v]) => v === f.field)[1]}` : ''}` : `${rows.length} row(s)`), exportBtn('csv', 'Export CSV'), exportBtn('xlsx', 'Export Excel')));
 
   const table = f.view === 'history' ? historyTableEl(rows) : recordsTableEl(rows, bankOpts);
   app.replaceChildren(topBar(),
     pageHead('Receipts, payments & balances', 'Balances move only when money is received or paid. Pending items are shown separately.',
       can('editor') && h('button', { class: 'c-green', onclick: () => txDialog('IN', accounts) }, '+ Receipt'),
       can('editor') && h('button', { class: 'c-red', onclick: () => txDialog('OUT', accounts) }, '+ Payment')),
-    filters, summary, cards, h('section', { class: 'card' }, seg, table));
+    // while searching, the results come straight under the search bar; the balances follow
+    ...(f.q ? [filters, h('section', { class: 'card' }, seg, table), summary, cards] : [filters, summary, cards, h('section', { class: 'card' }, seg, table)]));
 }
 
 const txDesc = (r) => r.note || (r.emi ? 'EMI' : r.category) || '';
@@ -441,8 +451,9 @@ function historyTableEl(rows) {
   if (!rows.length) return h('p', { class: 'empty' }, 'No money received or paid in this period.');
   const inSum = rows.filter((r) => r.kind === 'IN').reduce((s, r) => s + r.amount, 0), outSum = rows.filter((r) => r.kind === 'OUT').reduce((s, r) => s + r.amount, 0);
   return h('div', { class: 'scroll' }, h('table', { class: 'tx' },
-    h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Type'), h('th', {}, 'Party / description'), h('th', {}, 'Bank account'), h('th', {}, 'Bank ref.'), h('th', {}, 'Invoice / bill'), h('th', { class: 'num' }, 'Amount'))),
+    h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, 'Date'), h('th', {}, 'Type'), h('th', {}, 'Party / description'), h('th', {}, 'Bank account'), h('th', {}, 'Bank ref.'), h('th', {}, 'Invoice / bill'), h('th', { class: 'num' }, 'Amount'))),
     h('tbody', {}, rows.map((r) => h('tr', {},
+      h('td', { class: 'nowrap tx-id' }, txId(r)),
       h('td', { class: 'nowrap' }, nice(r.date)),
       h('td', {}, h('span', { class: `chip ${r.kind === 'IN' ? 'c-green' : 'c-red'}` }, r.kind === 'IN' ? 'Received' : 'Paid')),
       h('td', {}, h('strong', {}, r.name), txDesc(r) && h('div', { class: 'muted small' }, txDesc(r))),
@@ -450,16 +461,17 @@ function historyTableEl(rows) {
       h('td', { class: 'nowrap' }, r.bank_ref),
       h('td', {}, r.doc_ref || h('span', { class: 'muted' }, '—')),
       h('td', { class: 'num' }, h('strong', {}, money(r.kind === 'IN' ? r.amount : -r.amount, r.kind === 'IN' ? 'pos' : '')))))),
-    h('tfoot', {}, h('tr', {}, h('td', { colspan: '6' }, 'Received ', money(inSum, 'pos'), ' · Paid ', money(outSum, 'red')), h('td', { class: 'num' }, money(inSum - outSum))))));
+    h('tfoot', {}, h('tr', {}, h('td', { colspan: '7' }, 'Received ', money(inSum, 'pos'), ' · Paid ', money(outSum, 'red')), h('td', { class: 'num' }, money(inSum - outSum))))));
 }
 
 function recordsTableEl(rows, bankOpts) {
   if (!rows.length) return h('p', { class: 'empty' }, 'Nothing matches these filters.');
   return h('div', { class: 'scroll' }, h('table', { class: 'tx' },
-    h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Type'), h('th', {}, 'Party / description'), h('th', {}, 'Bank account'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'Settled'), h('th', { class: 'num' }, 'Outstanding'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
+    h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, 'Date'), h('th', {}, 'Type'), h('th', {}, 'Party / description'), h('th', {}, 'Bank account'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'Settled'), h('th', { class: 'num' }, 'Outstanding'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
     h('tbody', {}, rows.map((r) => {
       const open = r.state === 'pending' || r.state === 'partial', left = r.amount - r.settled, out = r.kind === 'OUT';
       return h('tr', { class: r.state === 'cancelled' ? 'inactive' : '' },
+        h('td', { class: 'nowrap tx-id' }, recId(r)),
         h('td', { class: 'nowrap' }, nice(r.date)),
         h('td', {}, h('span', { class: `chip ${out ? 'c-red' : 'c-green'}` }, out ? 'Payment' : 'Receipt')),
         h('td', {}, h('strong', {}, r.name), h('div', { class: 'muted small' }, [r.ref, txDesc(r), r.bank_refs && `bank ref. ${r.bank_refs}`].filter(Boolean).join(' · '))),
@@ -476,7 +488,7 @@ function recordsTableEl(rows, bankOpts) {
 
 function txDialog(kind, accounts) {
   const out = kind === 'OUT';
-  if (!accounts.length) return alert('Add a bank account first (Bank position → “+ Account”).');
+  if (!accounts.length) return alert('Add a bank account first (Banks → “+ Add bank account”).');
   openDialog(out ? 'Record a payment' : 'Record a receipt', [
     { name: out ? 'payee' : 'party', label: out ? 'Paid to' : 'Received from', required: true },
     { name: 'amount', label: 'Amount (₹)', type: 'money', required: true },
@@ -558,9 +570,10 @@ function renderBanks(d) {
       h('div', { class: 'bc-line total' }, h('span', {}, '= Closing balance'), money(b.closing)),
       h('div', { class: 'bc-emi' }, h('strong', {}, 'EMI'), emiDetail(b, isToday))))
     )
-    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add them on the Dashboard (“+ Account”).' : 'No bank accounts yet.'));
+    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add your first one with “+ Add bank account” above.' : 'No bank accounts yet.'));
 
-  app.replaceChildren(...[topBar(), pageHead('Banks', 'Each bank account for a day: opening balance, debits, credits, closing balance, and EMIs.'), picker, summary, table, cards].filter(Boolean));
+  app.replaceChildren(...[topBar(), pageHead('Banks', 'Each bank account for a day: opening balance, debits, credits, closing balance, and EMIs.',
+    can('admin') && h('button', { class: 'primary', onclick: bankDialog }, '+ Add bank account')), picker, summary, table, cards].filter(Boolean));
 }
 const EMI_STATE_SHORT = { paid: ['paid', 'c-green'], overdue: ['unpaid', 'c-red'], due: ['due today', 'c-amber'], upcoming: ['upcoming', 'c-blue'], scheduled: ['scheduled', ''] };
 // the EMI column: what is due that day, else the next one
@@ -723,7 +736,7 @@ const reminderBody = (v) => {
 };
 
 function emiForm(bankOpts) {
-  if (!bankOpts.length) return alert('Add a bank account first (Dashboard → “+ Account”).');
+  if (!bankOpts.length) return alert('Add a bank account first (Banks → “+ Add bank account”).');
   openDialog('Add an EMI', [
     { name: 'lender', label: 'Lender / loan', placeholder: 'e.g. HDFC car loan', required: true },
     { name: 'amount', label: 'EMI amount (₹)', type: 'money', required: true },
