@@ -4,7 +4,7 @@
 const app = document.getElementById('app'), dlg = document.getElementById('dlg');
 const S = { user: null, today: '', date: '', approvedOnly: false, uncertain: true, pos: null };
 // what one signed-in person was looking at; cleared on sign-out so the next person starts fresh
-const fresh = () => Object.assign(S, { bday: null, view: 'position', pf: { status: 'active', position: '', q: '' }, af: {}, act: null, tf: null, ef: null, dash: null, notes: null, notesAt: 0, approvedOnly: false, uncertain: true });
+const fresh = () => Object.assign(S, { bday: null, view: 'position', af: {}, act: null, tf: null, ef: null, dash: null, notes: null, notesAt: 0, approvedOnly: false, uncertain: true });
 fresh();
 
 function h(tag, attrs, ...kids) {
@@ -89,7 +89,7 @@ function authScreen(needsSetup) {
     !needsSetup && h('p', { class: 'muted small signin-note' }, 'Your login (email and password) is given to you by your admin.')));
 }
 
-// ── the page shown: the dashboard, Transactions, EMIs, People, Positions, or the activity log ──
+// ── the page shown: the dashboard, Banks, Transactions, EMIs, Users, or the activity log ──
 async function load() {
   // who is signed in, fresh each time a page opens: a changed role shows straight away, removed access signs out
   try {
@@ -97,8 +97,8 @@ async function load() {
     if (!st.user) { S.user = null; fresh(); return boot(); }
     S.user = st.user;
   } catch { /* offline for a moment: the page itself will say so */ }
-  if (S.view === 'activity' && !can('admin')) S.view = 'position';
-  try { await ({ position: loadPosition, banks: loadBanks, transactions: loadTransactions, emis: loadEmis, people: loadPeople, positions: loadPositions, activity: loadActivity })[S.view](); }
+  if ((S.view === 'activity' || S.view === 'users') && !can('admin')) S.view = 'position';
+  try { await ({ position: loadPosition, banks: loadBanks, transactions: loadTransactions, emis: loadEmis, users: loadUsers, activity: loadActivity })[S.view](); }
   catch (e) { if (S.user) app.replaceChildren(topBar(), h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again'))); }
 }
 
@@ -130,12 +130,12 @@ function go(key) {
 function topBar() {
   document.body.classList.add('has-shell');
   const items = [['position', 'Dashboard', 'home'], ['banks', 'Banks', 'bank'], ['transactions:records', 'Receipts & Payments', 'swap'], ['transactions:history', 'Transaction History', 'list'],
-    ['emis', 'EMI Management', 'calendar'], ['people', 'People', 'users'], ['positions', 'Positions', 'badge'], can('admin') && ['activity', 'Activity Log', 'shield']].filter(Boolean);
+    ['emis', 'EMI Management', 'calendar'], can('admin') && ['users', 'Users', 'users'], can('admin') && ['activity', 'Activity Log', 'shield']].filter(Boolean);
   const unread = S.notes?.unread ?? 0;
   if (Date.now() - S.notesAt > 60000) refreshNotes();
   return h('div', { class: 'chrome' },
     h('aside', { class: 'sidebar', 'aria-label': 'Main menu' },
-      h('div', { class: 'brand' }, icon('wallet'), h('div', {}, h('strong', {}, 'Finance'), h('small', {}, 'Bank, EMIs & people'))),
+      h('div', { class: 'brand' }, icon('wallet'), h('div', {}, h('strong', {}, 'Finance'), h('small', {}, 'Banks, payments & EMIs'))),
       h('nav', {}, items.map(([k, t, ic]) => h('button', { class: `nav-item ${navKey() === k ? 'on' : ''}`, 'aria-current': navKey() === k ? 'page' : null, onclick: () => go(k) }, icon(ic), h('span', {}, t))))),
     h('div', { class: 'scrim', onclick: () => document.body.classList.remove('nav-open') }),
     h('header', { class: 'topbar' },
@@ -172,7 +172,7 @@ function fillNotes(p) {
     // replaceChildren takes each element as its own argument, so the list is spread
     ...(items.length ? items.map((n) => h('button', { class: `note ${n.read_at ? '' : 'unread'}`, onclick: async () => {
       if (!n.read_at) await api('/api/notifications/read', { id: n.id }).catch(() => {});
-      S.notesAt = 0; go(n.link === 'people' ? 'people' : 'emis');
+      S.notesAt = 0; go(n.link === 'people' ? 'users' : 'emis'); // older sign-up notices pointed at People
     } }, h('span', { class: `chip ${tone[n.kind] ?? ''}` }, n.kind), h('span', { class: 'note-title' }, n.title), h('span', { class: 'muted small' }, when(n.created_at))))
       : [h('p', { class: 'empty' }, 'No reminders yet.')]));
 }
@@ -739,10 +739,9 @@ function emiSettingsDialog(e) {
   openDialog(`Settings: ${e.lender}`, reminderFields(e), 'Save', (v) => api(`/api/emis/${e.id}`, reminderBody(v)), `${inr(e.amount)} from ${e.bank_name}, every month on day ${e.day}.`);
 }
 
-// ── People ──
+// ── shared page pieces ──
 const when = (t) => (t ? new Date(t).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' }) : '');
 const pageHead = (title, sub, ...actions) => h('header', { class: 'page-head' }, h('div', {}, h('h1', {}, title), sub && h('div', { class: 'muted' }, sub)), h('div', { class: 'bar' }, actions));
-const statusChip = (active) => h('span', { class: `chip ${active ? 'c-green' : ''}` }, active ? 'Active' : 'Inactive');
 // keep the cursor in a search box when its page re-renders
 const keepFocus = (render) => {
   const a = document.activeElement, name = a?.name, pos = a?.selectionStart;
@@ -753,106 +752,40 @@ const keepFocus = (render) => {
 let searchTimer;
 const onSearch = (apply) => (e) => { clearTimeout(searchTimer); const v = e.target.value; searchTimer = setTimeout(() => { apply(v); load(); }, 250); };
 
-async function loadPeople() {
-  const p = new URLSearchParams(S.pf);
-  const [{ people, contactsHidden }, { positions }] = await Promise.all([api(`/api/people?${p}`), api('/api/positions')]);
-  keepFocus(() => renderPeople(people, positions, contactsHidden));
-}
-
-function renderPeople(people, positions, hidden) {
-  const filters = h('div', { class: 'card toolbar' },
-    h('div', { class: 'bar grow' },
-      h('input', { type: 'search', name: 'q', class: 'search', placeholder: hidden ? 'Search name or position' : 'Search name, email, phone or position', value: S.pf.q, oninput: onSearch((v) => { S.pf.q = v; }), 'aria-label': 'Search people' }),
-      h('select', { 'aria-label': 'Status', onchange: (e) => { S.pf.status = e.target.value; load(); } },
-        [['active', 'Active'], ['inactive', 'Inactive'], ['all', 'Everyone']].map(([v, t]) => h('option', { value: v, selected: S.pf.status === v }, t))),
-      h('select', { 'aria-label': 'Position', onchange: (e) => { S.pf.position = e.target.value; load(); } },
-        [['', 'All positions'], ['none', 'No position'], ...positions.map((x) => [String(x.id), x.name + (x.active ? '' : ' (inactive)')])].map(([v, t]) => h('option', { value: v, selected: S.pf.position === v }, t)))));
-  const table = people.length
-    ? h('div', { class: 'scroll' }, h('table', { class: 'people' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Position'), !hidden && h('th', {}, 'Email'), !hidden && h('th', {}, 'Phone'), h('th', {}, 'Status'), !hidden && h('th', {}, 'App access'), can('admin') && h('th', {}, ''))),
-      h('tbody', {}, people.map((x) => h('tr', { class: x.active ? '' : 'inactive' },
-        h('td', {}, h('button', { class: 'link', onclick: () => personView(x, positions, hidden) }, x.name)),
-        h('td', {}, x.position ? h('span', { class: `chip ${x.position_active ? 'c-violet' : ''}` }, x.position) : h('span', { class: 'muted' }, '—')),
-        !hidden && h('td', {}, x.email || h('span', { class: 'muted' }, '—')),
-        !hidden && h('td', { class: 'nowrap' }, x.phone || h('span', { class: 'muted' }, '—')),
-        h('td', {}, statusChip(x.active)),
-        !hidden && h('td', {}, accessChip(x)),
-        can('admin') && h('td', { class: 'acts-cell' },
-          h('button', { class: 'small', onclick: () => personForm(x, positions) }, 'Edit'),
-          h('button', { class: 'small', onclick: () => setPersonActive(x, !x.active) }, x.active ? 'Deactivate' : 'Activate'),
-          ...accessButtons(x)))))))
-    : h('p', { class: 'empty' }, S.pf.q || S.pf.position || S.pf.status !== 'active' ? 'No one matches.' : 'No people yet.');
-  app.replaceChildren(topBar(),
-    pageHead('People', `${people.length} shown${hidden ? ' · contact details are visible to editors and admins' : ''}`,
-      can('admin') && h('button', { class: 'primary', onclick: () => personForm(null, positions) }, '+ Person')),
-    filters, h('section', { class: 'card' }, table));
-}
-
-function personView(x, positions, hidden) {
-  const row = (k, v) => v !== undefined && h('div', { class: 'kv' }, h('span', { class: 'muted' }, k), h('span', {}, v || '—'));
-  dlg.className = '';
-  dlg.replaceChildren(h('h2', {}, x.name, ' ', statusChip(x.active)),
-    h('div', { class: 'kvs' },
-      row('Position', x.position ? `${x.position}${x.position_active ? '' : ' (inactive position)'}` : ''),
-      !hidden && row('Email', x.email), !hidden && row('Phone', x.phone), !hidden && row('Notes', x.notes),
-      row('Added', `${when(x.created_at)}${x.created_by ? ` by ${x.created_by}` : ''}`),
-      row('Last changed', `${when(x.updated_at)}${x.updated_by ? ` by ${x.updated_by}` : ''}`),
-      !hidden && h('div', { class: 'kv' }, h('span', { class: 'muted' }, 'App access'), h('span', {}, accessChip(x)))),
-    h('div', { class: 'bar' },
-      can('editor') && h('button', { class: 'primary', onclick: () => personForm(x, positions) }, 'Edit'),
-      h('button', { onclick: () => dlg.close() }, 'Close')));
-  dlg.showModal();
-}
-
-function personForm(x, positions) {
-  // a person keeps an inactive position until it is changed; new choices are active positions only
-  const opts = [['', 'No position'], ...positions.filter((p) => p.active || p.id === x?.position_id).map((p) => [p.id, p.name + (p.active ? '' : ' (inactive)')])];
-  openDialog(x ? `Edit ${x.name}` : 'Add a person', [
-    { name: 'name', label: 'Full name', value: x?.name, required: true },
-    { name: 'position_id', label: 'Position', type: 'select', value: x?.position_id ?? '', options: opts, hint: positions.length ? null : 'No positions yet — an admin adds them under Positions.' },
-    { name: 'email', label: 'Email (optional)', type: 'email', value: x?.email },
-    { name: 'phone', label: 'Phone (optional)', type: 'tel', value: x?.phone, placeholder: '+91 98765 43210' },
-    { name: 'notes', label: 'Notes (optional)', value: x?.notes },
-    ...(x ? [] : [
-      { name: 'login_role', label: 'App login', type: 'select', value: '', options: [['', 'No login'], ...ROLE_OPTS],
-        hint: 'To let them use the app, choose what they can do and set their password. They sign in with the email above.' },
-      { name: 'password', label: 'Password (for their login)', type: 'password', autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers. Give it to them privately.' },
-      { name: 'confirm', label: 'Password again', type: 'password', autocomplete: 'new-password' },
-    ]),
-  ], x ? 'Save changes' : 'Add person', async (v) => {
-    if (x) return api(`/api/people/${x.id}`, v);
-    const { confirm: again, ...body } = v;
-    if (body.login_role) {
-      if (!body.email) throw new Error('A login needs their email address: it is what they sign in with.');
-      if (!body.password) throw new Error('Set a password for their login.');
-      if (body.password !== again) throw new Error('The two passwords don’t match.');
-    } else { delete body.password; delete body.login_role; }
-    await api('/api/people', body);
-    if (body.login_role) setTimeout(() => alert(`${body.name} can now sign in with ${body.email.trim().toLowerCase()} and the password you set. Give them the password privately.`), 0);
-  });
-}
-
-const setPersonActive = (x, active) => {
-  if (!active && !confirm(`Deactivate ${x.name}? They stay on record and can be activated again.`)) return;
-  act(`/api/people/${x.id}/active`, { active });
-};
-
-// ── app access: logins are created by admins — the person's email from People and a password the admin sets ──
+// ── Users: everyone who can sign in. Admins add them with an email (their login ID) and a password ──
 const ROLE = { viewer: 'Viewer', editor: 'Editor', admin: 'Admin' };
-const ROLE_OPTS = [['viewer', 'Viewer — can look, can’t change anything'], ['editor', 'Editor — adds and updates records'], ['admin', 'Admin — everything, including people and logins']];
-function accessChip(x) {
-  if (x.user_id) return x.access_active ? h('span', { class: `chip ${x.access_role === 'admin' ? 'c-violet' : 'c-green'}` }, `${ROLE[x.access_role]} access`) : h('span', { class: 'chip c-red' }, 'Access removed');
-  return h('span', { class: 'muted small' }, 'No login');
+const ROLE_OPTS = [['viewer', 'Viewer — can look, can’t change anything'], ['editor', 'Editor — adds and updates records'], ['admin', 'Admin — everything, including users']];
+
+async function loadUsers() {
+  const { users } = await api('/api/users');
+  renderUsers(users);
 }
-function accessButtons(x) {
-  if (!can('admin') || !x.active) return [];
-  const me = x.user_id === S.user.id;
-  if (!x.user_id) return [h('button', { class: 'small c-violet', onclick: () => loginDialog(x) }, 'Create login')];
-  if (!x.access_active) return [h('button', { class: 'small', onclick: () => act(`/api/people/${x.id}/access`, { active: true }) }, 'Restore access')];
+
+function renderUsers(users) {
+  const active = users.filter((u) => u.active).length;
+  const table = users.length && h('div', { class: 'scroll' }, h('table', { class: 'tx users' },
+    h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Email (login ID)'), h('th', {}, 'Role'), h('th', {}, 'Status'), h('th', {}, 'Last sign-in'), h('th', {}, ''))),
+    h('tbody', {}, users.map((u) => h('tr', { class: u.active ? '' : 'inactive' },
+      h('td', {}, h('strong', {}, u.name), u.id === S.user.id && h('span', { class: 'chip c-blue' }, 'you')),
+      h('td', {}, u.email),
+      h('td', {}, h('span', { class: `chip ${u.role === 'admin' ? 'c-violet' : u.role === 'editor' ? 'c-green' : ''}` }, ROLE[u.role])),
+      h('td', {}, h('span', { class: `chip ${u.active ? 'c-green' : 'c-red'}` }, u.active ? 'Can sign in' : 'Access removed')),
+      h('td', { class: 'nowrap muted small' }, u.last_login ? when(u.last_login) : 'Never'),
+      h('td', { class: 'acts-cell' }, ...userButtons(u)))))));
+  app.replaceChildren(topBar(),
+    pageHead('Users', `${active} ${active === 1 ? 'person' : 'people'} can sign in. Each signs in with their email and the password you set.`,
+      h('button', { class: 'primary', onclick: userForm }, '+ Add user')),
+    h('section', { class: 'card' }, table || h('p', { class: 'empty' }, 'No users yet.')));
+}
+
+function userButtons(u) {
+  if (!u.active) return [h('button', { class: 'small', onclick: () => act(`/api/users/${u.id}/access`, { active: true }) }, 'Restore access')];
+  const me = u.id === S.user.id;
   return [
-    !me && h('button', { class: 'small', onclick: () => roleDialog(x) }, 'Change role'),
-    !me && h('button', { class: 'small', onclick: () => setPasswordDialog(x) }, 'Set password'),
-    !me && h('button', { class: 'small', onclick: () => { if (confirm(`Remove ${x.name}’s access? They are signed out everywhere and can’t sign in until you restore it.`)) act(`/api/people/${x.id}/access`, { active: false }); } }, 'Remove access'),
+    h('button', { class: 'small', onclick: () => editUserDialog(u) }, 'Edit'),
+    !me && h('button', { class: 'small', onclick: () => roleDialog(u) }, 'Change role'),
+    !me && h('button', { class: 'small', onclick: () => setPasswordDialog(u) }, 'Set password'),
+    !me && h('button', { class: 'small', onclick: () => { if (confirm(`Remove ${u.name}’s access? They are signed out everywhere and can’t sign in until you restore it. Their history stays.`)) act(`/api/users/${u.id}/access`, { active: false }); } }, 'Remove access'),
   ].filter(Boolean);
 }
 
@@ -860,28 +793,35 @@ const passwordFields = (label) => [
   { name: 'password', label, type: 'password', required: true, autocomplete: 'new-password', hint: 'At least 10 characters, with letters and numbers. Give it to them privately.' },
   { name: 'confirm', label: 'Password again', type: 'password', required: true, autocomplete: 'new-password' },
 ];
-function loginDialog(x) {
-  if (!x.email) return alert(`Add ${x.name}’s email address first (Edit). It is what they sign in with.`);
-  openDialog(`Create a login for ${x.name}`, [
+function userForm() {
+  openDialog('Add a user', [
+    { name: 'name', label: 'Full name', required: true },
+    { name: 'email', label: 'Email — this is their login ID', type: 'email', required: true },
     { name: 'role', label: 'What can they do?', type: 'select', value: 'viewer', options: ROLE_OPTS },
     ...passwordFields('Password'),
-  ], 'Create login', async (v) => {
+  ], 'Add user', async (v) => {
     if (v.password !== v.confirm) throw new Error('The two passwords don’t match.');
-    await api(`/api/people/${x.id}/login`, { role: v.role, password: v.password });
-    setTimeout(() => alert(`${x.name} can now sign in with ${x.email} and the password you set. Give them the password privately.`), 0);
-  }, `They will sign in with ${x.email}.`);
+    await api('/api/users', { name: v.name, email: v.email, role: v.role, password: v.password });
+    setTimeout(() => alert(`${v.name} can now sign in with ${v.email.trim().toLowerCase()} and the password you set. Give them the password privately.`), 0);
+  });
 }
-function setPasswordDialog(x) {
-  openDialog(`Set a new password for ${x.name}`, passwordFields('New password'), 'Set password', async (v) => {
+function editUserDialog(u) {
+  openDialog(`Edit ${u.name}`, [
+    { name: 'name', label: 'Full name', value: u.name, required: true },
+    { name: 'email', label: 'Email — their login ID', type: 'email', value: u.email, required: true, hint: 'If you change it, they sign in with the new email from now on.' },
+  ], 'Save', (v) => api(`/api/users/${u.id}`, v));
+}
+function setPasswordDialog(u) {
+  openDialog(`Set a new password for ${u.name}`, passwordFields('New password'), 'Set password', async (v) => {
     if (v.password !== v.confirm) throw new Error('The two passwords don’t match.');
-    await api(`/api/people/${x.id}/password`, { password: v.password });
-    setTimeout(() => alert(`Done. ${x.name} is signed out everywhere and now signs in with the new password.`), 0);
-  }, `For their login ${x.email}. They are signed out everywhere and use this password from now on.`);
+    await api(`/api/users/${u.id}/password`, { password: v.password });
+    setTimeout(() => alert(`Done. ${u.name} is signed out everywhere and now signs in with the new password.`), 0);
+  }, `For ${u.email}. They are signed out everywhere and use this password from now on.`);
 }
-function roleDialog(x) {
-  openDialog(`Change ${x.name}’s role`, [
-    { name: 'role', label: 'What can they do?', type: 'select', value: x.access_role, options: ROLE_OPTS },
-  ], 'Save', (v) => api(`/api/people/${x.id}/role`, v), 'It applies the next time they open a page; they don’t need to sign in again.');
+function roleDialog(u) {
+  openDialog(`Change ${u.name}’s role`, [
+    { name: 'role', label: 'What can they do?', type: 'select', value: u.role, options: ROLE_OPTS },
+  ], 'Save', (v) => api(`/api/users/${u.id}/role`, v), 'It applies the next time they open a page; they don’t need to sign in again.');
 }
 
 function passwordDialog() {
@@ -896,57 +836,13 @@ function passwordDialog() {
   });
 }
 
-// ── Positions ──
-async function loadPositions() {
-  const [{ positions }, people] = await Promise.all([api('/api/positions'), can('admin') ? api('/api/people?status=active') : null]);
-  renderPositions(positions, people?.people ?? []);
-}
-
-function renderPositions(positions, people) {
-  const list = positions.length
-    ? positions.map((p) => h('div', { class: `pos-row ${p.active ? '' : 'inactive'}` },
-      h('div', { class: 'item-main' },
-        h('div', {}, h('strong', {}, p.name), ' ', statusChip(p.active)),
-        p.description && h('div', { class: 'muted small' }, p.description),
-        h('div', { class: 'muted small' }, `${p.people} active ${p.people === 1 ? 'person' : 'people'}`)),
-      h('div', { class: 'acts' },
-        can('admin') && p.active && h('button', { class: 'small c-violet', onclick: () => assignDialog(p, people) }, 'Assign'),
-        h('button', { class: 'small', onclick: () => { S.view = 'people'; S.pf = { status: 'active', position: String(p.id), q: '' }; load(); } }, 'View people'),
-        can('admin') && h('button', { class: 'small', onclick: () => positionForm(p) }, 'Edit'),
-        can('admin') && h('button', { class: 'small', onclick: () => setPositionActive(p, !p.active) }, p.active ? 'Deactivate' : 'Activate'))))
-    : h('p', { class: 'empty' }, can('admin') ? 'No positions yet. Add the ones your team uses, e.g. Accountant, Manager, Director.' : 'No positions yet — an admin adds them.');
-  app.replaceChildren(topBar(),
-    pageHead('Positions', can('admin') ? 'Create the positions your team uses and assign them to people.' : 'The positions people can hold.',
-      can('admin') && h('button', { class: 'primary', onclick: () => positionForm(null) }, '+ Position')),
-    h('section', { class: 'card' }, list));
-}
-
-function positionForm(p) {
-  openDialog(p ? `Edit ${p.name}` : 'Add a position', [
-    { name: 'name', label: 'Position name', value: p?.name, placeholder: 'e.g. Accountant', required: true },
-    { name: 'description', label: 'Description (optional)', value: p?.description },
-  ], p ? 'Save changes' : 'Add position', (v) => api(p ? `/api/positions/${p.id}` : '/api/positions', v));
-}
-
-const setPositionActive = (p, active) => {
-  if (!active && !confirm(`Deactivate “${p.name}”? People keep it, but it can’t be given to anyone new until it is activated again.`)) return;
-  act(`/api/positions/${p.id}`, { active });
-};
-
-function assignDialog(p, people) {
-  const others = people.filter((x) => x.position_id !== p.id);
-  if (!others.length) return alert(people.length ? `Everyone active already holds “${p.name}”.` : 'There are no active people yet. Add them under People.');
-  openDialog(`Assign “${p.name}”`, [
-    { name: 'person_id', label: 'Person', type: 'select', options: others.map((x) => [x.id, x.name + (x.position ? ` — now ${x.position}` : '')]), required: true },
-  ], 'Assign', (v) => api(`/api/positions/${p.id}/assign`, v), 'Their current position, if any, is replaced.');
-}
-
 // ── Activity log (admins) ──
 const ACTION_LABELS = {
   'emi.edit': 'Changed EMI settings', 'emi.reminders': 'Checked EMI reminders',
   'report.export': 'Exported a report',
   login: 'Signed in', 'login.failed': 'Failed sign-in', 'login.locked': 'Locked out (too many wrong passwords)', logout: 'Signed out',
-  setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user', 'account.create': 'Created a login', 'account.password': 'Set someone’s password',
+  setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user', 'user.edit': 'Edited a user', 'user.role': 'Changed a user’s role', 'user.password': 'Set a user’s password',
+  'user.remove': 'Removed a user’s access', 'user.restore': 'Restored a user’s access', 'account.create': 'Created a login', 'account.password': 'Set someone’s password',
   'invite.create': 'Invited someone to the app', 'invite.reset_link': 'Made a password reset link', 'invite.cancel': 'Cancelled an invite link',
   'invite.accept': 'Accepted an invite (set their password)', 'password.reset': 'Set a new password from a reset link', 'password.change': 'Changed their password',
   'signup.request': 'Asked to sign up', 'access.role': 'Changed someone’s role',
@@ -977,7 +873,7 @@ async function loadActivity(more = false) {
   const p = new URLSearchParams(Object.entries(S.af).filter(([, v]) => v));
   if (more && S.act?.rows.length) p.set('before', S.act.rows.at(-1).id);
   const [{ activity, more: hasMore }, users, positions] = await Promise.all([
-    api(`/api/activity?${p}`), more ? S.act.users : api('/api/users').then((x) => x.users), more ? S.act.positions : api('/api/positions').then((x) => new Map(x.positions.map((y) => [y.id, y.name]))),
+    api(`/api/activity?${p}`), more ? S.act.users : api('/api/users').then((x) => x.users), new Map(),
   ]);
   S.act = { rows: more ? [...S.act.rows, ...activity] : activity, more: hasMore, users, positions };
   keepFocus(renderActivity);
@@ -989,7 +885,7 @@ function renderActivity() {
   const filters = h('div', { class: 'card toolbar' }, h('div', { class: 'bar grow' },
     h('input', { type: 'search', name: 'aq', class: 'search', placeholder: 'Search actions, names, references', value: f.q ?? '', oninput: onSearch((v) => { S.af = { ...S.af, q: v }; }), 'aria-label': 'Search activity' }),
     h('select', { 'aria-label': 'Who', onchange: set('user') }, [['', 'Everyone'], ...users.map((u) => [String(u.id), `${u.name} (${u.role})`]), ['none', 'Not signed in']].map(([v, t]) => h('option', { value: v, selected: (f.user ?? '') === v }, t))),
-    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'All activity'], ['signin', 'Sign-ins'], ['people', 'People'], ['positions', 'Positions'], ['payments', 'Payments'], ['receipts', 'Receipts'], ['emis', 'EMIs'], ['balances', 'Bank balances'], ['accounts', 'Bank accounts'], ['users', 'Logins & access'], ['reports', 'Report exports']]
+    h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'All activity'], ['signin', 'Sign-ins'], ['people', 'People'], ['positions', 'Positions'], ['payments', 'Payments'], ['receipts', 'Receipts'], ['emis', 'EMIs'], ['balances', 'Bank balances'], ['accounts', 'Bank accounts'], ['users', 'Users'], ['reports', 'Report exports']]
       .map(([v, t]) => h('option', { value: v, selected: (f.type ?? '') === v }, t))),
     h('label', { class: 'check' }, 'From', h('input', { type: 'date', value: f.from ?? '', max: S.today, onchange: set('from') })),
     h('label', { class: 'check' }, 'To', h('input', { type: 'date', value: f.to ?? '', max: S.today, onchange: set('to') })),

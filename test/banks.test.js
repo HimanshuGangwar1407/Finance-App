@@ -28,7 +28,7 @@ let hdfc, icici;
 
 test('setup: two banks with balances two days ago, and a few days of money in and out', async () => {
   await admin('/api/setup', { name: 'Asha', email: 'asha@x.in', password: 'adminpass123' });
-  await admin('/api/people', { name: 'Vik', email: 'vik@x.in', login_role: 'viewer', password: 'viewerpass12' });
+  await admin('/api/users', { name: 'Vik', email: 'vik@x.in', role: 'viewer', password: 'viewerpass12' });
   await viewer('/api/login', { email: 'vik@x.in', password: 'viewerpass12' });
   hdfc = (await admin('/api/banks', { name: 'HDFC', bank: 'HDFC Bank', last4: '1111' })).body.id;
   icici = (await admin('/api/banks', { name: 'ICICI', bank: 'ICICI Bank', last4: '2222' })).body.id;
