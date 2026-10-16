@@ -215,6 +215,23 @@ const MIGRATIONS = [
   // logins are made by admins on the Users page now (no invite links or sign-up): any invite links still open stop
   // working. The people and positions tables stay as they are, unused; nothing is deleted.
   `UPDATE invites SET revoked_at = now() WHERE used_at IS NULL AND revoked_at IS NULL;`,
+  // launch: the data entered while testing was dummy data. Every table except users (logins and passwords) is copied
+  // into the "prelaunch_backup" schema and then emptied, so the app starts clean. Runs once, like every migration;
+  // on a new, empty database it changes nothing. The backup can be dropped later: DROP SCHEMA prelaunch_backup CASCADE;
+  `CREATE SCHEMA prelaunch_backup;
+   CREATE TABLE prelaunch_backup.entries AS TABLE entries;
+   CREATE TABLE prelaunch_backup.payments AS TABLE payments;
+   CREATE TABLE prelaunch_backup.receipts AS TABLE receipts;
+   CREATE TABLE prelaunch_backup.balances AS TABLE balances;
+   CREATE TABLE prelaunch_backup.emis AS TABLE emis;
+   CREATE TABLE prelaunch_backup.banks AS TABLE banks;
+   CREATE TABLE prelaunch_backup.notifications AS TABLE notifications;
+   CREATE TABLE prelaunch_backup.email_outbox AS TABLE email_outbox;
+   CREATE TABLE prelaunch_backup.invites AS TABLE invites;
+   CREATE TABLE prelaunch_backup.people AS TABLE people;
+   CREATE TABLE prelaunch_backup.positions AS TABLE positions;
+   CREATE TABLE prelaunch_backup.audit AS TABLE audit;
+   TRUNCATE TABLE entries, payments, receipts, balances, emis, banks, notifications, email_outbox, invites, people, positions, audit RESTART IDENTITY;`,
 ];
 
 let ready;
