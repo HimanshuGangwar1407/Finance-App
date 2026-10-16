@@ -212,6 +212,9 @@ const MIGRATIONS = [
      revoked_at  timestamptz
    );
    CREATE INDEX invites_person ON invites (person_id, id DESC);`,
+  // logins are made by admins on the Users page now (no invite links or sign-up): any invite links still open stop
+  // working. The people and positions tables stay as they are, unused; nothing is deleted.
+  `UPDATE invites SET revoked_at = now() WHERE used_at IS NULL AND revoked_at IS NULL;`,
 ];
 
 let ready;
