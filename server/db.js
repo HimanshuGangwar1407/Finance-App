@@ -232,6 +232,9 @@ const MIGRATIONS = [
    CREATE TABLE prelaunch_backup.positions AS TABLE positions;
    CREATE TABLE prelaunch_backup.audit AS TABLE audit;
    TRUNCATE TABLE entries, payments, receipts, balances, emis, banks, notifications, email_outbox, invites, people, positions, audit RESTART IDENTITY;`,
+  // deleted users: they can't sign in and don't appear on the Users page, but their name stays on what they recorded
+  // and in the activity log (their email is released so it can be used again)
+  `ALTER TABLE users ADD COLUMN deleted_at timestamptz;`,
 ];
 
 let ready;

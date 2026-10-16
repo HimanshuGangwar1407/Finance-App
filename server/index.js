@@ -41,7 +41,7 @@ const likeTerm = (s) => `%${s.replace(/[\\%_]/g, '\\$&')}%`;
 const ROLES = ['viewer', 'editor', 'admin'];
 // a user an admin is about to change: never themselves (for role / access), and never the last active admin
 async function userForChange(c, id, me, { notSelf } = {}) {
-  const { rows: [u] } = await c.query('SELECT id, name, email, role, active FROM users WHERE id = $1 FOR UPDATE', [id]);
+  const { rows: [u] } = await c.query('SELECT id, name, email, role, active FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [id]);
   if (!u) notFound('That user doesn’t exist.');
   if (notSelf && u.id === me) bad(notSelf);
   return u;
@@ -719,7 +719,7 @@ const routes = [
   ['GET', /^\/api\/users$/, 'admin', async () => ({
     users: (await q(`SELECT u.id, u.email, u.name, u.role, u.active, u.created_at,
         (SELECT max(a.at) FROM audit a WHERE a.user_id = u.id AND a.action IN ('login', 'setup')) AS last_login
-      FROM users u ORDER BY u.active DESC, lower(u.name), u.id`)).rows,
+      FROM users u WHERE u.deleted_at IS NULL ORDER BY u.active DESC, lower(u.name), u.id`)).rows,
   })],
 
   ['POST', /^\/api\/users$/, 'admin', async ({ body, user }) => {
@@ -764,6 +764,18 @@ const routes = [
     return {};
   })],
 
+  // delete a user for good: they can't sign in again and leave the Users page. Their name stays on what they recorded
+  // and in the activity log; their email is released (so it can be added again) and their password is wiped.
+  ['POST', /^\/api\/users\/(\d+)\/delete$/, 'admin', async ({ user, m }) => withTx(async (c) => {
+    const u = await userForChange(c, intId(m[1], 'User'), user.id, { notSelf: 'You can’t delete yourself.' });
+    if (await lastAdmin(c, u)) bad('This is the only admin. Make someone else an admin first.');
+    await c.query(`UPDATE users SET deleted_at = now(), active = false, ver = ver + 1, email = $2, pw = $3 WHERE id = $1`,
+      [u.id, `deleted-${u.id}-${Date.now()}@deleted.invalid`, A.hashPassword(crypto.randomBytes(24).toString('hex'))]);
+    await c.query('DELETE FROM notifications WHERE user_id = $1', [u.id]);
+    await audit(c, user.id, 'user.delete', { id: u.id, name: u.name, email: u.email, role: u.role });
+    return {};
+  })],
+
   // remove (or give back) access; removing signs them out everywhere. Nothing is deleted: their history stays.
   ['POST', /^\/api\/users\/(\d+)\/access$/, 'admin', async ({ body, user, m }) => withTx(async (c) => {
     const active = body.active === true;
@@ -805,7 +817,7 @@ const routes = [
     const term = str(p.get('q'), 100);
     if (term) { const t = arg(likeTerm(term)); where.push(`(a.action ILIKE ${t} OR a.detail::text ILIKE ${t} OR coalesce(u.name, '') ILIKE ${t} OR coalesce(u.email, '') ILIKE ${t})`); }
     if (p.get('before')) where.push(`a.id < ${arg(intId(p.get('before'), 'Page'))}`);
-    const { rows } = await q(`SELECT a.id, a.at, a.action, a.detail, a.user_id, u.name AS user_name, u.email AS user_email, u.role AS user_role
+    const { rows } = await q(`SELECT a.id, a.at, a.action, a.detail, a.user_id, u.name AS user_name, u.email AS user_email, u.role AS user_role, u.deleted_at IS NOT NULL AS user_deleted
       FROM audit a LEFT JOIN users u ON u.id = a.user_id ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY a.id DESC LIMIT 51`, args);
     return { activity: rows.slice(0, 50), more: rows.length > 50 };
   }],
