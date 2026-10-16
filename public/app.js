@@ -190,7 +190,7 @@ function render() {
   const anyBank = [...bankOpts, ['', 'Not decided yet']]; // the first account is picked unless changed
 
   const warnings = [];
-  if (!P.banks.length) warnings.push(can('admin') ? 'Add your bank accounts to start (“+ Account”).' : 'No bank accounts yet — ask an admin to add them.');
+  if (!P.banks.length) warnings.push(can('admin') ? 'Add your bank accounts to start: Banks → “+ Add bank account”.' : 'No bank accounts yet — ask an admin to add them.');
   for (const r of P.rows) {
     if (r.id == null) continue;
     if (r.balance == null) warnings.push(`${r.name}: no bank balance entered yet, so it counts as ₹0.`);
@@ -232,8 +232,7 @@ function render() {
       can('editor') && P.banks.length > 0 && h('button', { class: 'c-blue', onclick: () => balanceDialog(bankOpts) }, 'Enter bank balance'),
       can('editor') && h('button', { class: 'c-red', onclick: () => paymentDialog(anyBank) }, '+ Payment'),
       can('editor') && h('button', { class: 'c-green', onclick: () => receiptDialog(anyBank) }, '+ Receipt'),
-      P.banks.length > 0 && h('button', { class: 'c-amber', onclick: () => go('emis') }, 'EMIs'),
-      can('admin') && h('button', { onclick: bankDialog }, '+ Account')));
+      P.banks.length > 0 && h('button', { class: 'c-amber', onclick: () => go('emis') }, 'EMIs')));
 
   const alerts = [
     ...P.rows.filter((r) => r.id != null && r.final < 0 && T.final >= 0).map((r) => ['bad', `${r.name} will be short by ${inr(-r.final)}. Transfer money into it before the payments go out.`]),
@@ -347,7 +346,7 @@ function bankDialog() {
     { name: 'name', label: 'Name in this app', placeholder: 'e.g. Main current account', required: true },
     { name: 'bank', label: 'Bank', placeholder: 'e.g. HDFC Bank', required: true },
     { name: 'last4', label: 'Last 4 digits of the account number', required: true },
-  ], 'Add account', (v) => api('/api/banks', v));
+  ], 'Add account', (v) => api('/api/banks', v), 'Then enter its balance on the Dashboard (“Enter bank balance”), so its figures start from the right amount.');
 }
 
 // ── Transactions: money received and paid, bank statements for a period, reports and exports ──
@@ -420,14 +419,14 @@ function renderTransactions(sum, rows) {
   const cards = sum.banks.length
     ? h('div', { class: 'bank-cards' }, sum.banks.map((b) => h('section', { class: 'bank-card' },
       h('div', { class: 'bc-head' }, h('div', {}, h('strong', {}, b.name), h('div', { class: 'muted small' }, b.bank)),
-        !b.balanceEntered && h('span', { class: 'chip c-amber', title: 'Enter a bank balance on the Bank position page so this starts from the right figure.' }, 'no balance entered')),
+        !b.balanceEntered && h('span', { class: 'chip c-amber', title: 'Enter a bank balance on the Dashboard (“Enter bank balance”) so this starts from the right figure.' }, 'no balance entered')),
       h('div', { class: `bc-amt ${b.closing < 0 ? 'neg' : ''}` }, inr(b.closing)),
       line(`Opening (${nice(addDays(sum.from, -1))})`, b.opening),
       line('+ Received', b.received, 'pos'),
       line('− Paid', b.paid, 'red'),
       b.corrections !== 0 && line('± Balance corrections', b.corrections, 'amber', 'A balance entered during the period differs from the running figure — e.g. bank charges or interest not recorded here.'),
       h('div', { class: 'bc-line total' }, h('span', {}, sum.to === sum.today ? '= Current balance' : `= Balance on ${nice(sum.to)}`), money(b.closing)))))
-    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add them on the Bank position page (“+ Account”).' : 'No bank accounts yet.'));
+    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add them on the Banks page (“+ Add bank account”).' : 'No bank accounts yet.'));
 
   const exportBtn = (format, label) => h('button', { class: 'small', onclick: () => {
     const a = h('a', { href: `/api/transactions/export?${txQuery({ format })}`, download: '' });
@@ -489,7 +488,7 @@ function recordsTableEl(rows, bankOpts) {
 
 function txDialog(kind, accounts) {
   const out = kind === 'OUT';
-  if (!accounts.length) return alert('Add a bank account first (Bank position → “+ Account”).');
+  if (!accounts.length) return alert('Add a bank account first (Banks → “+ Add bank account”).');
   openDialog(out ? 'Record a payment' : 'Record a receipt', [
     { name: out ? 'payee' : 'party', label: out ? 'Paid to' : 'Received from', required: true },
     { name: 'amount', label: 'Amount (₹)', type: 'money', required: true },
@@ -571,9 +570,10 @@ function renderBanks(d) {
       h('div', { class: 'bc-line total' }, h('span', {}, '= Closing balance'), money(b.closing)),
       h('div', { class: 'bc-emi' }, h('strong', {}, 'EMI'), emiDetail(b, isToday))))
     )
-    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add them on the Dashboard (“+ Account”).' : 'No bank accounts yet.'));
+    : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add your first one with “+ Add bank account” above.' : 'No bank accounts yet.'));
 
-  app.replaceChildren(...[topBar(), pageHead('Banks', 'Each bank account for a day: opening balance, debits, credits, closing balance, and EMIs.'), picker, summary, table, cards].filter(Boolean));
+  app.replaceChildren(...[topBar(), pageHead('Banks', 'Each bank account for a day: opening balance, debits, credits, closing balance, and EMIs.',
+    can('admin') && h('button', { class: 'primary', onclick: bankDialog }, '+ Add bank account')), picker, summary, table, cards].filter(Boolean));
 }
 const EMI_STATE_SHORT = { paid: ['paid', 'c-green'], overdue: ['unpaid', 'c-red'], due: ['due today', 'c-amber'], upcoming: ['upcoming', 'c-blue'], scheduled: ['scheduled', ''] };
 // the EMI column: what is due that day, else the next one
@@ -736,7 +736,7 @@ const reminderBody = (v) => {
 };
 
 function emiForm(bankOpts) {
-  if (!bankOpts.length) return alert('Add a bank account first (Dashboard → “+ Account”).');
+  if (!bankOpts.length) return alert('Add a bank account first (Banks → “+ Add bank account”).');
   openDialog('Add an EMI', [
     { name: 'lender', label: 'Lender / loan', placeholder: 'e.g. HDFC car loan', required: true },
     { name: 'amount', label: 'EMI amount (₹)', type: 'money', required: true },
