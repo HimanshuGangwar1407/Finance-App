@@ -779,13 +779,15 @@ function renderUsers(users) {
 }
 
 function userButtons(u) {
-  if (!u.active) return [h('button', { class: 'small', onclick: () => act(`/api/users/${u.id}/access`, { active: true }) }, 'Restore access')];
+  const del = u.id !== S.user.id && h('button', { class: 'small c-red', onclick: () => deleteUserDialog(u) }, 'Delete');
+  if (!u.active) return [h('button', { class: 'small', onclick: () => act(`/api/users/${u.id}/access`, { active: true }) }, 'Restore access'), del].filter(Boolean);
   const me = u.id === S.user.id;
   return [
     h('button', { class: 'small', onclick: () => editUserDialog(u) }, 'Edit'),
     !me && h('button', { class: 'small', onclick: () => roleDialog(u) }, 'Change role'),
     !me && h('button', { class: 'small', onclick: () => setPasswordDialog(u) }, 'Set password'),
     !me && h('button', { class: 'small', onclick: () => { if (confirm(`Remove ${u.name}’s access? They are signed out everywhere and can’t sign in until you restore it. Their history stays.`)) act(`/api/users/${u.id}/access`, { active: false }); } }, 'Remove access'),
+    del,
   ].filter(Boolean);
 }
 
@@ -818,6 +820,15 @@ function setPasswordDialog(u) {
     setTimeout(() => alert(`Done. ${u.name} is signed out everywhere and now signs in with the new password.`), 0);
   }, `For ${u.email}. They are signed out everywhere and use this password from now on.`);
 }
+// deleting can't be undone, so the admin types the person's name to confirm
+function deleteUserDialog(u) {
+  openDialog(`Delete ${u.name}?`, [
+    { name: 'confirm', label: `Type ${u.name} to confirm`, required: true, autocomplete: 'off' },
+  ], 'Delete user', async (v) => {
+    if (v.confirm.trim() !== u.name.trim()) throw new Error(`Type the name exactly as shown: ${u.name}`);
+    await api(`/api/users/${u.id}/delete`, {});
+  }, `${u.name} (${u.email}) will be signed out and can never sign in again, and leaves this list. This can’t be undone — to stop someone for now, use “Remove access” instead. What they recorded stays, under their name.`);
+}
 function roleDialog(u) {
   openDialog(`Change ${u.name}’s role`, [
     { name: 'role', label: 'What can they do?', type: 'select', value: u.role, options: ROLE_OPTS },
@@ -842,7 +853,7 @@ const ACTION_LABELS = {
   'report.export': 'Exported a report',
   login: 'Signed in', 'login.failed': 'Failed sign-in', 'login.locked': 'Locked out (too many wrong passwords)', logout: 'Signed out',
   setup: 'Set up the app (first admin)', 'admin.create': 'Admin account created (script)', 'user.add': 'Added a user', 'user.edit': 'Edited a user', 'user.role': 'Changed a user’s role', 'user.password': 'Set a user’s password',
-  'user.remove': 'Removed a user’s access', 'user.restore': 'Restored a user’s access', 'account.create': 'Created a login', 'account.password': 'Set someone’s password',
+  'user.remove': 'Removed a user’s access', 'user.delete': 'Deleted a user', 'user.restore': 'Restored a user’s access', 'account.create': 'Created a login', 'account.password': 'Set someone’s password',
   'invite.create': 'Invited someone to the app', 'invite.reset_link': 'Made a password reset link', 'invite.cancel': 'Cancelled an invite link',
   'invite.accept': 'Accepted an invite (set their password)', 'password.reset': 'Set a new password from a reset link', 'password.change': 'Changed their password',
   'signup.request': 'Asked to sign up', 'access.role': 'Changed someone’s role',
@@ -895,7 +906,7 @@ function renderActivity() {
       h('thead', {}, h('tr', {}, h('th', {}, 'When (IST)'), h('th', {}, 'Who'), h('th', {}, 'What'), h('th', {}, 'Details'))),
       h('tbody', {}, rows.map((a) => h('tr', {},
         h('td', { class: 'nowrap' }, when(a.at)),
-        h('td', {}, a.user_name ? h('span', {}, a.user_name, h('div', { class: 'muted small' }, a.user_role)) : h('span', { class: 'muted' }, 'Not signed in')),
+        h('td', {}, a.user_name ? h('span', {}, a.user_name, a.user_deleted && h('span', { class: 'muted small' }, ' (deleted)'), h('div', { class: 'muted small' }, a.user_role)) : h('span', { class: 'muted' }, 'Not signed in')),
         h('td', {}, h('span', { class: `chip ${actionTone(a.action)}` }, ACTION_LABELS[a.action] ?? a.action)),
         h('td', { class: 'small' }, describe(a, positions)))))))
     : h('p', { class: 'empty' }, 'Nothing matches.');

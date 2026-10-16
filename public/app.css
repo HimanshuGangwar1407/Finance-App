@@ -244,3 +244,7 @@ button.sum-card:hover { filter: none; border-color: var(--brand); }
 .bc-emi { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: var(--amber-bg); display: grid; gap: 4px; }
 .bc-emi .bc-line { border-top: 0; padding: 2px 0; }
 .toolbar input[type=date] { width: auto; }
+/* Users: labels stay on one line; the action buttons wrap rather than pushing the table wider */
+table.users .chip, table.users th { white-space: nowrap; }
+table.users td.acts-cell { white-space: normal; min-width: 220px; }
+table.users td.acts-cell button { margin: 2px 0 2px 4px; }

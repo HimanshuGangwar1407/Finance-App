@@ -112,3 +112,38 @@ test('activity log: every change to users, with who did it — never a password'
   const all = JSON.stringify((await q('SELECT detail FROM audit')).rows);
   for (const pw of ['ravispass123', 'ravisnew1234', 'ravisown1234', 'meenapass123', 'takeover1234', 'goodpass1234']) assert.ok(!all.includes(pw), pw);
 });
+
+test('delete a user (admins only): they can never sign in again and leave the list; what they did keeps their name', async () => {
+  // Meena (an editor now) records something first
+  const meena = await signIn('meena.shah@firm.in', 'meenapass123');
+  const bank = (await admin('/api/banks', { name: 'Main', bank: 'HDFC', last4: '1234' })).body.id;
+  assert.equal((await meena('/api/balances', { bank_id: bank, amount: '1,000' })).status, 200);
+  const gone = (await users()).get('Meena Shah').id;
+
+  // only admins; never yourself; a typo'd id is not found
+  assert.equal((await meena(`/api/users/${gone}/delete`, {})).status, 403);
+  assert.equal((await session()(`/api/users/${gone}/delete`, {})).status, 401);
+  assert.match((await admin(`/api/users/${await id('Asha Admin')}/delete`, {})).body.error.message, /can’t delete yourself/);
+
+  assert.equal((await admin(`/api/users/${gone}/delete`, {})).status, 200);
+  assert.equal((await meena('/api/position')).status, 401); // signed out at once
+  assert.equal(await signIn('meena.shah@firm.in', 'meenapass123'), 401); // and can't sign in
+  assert.equal((await users()).has('Meena Shah'), false); // gone from the Users page
+  assert.equal((await admin(`/api/users/${gone}/delete`, {})).status, 404); // already deleted
+  assert.equal((await admin(`/api/users/${gone}/role`, { role: 'admin' })).status, 404); // and can't be changed
+  assert.equal((await admin(`/api/users/${gone}/access`, { active: true })).status, 404); // nor brought back
+
+  // the password is wiped, the email released: the same email can be given to someone new
+  const { rows: [row] } = await q('SELECT email, active, deleted_at FROM users WHERE id = $1', [gone]);
+  assert.ok(row.deleted_at && !row.active && row.email.endsWith('@deleted.invalid'));
+  assert.equal((await admin('/api/users', { name: 'New Meena', email: 'meena.shah@firm.in', role: 'viewer', password: 'newmeena1234' })).status, 200);
+  assert.equal(typeof await signIn('meena.shah@firm.in', 'newmeena1234'), 'function');
+
+  // her record and her activity stay, under her name, marked deleted
+  assert.equal((await q('SELECT count(*)::int AS n FROM balances WHERE created_by = $1', [gone])).rows[0].n, 1);
+  const log = (await admin('/api/activity')).body.activity;
+  const hers = log.find((a) => a.action === 'balance.add' && a.user_id === gone);
+  assert.deepEqual([hers.user_name, hers.user_deleted], ['Meena Shah', true]);
+  const del = log.find((a) => a.action === 'user.delete');
+  assert.deepEqual([del.user_name, del.detail.name, del.detail.email], ['Asha Admin', 'Meena Shah', 'meena.shah@firm.in']);
+});
