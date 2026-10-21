@@ -267,3 +267,4 @@ dialog.wide.import { width: min(900px, calc(100vw - 32px)); }
 .import-preview td.small { min-width: 160px; max-width: 260px; }
 .import-preview .chip, .import-preview td.num { white-space: nowrap; }
 dialog input[type=file] { padding: 8px; }
+.from-excel { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 10px 12px; margin: 4px 0 12px; border: 1px dashed var(--line); border-radius: 10px; font-size: 14px; }
