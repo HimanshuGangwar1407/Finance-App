@@ -14,6 +14,7 @@ import { finalBalance } from './balance.js';
 import { emiDates } from './emi.js';
 import { bankStatements } from './ledger.js';
 import { toCsv, toXlsx } from './export.js';
+import { readTable, importRows, MAX_BYTES } from './sheet.js';
 import { dueReminders, projectDates, coverage, DEFAULT_BEFORE } from './reminders.js';
 import { emailConfigured, sendEmail } from './email.js';
 import * as A from './auth.js';
@@ -50,7 +51,7 @@ const lastAdmin = async (c, u) => u.role === 'admin' && u.active && Number((awai
 
 // activity log filters: a type is the part of the action before the dot (older entries — people, positions, invites,
 // sign-ups, account.* — keep their own names and stay findable)
-const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user', 'account', 'password', 'access', 'invite', 'signup'], reports: ['report'] };
+const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user', 'account', 'password', 'access', 'invite', 'signup'], reports: ['report', 'import'] };
 const istStart = (d) => new Date(`${d}T00:00:00+05:30`).toISOString();
 
 // makes each active EMI's instalments into payments, up to `through` (once each: a cancelled one stays cancelled)
@@ -429,10 +430,43 @@ async function records(f) {
   return rows;
 }
 
+// ── an uploaded Excel / CSV sheet → receipts and payments yet to be paid / received (pending: balances don't move) ──
+// "check" reads the sheet and says what each row will become; "add" reads the same file again and adds the good rows.
+async function sheetImport(c, body) {
+  const kind = oneOf(body.kind || 'OUT', ['IN', 'OUT'], 'These rows are');
+  const file = String(body.file ?? '');
+  if (!file || !/^[A-Za-z0-9+/=\s]+$/.test(file)) bad('Choose an Excel (.xlsx) or CSV file to upload.');
+  const buf = Buffer.from(file, 'base64');
+  if (buf.length > MAX_BYTES) bad('That file is too big. Upload at most 3 MB (about 20,000 rows).');
+  const table = readTable(buf, str(body.name, 200));
+  const banks = (await c.query('SELECT id, name, bank, last4 FROM banks ORDER BY id')).rows;
+  const out = importRows(table, { kind, banks, today: todayIST() });
+  if (!out.rows.length) bad('No rows found under the headings.');
+  // already in the app: the same name, amount and date (not cancelled), or the same invoice / bill no. still open
+  const [rec, pay] = [
+    await c.query("SELECT 'IN' AS kind, party AS name, amount, expected_date AS date, ref, status FROM receipts WHERE status <> 'CANCELLED'"),
+    await c.query("SELECT 'OUT' AS kind, payee AS name, amount, due_date AS date, ref, status FROM payments WHERE status <> 'CANCELLED'"),
+  ];
+  const key = (x) => `${x.kind}|${x.name.toLowerCase()}|${Number(x.amount)}|${x.date}`;
+  const have = new Set([...rec.rows, ...pay.rows].map(key));
+  const refs = new Set([...rec.rows, ...pay.rows].filter((x) => x.status === 'OPEN' && normRef(x.ref)).map((x) => `${x.kind}|${normRef(x.ref)}`));
+  const seen = new Map(); // rows of this sheet so far, to spot the same row twice
+  for (const r of out.rows) {
+    if (r.problems.length) { r.status = 'problem'; continue; }
+    const k = key(r), ref = normRef(r.ref), again = seen.get(`${k}|${ref}`);
+    if (have.has(k)) r.duplicate = 'Already in the app (same name, amount and date)';
+    else if (ref && refs.has(`${r.kind}|${ref}`)) r.duplicate = `Invoice / bill no. “${r.ref}” is already in the app`;
+    else if (again) r.duplicate = `Same as row ${again} of this sheet`;
+    if (!again) seen.set(`${k}|${ref}`, r.row);
+    r.status = r.duplicate ? 'duplicate' : 'ok';
+  }
+  return { fileName: str(body.name, 200), sheet: table.sheet, ...out }; // not "file": that is a download
+}
+
 // export tables: a header row, then rows; amounts in rupees as numbers so spreadsheets can add them up
 const rupeeNum = (p) => Math.round(Number(p)) / 100;
 const TYPE = { IN: 'Receipt', OUT: 'Payment' };
-const STATE = { pending: 'Pending', partial: 'Partly settled', completed: 'Completed', cancelled: 'Cancelled' };
+const STATE = { pending: 'Yet to be paid', partial: 'Partly settled', completed: 'Completed', cancelled: 'Cancelled' };
 // IDs as shown in the app
 const txId = (r) => `T-${String(r.id).padStart(5, '0')}`;
 const recId = (r) => `${r.kind === 'IN' ? 'R' : 'P'}-${r.id}`;
@@ -442,7 +476,7 @@ const historyTable = (rows) => [
 ];
 const recordsTable = (rows) => [
   ['ID', 'Date', 'Type', 'Party', 'Amount (₹)', 'Settled (₹)', 'Outstanding (₹)', 'Status', 'Bank account', 'Bank references', 'Last settled on', 'Invoice / bill no.', 'Description'],
-  ...rows.map((r) => [recId(r), r.date, TYPE[r.kind], r.name, rupeeNum(r.amount), rupeeNum(r.settled), r.state === 'cancelled' ? 0 : rupeeNum(r.amount - r.settled), STATE[r.state], r.bank_name ?? 'Not decided', r.bank_refs ?? '', r.last_date ?? '', r.ref, r.note || (r.emi ? 'EMI' : r.category)]),
+  ...rows.map((r) => [recId(r), r.date, TYPE[r.kind], r.name, rupeeNum(r.amount), rupeeNum(r.settled), r.state === 'cancelled' ? 0 : rupeeNum(r.amount - r.settled), r.state === 'pending' && r.kind === 'IN' ? 'Yet to be received' : STATE[r.state], r.bank_name ?? 'Not decided', r.bank_refs ?? '', r.last_date ?? '', r.ref, r.note || (r.emi ? 'EMI' : r.category)]),
 ];
 
 async function currentUser(req) {
@@ -691,6 +725,42 @@ const routes = [
     }).catch(unique(REF_TAKEN));
   }],
 
+  ['POST', /^\/api\/import\/check$/, 'editor', async ({ body }) => withTx((c) => sheetImport(c, body))],
+
+  // adds the sheet's good rows as yet to be paid / received; rows that look like duplicates only when asked
+  ['POST', /^\/api\/import\/add$/, 'editor', async ({ body, user }) => withTx(async (c) => {
+    const x = await sheetImport(c, body);
+    const add = x.rows.filter((r) => r.status === 'ok' || (r.status === 'duplicate' && body.includeDuplicates === true));
+    if (!add.length) bad('Nothing to add: every row has a problem or is already in the app.');
+    const cols = (rows, ...keys) => keys.map((k) => rows.map((r) => (typeof k === 'function' ? k(r) : r[k])));
+    const ins = add.filter((r) => r.kind === 'IN'), outs = add.filter((r) => r.kind === 'OUT');
+    if (ins.length) {
+      await c.query(`INSERT INTO receipts (party, ref, amount, expected_date, bank_id, note, created_by)
+        SELECT t.party, t.ref, t.amount, t.d, t.bank, t.note, $7 FROM unnest($1::text[], $2::text[], $3::bigint[], $4::date[], $5::int[], $6::text[]) AS t(party, ref, amount, d, bank, note)`,
+      [...cols(ins, 'name', 'ref', 'amount', 'date', 'bank_id', 'note'), user.id]);
+    }
+    if (outs.length) {
+      await c.query(`INSERT INTO payments (payee, ref, ref_norm, category, amount, due_date, bank_id, note, approved, created_by)
+        SELECT t.payee, t.ref, t.ref_norm, t.category, t.amount, t.d, t.bank, t.note, $9, $10 FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::date[], $7::int[], $8::text[]) AS t(payee, ref, ref_norm, category, amount, d, bank, note)`,
+      [...cols(outs, 'name', 'ref', (r) => normRef(r.ref), 'category', 'amount', 'date', 'bank_id', 'note'), user.role === 'admin', user.id]);
+    }
+    const dates = add.map((r) => r.date).sort();
+    const result = { added: add.length, receipts: ins.length, payments: outs.length, skipped: x.rows.length - add.length, from: dates[0], to: dates.at(-1) };
+    await audit(c, user.id, 'import.add', { file: x.fileName, sheet: x.sheet, ...result, receiptAmount: ins.reduce((n, r) => n + r.amount, 0), paymentAmount: outs.reduce((n, r) => n + r.amount, 0) });
+    return result;
+  })],
+
+  // a sample sheet with the headings the upload understands
+  ['GET', /^\/api\/import\/sample$/, 'viewer', async () => ({ file: {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', name: 'receipts-payments-upload-sample.xlsx',
+    body: toXlsx([
+      ['Type', 'Name', 'Amount', 'Due date', 'Invoice / bill no.', 'Description', 'Category', 'Bank account'],
+      ['Payment', 'Steel Co', 125000, '25/10/2026', 'BILL-2291', 'October steel', 'Vendor', 'HDFC'],
+      ['Payment', 'Office rent', 45000, '01/11/2026', '', 'November rent', 'Rent', ''],
+      ['Receipt', 'Mehta Retail', 80000, '28/10/2026', 'INV-118', 'Order 42', '', ''],
+    ], 'Upload'),
+  } })],
+
   // the Banks page: each account's day — opening balance, debits (money paid out), credits (money received), closing
   // balance, the day's transactions, and its EMIs (due that day, reserved now, the next one). Same figures as Transactions.
   ['GET', /^\/api\/banks\/day$/, 'viewer', async ({ url }) => {
@@ -871,10 +941,11 @@ const routes = [
   }],
 ];
 
-async function readJson(req) {
+// an uploaded sheet arrives base64-encoded (3 MB → 4 MB); everything else is small
+async function readJson(req, limit = 32768) {
   if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) throw err(415, 'invalid_argument', 'Send JSON.');
   let size = 0; const parts = [];
-  for await (const chunk of req) { size += chunk.length; if (size > 32768) throw err(413, 'invalid_argument', 'That is too much data.'); parts.push(chunk); }
+  for await (const chunk of req) { size += chunk.length; if (size > limit) throw err(413, 'invalid_argument', limit > 32768 ? 'That file is too big. Upload at most 3 MB.' : 'That is too much data.'); parts.push(chunk); }
   try { const v = JSON.parse(Buffer.concat(parts).toString('utf8') || '{}'); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; }
   catch { throw err(400, 'invalid_argument', 'That request couldn’t be read.'); }
 }
@@ -906,7 +977,7 @@ export async function handler(req, res) {
       // the cookie is SameSite=Lax and writes need a JSON body; refusing other origins closes the rest of CSRF
       const origin = req.headers.origin;
       if (origin && new URL(origin).host !== req.headers.host) deny('Requests from other sites are refused.');
-      ctx.body = await readJson(req);
+      ctx.body = await readJson(req, url.pathname.startsWith('/api/import/') ? 4_400_000 : 32768);
     }
     await ensureSchema();
     ctx.user = await currentUser(req);
