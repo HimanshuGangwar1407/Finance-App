@@ -376,7 +376,8 @@ const txId = (r) => `T-${String(r.id).padStart(5, '0')}`;
 const recId = (r) => `${r.kind === 'IN' ? 'R' : 'P'}-${r.id}`;
 const SEARCH_IN = [['', 'Everything'], ['name', 'Name'], ['id', 'Transaction ID'], ['bank_ref', 'Bank reference (UTR / cheque)'], ['doc_ref', 'Invoice / bill no.'], ['note', 'Description'], ['amount', 'Amount'], ['bank', 'Bank account'], ['user', 'Recorded by']];
 const SEARCH_HINT = { '': 'Search name, ID, reference, invoice, amount…', name: 'e.g. Mehta Retail', id: 'e.g. T-00042, R-12 or P-34', bank_ref: 'e.g. UTR number or cheque no.', doc_ref: 'e.g. INV-2291', note: 'e.g. October order', amount: 'e.g. 25000 or 25,000', bank: 'e.g. HDFC', user: 'e.g. Ravi' };
-const STATE_LABEL = { pending: 'Pending', partial: 'Partly settled', completed: 'Completed', cancelled: 'Cancelled' };
+const STATE_LABEL = { pending: 'Yet to be paid', partial: 'Partly settled', completed: 'Completed', cancelled: 'Cancelled' };
+const stateLabel = (r) => (r.state === 'pending' && r.kind === 'IN' ? 'Yet to be received' : STATE_LABEL[r.state]);
 const STATE_TONE = { pending: 'c-amber', partial: 'c-blue', completed: 'c-green', cancelled: '' };
 
 function renderTransactions(sum, rows) {
@@ -398,7 +399,7 @@ function renderTransactions(sum, rows) {
     h('label', { class: 'check' }, 'To', h('input', { type: 'date', name: 'to', value: f.to, min: f.from, onchange: setDate('to') })),
     h('select', { 'aria-label': 'Bank account', onchange: set('bank') }, [['', 'All bank accounts'], ...accounts.map((b) => [String(b.id), b.name])].map(([v, t]) => h('option', { value: v, selected: f.bank === v }, t))),
     h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'Receipts and payments'], ['IN', 'Receipts only'], ['OUT', 'Payments only']].map(([v, t]) => h('option', { value: v, selected: f.type === v }, t))),
-    f.view === 'records' && h('select', { 'aria-label': 'Status', onchange: set('status') }, [['', 'Any status'], ['pending', 'Pending'], ['partial', 'Partly settled'], ['completed', 'Completed'], ['cancelled', 'Cancelled']].map(([v, t]) => h('option', { value: v, selected: f.status === v }, t)))));
+    f.view === 'records' && h('select', { 'aria-label': 'Status', onchange: set('status') }, [['', 'Any status'], ['pending', 'Yet to be paid / received'], ['partial', 'Partly settled'], ['completed', 'Completed'], ['cancelled', 'Cancelled']].map(([v, t]) => h('option', { value: v, selected: f.status === v }, t)))));
 
   const tile = (cls, label, p, sub) => h('div', { class: `tile ${cls}` }, h('div', { class: 'tile-lbl' }, label), h('div', { class: `tile-amt ${p < 0 ? 'neg' : ''}` }, inr(p)), sub && h('div', { class: 'tile-sub' }, sub));
   const P = sum.pending;
@@ -441,9 +442,103 @@ function renderTransactions(sum, rows) {
   app.replaceChildren(topBar(),
     pageHead('Receipts, payments & balances', 'Balances move only when money is received or paid. Pending items are shown separately.',
       can('editor') && h('button', { class: 'c-green', onclick: () => txDialog('IN', accounts) }, '+ Receipt'),
-      can('editor') && h('button', { class: 'c-red', onclick: () => txDialog('OUT', accounts) }, '+ Payment')),
+      can('editor') && h('button', { class: 'c-red', onclick: () => txDialog('OUT', accounts) }, '+ Payment'),
+      can('editor') && h('button', { class: 'primary', onclick: uploadDialog }, '⇪ Upload Excel')),
+    ...[flash()].filter(Boolean),
     // while searching, the results come straight under the search bar; the balances follow
     ...(f.q ? [filters, h('section', { class: 'card' }, seg, table), summary, cards] : [filters, summary, cards, h('section', { class: 'card' }, seg, table)]));
+}
+
+// a one-time message under the page heading (e.g. after an upload)
+function flash() {
+  const m = S.flash; S.flash = null;
+  return m && h('div', { class: 'card flash', role: 'status' }, icon('check'), h('span', {}, m));
+}
+
+// ── upload an Excel / CSV sheet: every good row becomes a payment yet to be paid (or a receipt yet to be received) ──
+const toBase64 = async (file) => {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+};
+const COL_LABEL = { type: 'Type', name: 'Name', amount: 'Amount', out: 'Payment amount', in: 'Receipt amount', date: 'Due date', ref: 'Invoice / bill no.', note: 'Description', category: 'Category', bank: 'Bank account' };
+function uploadDialog() {
+  let sent = null, checked = null;
+  const err = h('p', { class: 'err', role: 'alert' }), result = h('div', { class: 'import-result' });
+  const fileIn = h('input', { type: 'file', name: 'sheet', accept: '.xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv' });
+  const kindIn = h('select', { name: 'kind' }, h('option', { value: 'OUT' }, 'Payments — yet to be paid'), h('option', { value: 'IN' }, 'Receipts — yet to be received'));
+  const dupIn = h('input', { type: 'checkbox', name: 'dups' });
+  const addBtn = h('button', { class: 'primary', type: 'button', disabled: true }, 'Add');
+  const sample = h('a', { href: '/api/import/sample', download: '' }, 'Download a sample sheet');
+
+  const check = async () => {
+    err.textContent = ''; result.replaceChildren(); addBtn.disabled = true; checked = null;
+    const file = fileIn.files[0];
+    if (!file) return;
+    if (file.size > 3 * 1024 * 1024) { err.textContent = 'That file is too big. Upload at most 3 MB.'; return; }
+    result.append(h('p', { class: 'muted' }, 'Reading the sheet…'));
+    try {
+      sent = { file: await toBase64(file), name: file.name, kind: kindIn.value };
+      checked = await api('/api/import/check', sent);
+    } catch (e) { result.replaceChildren(); err.textContent = e.message; return; }
+    show();
+  };
+  const show = () => {
+    const rows = checked.rows, ok = rows.filter((r) => r.status === 'ok'), dup = rows.filter((r) => r.status === 'duplicate'), probs = rows.filter((r) => r.status === 'problem');
+    const adding = [...ok, ...(dupIn.checked ? dup : [])];
+    const sumOf = (k) => adding.filter((r) => r.kind === k).reduce((n, r) => n + r.amount, 0);
+    const nOut = adding.filter((r) => r.kind === 'OUT').length, nIn = adding.length - nOut;
+    addBtn.textContent = !adding.length ? 'Nothing to add' : nIn && nOut ? `Add ${adding.length} rows` : nIn ? `Add ${nIn} as yet to be received` : `Add ${nOut} as yet to be paid`;
+    addBtn.disabled = !adding.length;
+    const tone = { ok: 'c-green', duplicate: 'c-amber', problem: 'c-red' }, word = { ok: 'Ready', duplicate: 'Already there', problem: 'Problem' };
+    result.replaceChildren(...[
+      h('p', { class: 'import-counts' },
+        h('strong', {}, `${rows.length} row${rows.length === 1 ? '' : 's'}`), checked.sheet && ` in “${checked.sheet}”`, ': ',
+        h('span', { class: 'pos' }, `${ok.length} ready`),
+        dup.length > 0 && [' · ', h('span', { class: 'amber' }, `${dup.length} already in the app`)],
+        probs.length > 0 && [' · ', h('span', { class: 'red' }, `${probs.length} with a problem (skipped)`)]),
+      adding.length > 0 && h('p', { class: 'muted small' }, [nOut && `To pay: ${inr(sumOf('OUT'))} (${nOut})`, nIn && `To receive: ${inr(sumOf('IN'))} (${nIn})`].filter(Boolean).join(' · '), '. Balances don’t change until each one is marked paid / received.'),
+      h('p', { class: 'muted small' }, 'Columns used: ', Object.entries(checked.columns).map(([k, v]) => `${COL_LABEL[k]} ← “${v}”`).join(', '), '.'),
+      dup.length > 0 && h('label', { class: 'check' }, dupIn, `Add the ${dup.length} that look already in the app too`),
+      h('div', { class: 'scroll import-preview' }, h('table', { class: 'tx' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'Row'), h('th', {}, ''), h('th', {}, 'Type'), h('th', {}, 'Name'), h('th', {}, 'Due date'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Notes'))),
+        h('tbody', {}, rows.slice(0, 500).map((r) => h('tr', { class: r.status === 'ok' || (r.status === 'duplicate' && dupIn.checked) ? '' : 'inactive' },
+          h('td', { class: 'muted' }, r.row),
+          h('td', {}, h('span', { class: `chip ${tone[r.status]}` }, word[r.status])),
+          h('td', {}, r.kind === 'IN' ? 'Receipt' : 'Payment'),
+          h('td', {}, h('strong', {}, r.name || '—'), [r.ref, r.note].filter(Boolean).length > 0 && h('div', { class: 'muted small' }, [r.ref, r.note].filter(Boolean).join(' · '))),
+          h('td', { class: 'nowrap' }, r.date ? nice(r.date) : '—'),
+          h('td', { class: 'num' }, r.amount ? inr(r.amount) : '—'),
+          h('td', { class: 'small' }, [...r.problems, r.duplicate, ...r.notes].filter(Boolean).join('; '))))))),
+      rows.length > 500 && h('p', { class: 'muted small' }, `Showing the first 500 of ${rows.length} rows.`)].filter(Boolean));
+  };
+  fileIn.addEventListener('change', check);
+  kindIn.addEventListener('change', () => { if (fileIn.files[0]) check(); });
+  dupIn.addEventListener('change', () => checked && show());
+  addBtn.addEventListener('click', async () => {
+    addBtn.disabled = true; err.textContent = '';
+    try {
+      const r = await api('/api/import/add', { ...sent, includeDuplicates: dupIn.checked });
+      dlg.close();
+      // show what was added: Receipts & Payments, yet to be paid / received, over the dates of the sheet
+      const from = r.from < monthStart(S.today) ? r.from : monthStart(S.today), to = r.to > S.today ? r.to : S.today;
+      S.view = 'transactions';
+      S.tf = { ...txDefaults(), view: 'records', status: 'pending', preset: 'custom', from, to };
+      S.flash = `Added ${r.added} from the sheet as yet to be ${r.receipts && r.payments ? 'paid / received' : r.receipts ? 'received' : 'paid'}${r.skipped ? ` (${r.skipped} skipped)` : ''}. Showing everything yet to be paid / received from ${nice(from)} to ${nice(to)}.`;
+      await load();
+    } catch (e) { err.textContent = e.message; addBtn.disabled = false; }
+  });
+  dlg.className = 'wide import';
+  dlg.replaceChildren(
+    h('h2', {}, 'Upload payments / receipts from Excel'),
+    h('p', { class: 'muted' }, 'Each row of the sheet is added as yet to be paid (or yet to be received). Nothing is added until you check the rows below and press Add. ', sample, '.'),
+    h('label', {}, h('span', {}, 'Excel (.xlsx) or CSV file'), fileIn,
+      h('small', { class: 'muted' }, 'Needs a heading row with at least a name (Name / Party / Vendor…) and an amount (Amount…). Also read if present: Type (Payment / Receipt), Due date, Invoice / bill no., Description, Category, Bank account.')),
+    h('label', {}, h('span', {}, 'Rows without a Type column are'), kindIn),
+    result, err,
+    h('div', { class: 'bar' }, addBtn, h('button', { type: 'button', onclick: () => dlg.close() }, 'Cancel')));
+  dlg.showModal();
 }
 
 const txDesc = (r) => r.note || (r.emi ? 'EMI' : r.category) || '';
@@ -479,7 +574,7 @@ function recordsTableEl(rows, bankOpts) {
         h('td', { class: 'num' }, money(r.amount)),
         h('td', { class: 'num' }, r.settled ? money(r.settled, out ? 'red' : 'pos') : '—'),
         h('td', { class: 'num' }, open ? money(left, 'amber') : '—'),
-        h('td', {}, h('span', { class: `chip ${STATE_TONE[r.state]}` }, STATE_LABEL[r.state]), r.last_date && r.state !== 'pending' && h('div', { class: 'muted small' }, `last ${nice(r.last_date)}`)),
+        h('td', {}, h('span', { class: `chip ${STATE_TONE[r.state]}` }, stateLabel(r)), r.last_date && r.state !== 'pending' && h('div', { class: 'muted small' }, `last ${nice(r.last_date)}`)),
         can('editor') && h('td', { class: 'acts-cell' }, open && [
           h('button', { class: `small ${out ? 'solid-red' : 'solid-green'}`, onclick: () => settleDialog({ kind: r.kind, id: r.id, name: r.name, amount: left, bankId: r.bank_id }, bankOpts) }, out ? 'Mark paid' : 'Mark received'),
           h('button', { class: 'small', onclick: () => { if (confirm(`Cancel “${r.name}”? ${r.settled ? 'What was already settled stays in the balances; the rest' : 'It'} will no longer be expected.`)) act(`/api/${out ? 'payments' : 'receipts'}/${r.id}/cancel`, {}); } }, 'Cancel')]));
@@ -875,7 +970,7 @@ const ACTION_LABELS = {
   'position.add': 'Added a position', 'position.edit': 'Edited a position', 'position.activate': 'Activated a position', 'position.deactivate': 'Deactivated a position',
   'payment.add': 'Added a payment', 'payment.paid': 'Marked a payment paid', 'payment.approve': 'Approved a payment', 'payment.cancel': 'Cancelled a payment',
   'receipt.add': 'Added a receipt', 'receipt.received': 'Marked a receipt received', 'receipt.cancel': 'Cancelled a receipt',
-  'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account',
+  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account',
 };
 const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|setup|admin)/.test(a) ? 'c-blue' : /^(person|position|user)/.test(a) ? 'c-violet' : /cancel|deactivate|stop/.test(a) ? 'c-red' : 'c-amber');
 // a short, readable summary of what was recorded
@@ -884,6 +979,7 @@ function describe(a, positions) {
   const fmt = (k, v) => (v == null || v === '' ? '—' : k === 'position_id' ? positions.get(v) ?? `#${v}` : /amount/i.test(k) && typeof v === 'number' ? inr(v) : String(v));
   if (a.action === 'emi.reminders') return `${d.reminders ?? 0} due · ${d.inApp ?? 0} in-app · ${d.queued ?? 0} email(s) queued · ${d.sent ?? 0} sent${d.via ? ' · daily schedule' : ''}`;
   if (a.action === 'signup.request') return `${d.email} · ${!d.matched ? 'not in People (nothing sent)' : d.emailed === 'sent' ? `link emailed (${d.role})` : d.emailed === 'not set up' ? 'email not set up: admins notified' : `email ${d.emailed}`}`;
+  if (a.action === 'import.add') return `${d.file || 'sheet'} · ${d.added} added (${d.payments} to pay${d.paymentAmount ? ` ${inr(d.paymentAmount)}` : ''}, ${d.receipts} to receive${d.receiptAmount ? ` ${inr(d.receiptAmount)}` : ''})${d.skipped ? ` · ${d.skipped} skipped` : ''}`;
   if (a.action === 'report.export') return `${String(d.format).toUpperCase()} · ${d.view === 'history' ? 'transaction history' : 'receipts & payments'} · ${d.from} to ${d.to} · ${d.rows} row(s)`;
   for (const k of ['name', 'payee', 'party', 'lender', 'email', 'role', 'reason']) if (d[k]) out.push(String(d[k]));
   if (d.amount != null && typeof d.amount === 'number') out.push(inr(d.amount));
