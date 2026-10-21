@@ -443,7 +443,7 @@ function renderTransactions(sum, rows) {
     pageHead('Receipts, payments & balances', 'Balances move only when money is received or paid. Pending items are shown separately.',
       can('editor') && h('button', { class: 'c-green', onclick: () => txDialog('IN', accounts) }, '+ Receipt'),
       can('editor') && h('button', { class: 'c-red', onclick: () => txDialog('OUT', accounts) }, '+ Payment'),
-      can('editor') && h('button', { class: 'primary', onclick: uploadDialog }, '⇪ Upload Excel')),
+      can('editor') && h('button', { class: 'primary', onclick: () => uploadDialog() }, '⇪ Upload Excel')),
     ...[flash()].filter(Boolean),
     // while searching, the results come straight under the search bar; the balances follow
     ...(f.q ? [filters, h('section', { class: 'card' }, seg, table), summary, cards] : [filters, summary, cards, h('section', { class: 'card' }, seg, table)]));
@@ -463,11 +463,11 @@ const toBase64 = async (file) => {
   return btoa(bin);
 };
 const COL_LABEL = { type: 'Type', name: 'Name', amount: 'Amount', out: 'Payment amount', in: 'Receipt amount', date: 'Due date', ref: 'Invoice / bill no.', note: 'Description', category: 'Category', bank: 'Bank account' };
-function uploadDialog() {
+function uploadDialog(kind = 'OUT') {
   let sent = null, checked = null;
   const err = h('p', { class: 'err', role: 'alert' }), result = h('div', { class: 'import-result' });
   const fileIn = h('input', { type: 'file', name: 'sheet', accept: '.xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv' });
-  const kindIn = h('select', { name: 'kind' }, h('option', { value: 'OUT' }, 'Payments — yet to be paid'), h('option', { value: 'IN' }, 'Receipts — yet to be received'));
+  const kindIn = h('select', { name: 'kind' }, h('option', { value: 'OUT', selected: kind === 'OUT' }, 'Payments — yet to be paid'), h('option', { value: 'IN', selected: kind === 'IN' }, 'Receipts — yet to be received'));
   const dupIn = h('input', { type: 'checkbox', name: 'dups' });
   const addBtn = h('button', { class: 'primary', type: 'button', disabled: true }, 'Add');
   const sample = h('a', { href: '/api/import/sample', download: '' }, 'Download a sample sheet');
@@ -584,10 +584,14 @@ function recordsTableEl(rows, bankOpts) {
 function txDialog(kind, accounts) {
   const out = kind === 'OUT';
   if (!accounts.length) return alert('Add a bank account first (Banks → “+ Add bank account”).');
+  // many at once: from an Excel sheet, as yet to be paid / received
+  const fromExcel = h('div', { class: 'from-excel' },
+    h('span', {}, out ? 'Many payments in an Excel sheet?' : 'Many receipts in an Excel sheet?'),
+    h('button', { type: 'button', class: 'small primary', onclick: () => { dlg.close(); uploadDialog(kind); } }, '⇪ Add from Excel'));
   openDialog(out ? 'Record a payment' : 'Record a receipt', [
     { name: out ? 'payee' : 'party', label: out ? 'Paid to' : 'Received from', required: true },
     { name: 'amount', label: 'Amount (₹)', type: 'money', required: true },
-    { name: 'status', label: 'Status', type: 'select', value: 'completed', options: [['completed', out ? 'Paid — the money has left the bank' : 'Received — the money is in the bank'], ['pending', out ? 'Pending — still to pay (balances not affected)' : 'Pending — still to come (balances not affected)']] },
+    { name: 'status', label: 'Status', type: 'select', value: 'completed', options: [['completed', out ? 'Paid — the money has left the bank' : 'Received — the money is in the bank'], ['pending', out ? 'Yet to be paid (balances not affected)' : 'Yet to be received (balances not affected)']] },
     { name: 'date', label: 'Date', type: 'date', value: S.today, required: true, hint: 'For a received / paid item, the date it went through the bank (today or earlier). For a pending one, the date it is due.' },
     { name: 'bank_id', label: 'Bank account', type: 'select', options: [...accounts.map((b) => [b.id, `${b.name} — ${b.bank} XXXX${b.last4}`]), ['', 'Not decided yet (pending only)']], required: false },
     { name: 'bank_ref', label: 'Bank reference (UTR / cheque no.)', hint: 'Needed when it is received or paid. The same reference can’t be used twice on one account.' },
@@ -595,7 +599,7 @@ function txDialog(kind, accounts) {
     { name: 'ref', label: out ? 'Invoice / bill no. (optional)' : 'Invoice no. (optional)' },
     { name: 'note', label: 'Description (optional)' },
     ...(out && can('admin') ? [{ name: 'approved', label: 'Approved', type: 'checkbox', value: true }] : []),
-  ], out ? 'Record payment' : 'Record receipt', (v) => confirmDup((dup) => api('/api/transactions', { ...v, kind, confirmDuplicate: dup })));
+  ], out ? 'Record payment' : 'Record receipt', (v) => confirmDup((dup) => api('/api/transactions', { ...v, kind, confirmDuplicate: dup })), fromExcel);
 }
 
 // one alert per account that can't cover its EMIs in the next 30 days: the first one it misses, and the total it needs
