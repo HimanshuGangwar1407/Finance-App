@@ -341,6 +341,29 @@ function receiptDialog(anyBank) {
   ], 'Add receipt', (v) => confirmDup((dup) => api('/api/receipts', { ...v, confirmDuplicate: dup })));
 }
 
+// deleting an account: says what is recorded on it, and asks for its name to be typed
+async function bankDeleteDialog(b) {
+  let u;
+  try { u = await api(`/api/banks/${b.id}/usage`); } catch (e) { return alert(e.message); }
+  const lines = [
+    u.balances && `${u.balances} balance(s) entered`,
+    u.received && `${u.received} receipt(s) of money in — ${inr(u.received_amount)}`,
+    u.paid && `${u.paid} payment(s) of money out — ${inr(u.paid_amount)}`,
+    u.emis && `${u.emis} EMI(s) set up on this account, with their instalments`,
+  ].filter(Boolean);
+  const intro = h('div', { class: 'del-intro' },
+    h('p', {}, h('strong', {}, `${u.name} — ${u.bank} XXXX${u.last4}`)),
+    lines.length
+      ? [h('p', { class: 'neg' }, 'Deleting it also deletes:'), h('ul', {}, lines.map((x) => h('li', {}, x))),
+        (u.received || u.paid) > 0 && h('p', { class: 'muted small' }, 'Receipts and payments settled through this account are deleted with it; the balances of your other accounts don’t change.')]
+      : h('p', { class: 'muted' }, 'Nothing is recorded on this account yet.'),
+    u.unassigned > 0 && h('p', { class: 'muted small' }, `${u.unassigned} receipt(s) / payment(s) yet to be paid or received on this account are kept, as “Not decided”.`),
+    h('p', { class: 'muted small' }, 'This can’t be undone. It is recorded in the Activity Log.'));
+  openDialog('Delete bank account', [{ name: 'confirm', label: `Type “${u.name}” to confirm`, required: true, autocomplete: 'off' }], 'Delete account',
+    async (v) => { await api(`/api/banks/${b.id}/delete`, v); if (S.tf?.bank === String(b.id)) S.tf = { ...S.tf, bank: '' }; }, intro);
+  dlg.querySelector('button[type=submit]').classList.add('danger');
+}
+
 function bankDialog() {
   openDialog('Add a bank account', [
     { name: 'name', label: 'Name in this app', placeholder: 'e.g. Main current account', required: true },
@@ -577,8 +600,18 @@ function recordsTableEl(rows, bankOpts) {
         h('td', {}, h('span', { class: `chip ${STATE_TONE[r.state]}` }, stateLabel(r)), r.last_date && r.state !== 'pending' && h('div', { class: 'muted small' }, `last ${nice(r.last_date)}`)),
         can('editor') && h('td', { class: 'acts-cell' }, open && [
           h('button', { class: `small ${out ? 'solid-red' : 'solid-green'}`, onclick: () => settleDialog({ kind: r.kind, id: r.id, name: r.name, amount: left, bankId: r.bank_id }, bankOpts) }, out ? 'Mark paid' : 'Mark received'),
-          h('button', { class: 'small', onclick: () => { if (confirm(`Cancel “${r.name}”? ${r.settled ? 'What was already settled stays in the balances; the rest' : 'It'} will no longer be expected.`)) act(`/api/${out ? 'payments' : 'receipts'}/${r.id}/cancel`, {}); } }, 'Cancel')]));
+          h('button', { class: 'small', onclick: () => { if (confirm(`Cancel “${r.name}”? ${r.settled ? 'What was already settled stays in the balances; the rest' : 'It'} will no longer be expected.`)) act(`/api/${out ? 'payments' : 'receipts'}/${r.id}/cancel`, {}); } }, 'Cancel')],
+          can('admin') && !r.emi && h('button', { class: 'small danger', title: 'Delete it completely', onclick: () => deleteRecord(r) }, 'Delete')));
     }))));
+}
+
+// deletes a receipt or payment; money already received / paid on it leaves the balances too
+function deleteRecord(r) {
+  const out = r.kind === 'OUT', what = out ? 'payment' : 'receipt';
+  const msg = `Delete the ${what} “${r.name}” for ${inr(r.amount)} (${recId(r)})?\n\n`
+    + (r.settled ? `The ${inr(r.settled)} already ${out ? 'paid' : 'received'} on it is removed too, so the bank balance changes by that amount.\n\n` : '')
+    + 'This can’t be undone. It is recorded in the Activity Log.';
+  if (confirm(msg)) act(`/api/${out ? 'payments' : 'receipts'}/${r.id}/delete`, {});
 }
 
 function txDialog(kind, accounts) {
@@ -659,7 +692,9 @@ function renderBanks(d) {
   const cards = d.banks.length
     ? h('div', { class: 'bank-cards' }, d.banks.map((b) => h('section', { class: `bank-card ${b.closing < 0 ? 'short' : ''}` },
       h('div', { class: 'bc-head' }, h('div', {}, h('strong', {}, b.name), h('div', { class: 'muted small' }, b.bank)),
-        !b.balanceEntered && h('span', { class: 'chip c-amber', title: 'Enter a bank balance on the Dashboard so this starts from the right figure.' }, 'no balance entered')),
+        h('div', { class: 'bc-acts' },
+          !b.balanceEntered && h('span', { class: 'chip c-amber', title: 'Enter a bank balance on the Dashboard so this starts from the right figure.' }, 'no balance entered'),
+          can('admin') && h('button', { class: 'small danger', 'aria-label': `Delete ${b.name}`, onclick: () => bankDeleteDialog(b) }, 'Delete'))),
       h('div', { class: `bc-amt ${b.closing < 0 ? 'neg' : ''}` }, inr(b.closing)),
       h('div', { class: 'muted small bc-cap' }, isToday ? 'closing balance so far today' : 'closing balance'),
       line('Opening balance', b.opening),
@@ -974,15 +1009,17 @@ const ACTION_LABELS = {
   'position.add': 'Added a position', 'position.edit': 'Edited a position', 'position.activate': 'Activated a position', 'position.deactivate': 'Deactivated a position',
   'payment.add': 'Added a payment', 'payment.paid': 'Marked a payment paid', 'payment.approve': 'Approved a payment', 'payment.cancel': 'Cancelled a payment',
   'receipt.add': 'Added a receipt', 'receipt.received': 'Marked a receipt received', 'receipt.cancel': 'Cancelled a receipt',
-  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account',
+  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account', 'bank.delete': 'Deleted a bank account', 'payment.delete': 'Deleted a payment', 'receipt.delete': 'Deleted a receipt',
 };
-const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|setup|admin)/.test(a) ? 'c-blue' : /^(person|position|user)/.test(a) ? 'c-violet' : /cancel|deactivate|stop/.test(a) ? 'c-red' : 'c-amber');
+const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|setup|admin)/.test(a) ? 'c-blue' : /^(person|position|user)/.test(a) ? 'c-violet' : /cancel|deactivate|stop|delete/.test(a) ? 'c-red' : 'c-amber');
 // a short, readable summary of what was recorded
 function describe(a, positions) {
   const d = a.detail || {}, out = [];
   const fmt = (k, v) => (v == null || v === '' ? '—' : k === 'position_id' ? positions.get(v) ?? `#${v}` : /amount/i.test(k) && typeof v === 'number' ? inr(v) : String(v));
   if (a.action === 'emi.reminders') return `${d.reminders ?? 0} due · ${d.inApp ?? 0} in-app · ${d.queued ?? 0} email(s) queued · ${d.sent ?? 0} sent${d.via ? ' · daily schedule' : ''}`;
   if (a.action === 'signup.request') return `${d.email} · ${!d.matched ? 'not in People (nothing sent)' : d.emailed === 'sent' ? `link emailed (${d.role})` : d.emailed === 'not set up' ? 'email not set up: admins notified' : `email ${d.emailed}`}`;
+  if (a.action === 'bank.delete') return [`${d.name} (${d.bank} XXXX${d.last4})`, d.entries && `${d.entries} transaction(s) deleted`, d.receivedAmount && `${inr(d.receivedAmount)} in`, d.paidAmount && `${inr(d.paidAmount)} out`, d.emis && `${d.emis} EMI(s)`, d.balances && `${d.balances} balance(s)`, d.nowNotDecided && `${d.nowNotDecided} now “Not decided”`].filter(Boolean).join(' · ');
+  if (a.action === 'payment.delete' || a.action === 'receipt.delete') return [d.payee || d.party, inr(d.amount), d.date, d.ref, d.settled && `incl. ${inr(d.settled)} ${a.action === 'payment.delete' ? 'paid' : 'received'}`].filter(Boolean).join(' · ');
   if (a.action === 'import.add') return `${d.file || 'sheet'} · ${d.added} added (${d.payments} to pay${d.paymentAmount ? ` ${inr(d.paymentAmount)}` : ''}, ${d.receipts} to receive${d.receiptAmount ? ` ${inr(d.receiptAmount)}` : ''})${d.skipped ? ` · ${d.skipped} skipped` : ''}`;
   if (a.action === 'report.export') return `${String(d.format).toUpperCase()} · ${d.view === 'history' ? 'transaction history' : 'receipts & payments'} · ${d.from} to ${d.to} · ${d.rows} row(s)`;
   for (const k of ['name', 'payee', 'party', 'lender', 'email', 'role', 'reason']) if (d[k]) out.push(String(d[k]));

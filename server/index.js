@@ -463,6 +463,24 @@ async function sheetImport(c, body) {
   return { fileName: str(body.name, 200), sheet: table.sheet, ...out }; // not "file": that is a download
 }
 
+// ── deleting a bank account: what goes with it ──
+// The account's balances, the money received / paid through it, its EMIs (and their instalments), and the receipts
+// and payments settled only through it. Pending receipts and payments assigned to it stay, as "Not decided".
+async function bankUsage(c, id) {
+  const { rows: [b] } = await c.query('SELECT id, name, bank, last4 FROM banks WHERE id = $1', [id]);
+  if (!b) notFound('That bank account doesn’t exist (it may already be deleted).');
+  const { rows: [u] } = await c.query(`SELECT
+      (SELECT count(*) FROM balances WHERE bank_id = $1)::int AS balances,
+      (SELECT count(*) FROM entries WHERE bank_id = $1 AND kind = 'IN')::int AS received,
+      (SELECT coalesce(sum(amount), 0) FROM entries WHERE bank_id = $1 AND kind = 'IN')::bigint AS received_amount,
+      (SELECT count(*) FROM entries WHERE bank_id = $1 AND kind = 'OUT')::int AS paid,
+      (SELECT coalesce(sum(amount), 0) FROM entries WHERE bank_id = $1 AND kind = 'OUT')::bigint AS paid_amount,
+      (SELECT count(*) FROM emis WHERE bank_id = $1)::int AS emis,
+      (SELECT count(*) FROM receipts r WHERE r.bank_id = $1 AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.receipt_id = r.id))::int
+        + (SELECT count(*) FROM payments p WHERE p.bank_id = $1 AND p.emi_id IS NULL AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.payment_id = p.id))::int AS unassigned`, [id]);
+  return { ...b, ...u, received_amount: Number(u.received_amount), paid_amount: Number(u.paid_amount) };
+}
+
 // export tables: a header row, then rows; amounts in rupees as numbers so spreadsheets can add them up
 const rupeeNum = (p) => Math.round(Number(p)) / 100;
 const TYPE = { IN: 'Receipt', OUT: 'Payment' };
@@ -692,6 +710,34 @@ const routes = [
     });
   }],
 
+  // what deleting an account would remove, shown before the admin confirms
+  ['GET', /^\/api\/banks\/(\d+)\/usage$/, 'admin', async ({ m }) => bankUsage({ query: q }, intId(m[1], 'Bank account'))],
+
+  // delete an account; the admin types its name to confirm
+  ['POST', /^\/api\/banks\/(\d+)\/delete$/, 'admin', async ({ body, user, m }) => withTx(async (c) => {
+    const id = intId(m[1], 'Bank account');
+    await c.query('SELECT id FROM banks WHERE id = $1 FOR UPDATE', [id]);
+    const u = await bankUsage(c, id);
+    if (str(body.confirm, 80).toLowerCase() !== u.name.toLowerCase()) bad(`To confirm, type the account’s name exactly: ${u.name}`);
+    // receipts and payments settled only through this account, and the instalments of its EMIs, go with it
+    const only = (col) => `SELECT DISTINCT e.${col} FROM entries e WHERE e.bank_id = $1 AND e.${col} IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM entries x WHERE x.${col} = e.${col} AND x.bank_id <> $1)`;
+    const recs = (await c.query(only('receipt_id'), [id])).rows.map((r) => r.receipt_id);
+    const pays = [...new Set([...(await c.query(only('payment_id'), [id])).rows.map((r) => r.payment_id),
+      ...(await c.query('SELECT p.id FROM payments p JOIN emis e ON e.id = p.emi_id WHERE e.bank_id = $1', [id])).rows.map((r) => r.id)])];
+    const { rowCount: entries } = await c.query('DELETE FROM entries WHERE bank_id = $1 OR receipt_id = ANY($2::int[]) OR payment_id = ANY($3::int[])', [id, recs, pays]);
+    await c.query('DELETE FROM receipts WHERE id = ANY($1::int[])', [recs]);
+    await c.query('DELETE FROM payments WHERE id = ANY($1::int[])', [pays]);
+    await c.query('DELETE FROM emis WHERE bank_id = $1', [id]);
+    const moved = (await c.query('UPDATE receipts SET bank_id = NULL WHERE bank_id = $1', [id])).rowCount + (await c.query('UPDATE payments SET bank_id = NULL WHERE bank_id = $1', [id])).rowCount;
+    await c.query('DELETE FROM balances WHERE bank_id = $1', [id]);
+    await c.query('DELETE FROM banks WHERE id = $1', [id]);
+    const result = { id, name: u.name, bank: u.bank, last4: u.last4, balances: u.balances, entries, receivedAmount: u.received_amount, paidAmount: u.paid_amount,
+      emis: u.emis, receiptsDeleted: recs.length, paymentsDeleted: pays.length, nowNotDecided: moved };
+    await audit(c, user.id, 'bank.delete', result);
+    return result;
+  })],
+
   // the balance shown in net banking / the statement at the end of a day (or right now, dated today)
   ['POST', /^\/api\/balances$/, 'editor', async ({ body, user }) => {
     const bankId = intId(body.bank_id, 'Account'), amount = toPaise(body.amount, 'Balance', { allowNegative: true });
@@ -817,6 +863,22 @@ const routes = [
       ? { file: { type: 'text/csv; charset=utf-8', name, body: toCsv(table) } }
       : { file: { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', name, body: toXlsx(table, f.view === 'history' ? 'Transactions' : 'Receipts & payments') } };
   }],
+
+  // delete a receipt or payment, with any money recorded on it (balances change accordingly). Admins only.
+  ['POST', /^\/api\/(receipts|payments)\/(\d+)\/delete$/, 'admin', async ({ user, m }) => withTx(async (c) => {
+    const isIn = m[1] === 'receipts', id = intId(m[2]);
+    const { rows: [x] } = await c.query(isIn
+      ? 'SELECT party AS name, amount, expected_date AS date, ref, NULL AS emi_id FROM receipts WHERE id = $1 FOR UPDATE'
+      : 'SELECT payee AS name, amount, due_date AS date, ref, emi_id FROM payments WHERE id = $1 FOR UPDATE', [id]);
+    if (!x) notFound('That record doesn’t exist (it may already be deleted).');
+    // an EMI's instalments are made from the EMI; a deleted one would only be made again
+    if (x.emi_id != null) bad('This is an EMI instalment, so it can’t be deleted. Cancel it instead, or stop the EMI on EMI Management.');
+    const { rows: gone } = await c.query(`DELETE FROM entries WHERE ${isIn ? 'receipt_id' : 'payment_id'} = $1 RETURNING amount, bank_id, date, ref`, [id]);
+    await c.query(`DELETE FROM ${m[1]} WHERE id = $1`, [id]);
+    await audit(c, user.id, `${m[1].slice(0, -1)}.delete`, { id, [isIn ? 'party' : 'payee']: x.name, amount: Number(x.amount), date: x.date, ref: x.ref,
+      settled: gone.reduce((n, e) => n + Number(e.amount), 0), entries: gone.map((e) => ({ amount: Number(e.amount), bank_id: e.bank_id, date: e.date, ref: e.ref })) });
+    return { deleted: id, settled: gone.reduce((n, e) => n + Number(e.amount), 0) };
+  })],
 
   ['POST', /^\/api\/(receipts|payments)\/(\d+)\/cancel$/, 'editor', async ({ body, user, m }) => withTx(async (c) => {
     const { rowCount } = await c.query(`UPDATE ${m[1]} SET status = 'CANCELLED' WHERE id = $1 AND status = 'OPEN'`, [intId(m[2])]);
