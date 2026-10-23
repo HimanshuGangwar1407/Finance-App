@@ -95,7 +95,7 @@ async function load() {
   try {
     const st = await api('/api/state');
     if (!st.user) { S.user = null; fresh(); return boot(); }
-    S.user = st.user;
+    S.user = st.user; S.ai = Boolean(st.ai);
   } catch { /* offline for a moment: the page itself will say so */ }
   if ((S.view === 'activity' || S.view === 'users') && !can('admin')) S.view = 'position';
   if (S.view === 'reconcile' && !can('editor')) S.view = 'position';
@@ -584,7 +584,12 @@ async function recCheck(file, keepNote = false) {
     if (file) {
       if (file.size > 3 * 1024 * 1024) throw new Error('That file is too big. Upload at most 3 MB.');
       R.sent = { file: await toBase64(file), name: file.name };
-      R.password = ''; R.needPassword = false;
+      R.file = file; R.password = ''; R.needPassword = false; R.aiNote = '';
+      // a photo or screenshot of a statement: only the AI reads those
+      if (/^image\//.test(file.type)) {
+        if (!S.ai) throw new Error('A photo of a statement can only be read with AI reading, which isn’t set up for this app. Upload the PDF, Excel or CSV statement, or paste it.');
+        return await recAi(true);
+      }
     }
     try {
       R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId });
@@ -600,6 +605,22 @@ async function recCheck(file, keepNote = false) {
     R.payee = new Map(); R.left = new Map(); R.saveBalance = false;
   } catch (e) { R.err = e.message; R.data = null; R.progress = ''; if (e.code === 'pdf_password') R.needPassword = true; }
   R.busy = false; renderReconcile();
+}
+// read the chosen file with Claude (any PDF, or a photo): its lines are then checked like any other statement
+async function recAi(busy = false) {
+  const R = S.rec;
+  if (!busy) { R.err = ''; R.note = ''; R.busy = true; }
+  R.progress = 'Claude (AI) is reading the statement — this can take up to a minute…'; renderReconcile();
+  try {
+    const r = await api('/api/reconcile/ai-read', { file: R.sent.file, name: R.sent.name });
+    R.sent = { file: R.sent.file, name: R.sent.name, lines: r.lines };
+    R.aiNote = r.note;
+    R.progress = 'Checking what was read…'; renderReconcile();
+    R.data = await api('/api/reconcile/check', { ...R.sent, bank_id: R.bankId });
+    R.choice = new Map(R.data.debits.filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']));
+    R.payee = new Map(); R.left = new Map(); R.saveBalance = false;
+  } catch (e) { R.err = e.message; R.data = null; }
+  R.progress = ''; R.busy = false; renderReconcile();
 }
 // ── OCR: the words on each page of a picture-only PDF, with where they are (PDF points, y up, as pdf.js gives text) ──
 const loadScript = (src) => new Promise((ok, no) => {
@@ -649,7 +670,13 @@ const CHARGE = /charge|chrg|chgs|commission|\bfee\b|fees|gst|service\s*tax|sms\s
 
 function renderReconcile() {
   const R = S.rec, D = R.data;
-  const fileIn = h('input', { type: 'file', name: 'statement', accept: '.pdf,.xlsx,.csv,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv', onchange: (e) => e.target.files[0] && recCheck(e.target.files[0]) });
+  const fileIn = h('input', { type: 'file', name: 'statement', accept: `.pdf,.xlsx,.csv,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv${S.ai ? ',.png,.jpg,.jpeg,image/png,image/jpeg' : ''}`, onchange: (e) => e.target.files[0] && recCheck(e.target.files[0]) });
+  // AI reading: offered for a PDF or a photo once one is chosen, most of all when OCR couldn't confirm every line
+  const canAi = S.ai && R.file && /pdf|image/.test(R.file.type || (/\.pdf$/i.test(R.file.name) ? 'pdf' : '')) && !R.busy && !D?.ai;
+  const aiOffer = canAi && h('div', { class: `rec-ai ${D?.checked && D.checked.ok < D.checked.of ? 'urge' : ''}` },
+    h('button', { class: 'small primary', onclick: () => recAi() }, D ? '✨ Read it with AI instead' : '✨ Read with AI'),
+    h('span', { class: 'muted small' }, D?.checked && D.checked.ok < D.checked.of ? 'Some lines don’t add up — Claude (AI) may read them better. ' : R.err ? 'Claude (AI) can read PDFs this page can’t, and photos of statements. ' : '',
+      'The statement is sent to Anthropic to be read; the figures are checked against the running balance as usual.'));
   const pwIn = h('input', { type: 'password', name: 'pdfPassword', autocomplete: 'off', placeholder: 'PDF password', 'aria-label': 'PDF password' });
   const pasteIn = h('textarea', { name: 'pasted', rows: '4', placeholder: 'Or paste the statement here: in the bank’s email, select the table (from the column headings to the last line), copy, and paste.', 'aria-label': 'Paste the statement' });
   const step = h('section', { class: 'card rec-step' },
@@ -662,12 +689,19 @@ function renderReconcile() {
     h('p', { class: 'muted small' }, 'It is read for: date, narration / particulars, cheque or reference no., withdrawal (debit) and balance. A PDF saved as a picture (e.g. with “Microsoft Print to PDF”) is read here with OCR, and every line is checked against the running balance. Nothing changes until you press Apply.'),
     R.sent && h('p', { class: 'small' }, 'File: ', h('strong', {}, R.sent.name), D && ` · ${nice(D.from)} – ${nice(D.to)} · ${D.debits.length} payment(s) out${D.credits.count ? `, ${D.credits.count} credit(s) in (not reconciled here)` : ''}`),
     R.busy && h('p', { class: 'muted' }, R.progress || 'Reading the statement…'),
+    D?.ai && h('p', { class: `rec-ocr ${D.checked && D.checked.ok < D.checked.of ? 'warn' : ''}` }, icon(D.checked && D.checked.ok === D.checked.of ? 'check' : 'alert'),
+      h('span', {}, 'Read by AI (Claude). ', D.checked
+        ? (D.checked.ok === D.checked.of ? `The running balance confirms all ${D.checked.of} lines.` : `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below and aren’t matched automatically; check them against the statement.`)
+        : 'The statement has no balance column to check the figures against — compare the amounts with the statement before applying.',
+      R.aiNote ? ` The AI noted: “${R.aiNote}”` : '')),
     D?.ocr && h('p', { class: `rec-ocr ${D.checked && D.checked.ok < D.checked.of ? 'warn' : ''}` }, icon(D.checked && D.checked.ok === D.checked.of ? 'check' : 'alert'),
       h('span', {}, 'Read from a picture of the statement (OCR). ', D.checked
         ? (D.checked.ok === D.checked.of ? `The running balance confirms all ${D.checked.of} lines.` : `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below and aren’t matched automatically; check them against the statement.`)
         : 'The statement has no balance column to check the figures against — compare the amounts with the statement before applying.')),
     D && !D.ocr && D.checked && D.checked.ok < D.checked.of && h('p', { class: 'rec-ocr warn' }, icon('alert'), h('span', {}, `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below.`)),
-    R.err && h('p', { class: 'err', role: 'alert' }, R.err));
+    R.err && h('p', { class: 'err', role: 'alert' }, R.err),
+    aiOffer,
+    !S.ai && can('admin') && h('p', { class: 'muted small' }, 'AI reading (for statements this page can’t read, and photos of statements) is off: add an ANTHROPIC_API_KEY to the app’s settings to turn it on.'));
   if (!R.accounts.length) return app.replaceChildren(topBar(), pageHead('Reconcile with the bank statement', ''), h('div', { class: 'card' }, h('p', { class: 'empty' }, 'Add a bank account first (Banks → “+ Add bank account”).')));
   const parts = [topBar(), pageHead('Reconcile with the bank statement', 'Payments the statement shows are marked paid — only these come off the balance. Payments due but not in the statement are listed so you can decide.'), R.note && h('div', { class: 'card flash', role: 'status' }, icon('check'), h('span', {}, R.note)), step].filter(Boolean);
   if (!D) return app.replaceChildren(...parts);
@@ -1226,7 +1260,7 @@ const ACTION_LABELS = {
   'position.add': 'Added a position', 'position.edit': 'Edited a position', 'position.activate': 'Activated a position', 'position.deactivate': 'Deactivated a position',
   'payment.add': 'Added a payment', 'payment.paid': 'Marked a payment paid', 'payment.approve': 'Approved a payment', 'payment.cancel': 'Cancelled a payment',
   'receipt.add': 'Added a receipt', 'receipt.received': 'Marked a receipt received', 'receipt.cancel': 'Cancelled a receipt',
-  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account', 'bank.delete': 'Deleted a bank account', 'reconcile.apply': 'Reconciled a bank statement', 'payment.reschedule': 'Moved a payment’s due date', 'payment.delete': 'Deleted a payment', 'receipt.delete': 'Deleted a receipt',
+  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account', 'bank.delete': 'Deleted a bank account', 'reconcile.apply': 'Reconciled a bank statement', 'reconcile.ai_read': 'Had a statement read by AI', 'payment.reschedule': 'Moved a payment’s due date', 'payment.delete': 'Deleted a payment', 'receipt.delete': 'Deleted a receipt',
 };
 const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|setup|admin)/.test(a) ? 'c-blue' : /^(person|position|user)/.test(a) ? 'c-violet' : /cancel|deactivate|stop|delete/.test(a) ? 'c-red' : 'c-amber');
 // a short, readable summary of what was recorded
@@ -1235,6 +1269,7 @@ function describe(a, positions) {
   const fmt = (k, v) => (v == null || v === '' ? '—' : k === 'position_id' ? positions.get(v) ?? `#${v}` : /amount/i.test(k) && typeof v === 'number' ? inr(v) : String(v));
   if (a.action === 'emi.reminders') return `${d.reminders ?? 0} due · ${d.inApp ?? 0} in-app · ${d.queued ?? 0} email(s) queued · ${d.sent ?? 0} sent${d.via ? ' · daily schedule' : ''}`;
   if (a.action === 'signup.request') return `${d.email} · ${!d.matched ? 'not in People (nothing sent)' : d.emailed === 'sent' ? `link emailed (${d.role})` : d.emailed === 'not set up' ? 'email not set up: admins notified' : `email ${d.emailed}`}`;
+  if (a.action === 'reconcile.ai_read') return `${d.file || 'statement'} · ${d.lines} line(s) read · ${d.model}`;
   if (a.action === 'reconcile.apply') return [`${d.bank} · ${d.from} to ${d.to}`, d.paid && `${d.paid} paid ${inr(d.paidAmount)}`, d.recorded && `${d.recorded} recorded as new`, d.today && `${d.today} to today`, d.tomorrow && `${d.tomorrow} to next day`, d.cancelled && `${d.cancelled} cancelled`, d.balanceSaved && 'balance saved'].filter(Boolean).join(' · ');
   if (a.action === 'payment.reschedule') return `${d.payee} · ${inr(d.amount)} · ${d.from} → ${d.to}`;
   if (a.action === 'bank.delete') return [`${d.name} (${d.bank} XXXX${d.last4})`, d.entries && `${d.entries} transaction(s) deleted`, d.receivedAmount && `${inr(d.receivedAmount)} in`, d.paidAmount && `${inr(d.paidAmount)} out`, d.emis && `${d.emis} EMI(s)`, d.balances && `${d.balances} balance(s)`, d.nowNotDecided && `${d.nowNotDecided} now “Not decided”`].filter(Boolean).join(' · ');

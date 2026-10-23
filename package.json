@@ -13,6 +13,7 @@
     "create-admin": "node scripts/create-admin.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.1.0",
     "@electric-sql/pglite": "^0.5.10",
     "pdfjs-dist": "^4.10.38",
     "pg": "^8.23.1"

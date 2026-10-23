@@ -16,6 +16,7 @@ import { bankStatements } from './ledger.js';
 import { toCsv, toXlsx } from './export.js';
 import { readTable, importRows, MAX_BYTES } from './sheet.js';
 import { readStatement, matchStatement, lineRef } from './reconcile.js';
+import { readWithAi, tableFromLines, aiConfigured } from './ai.js';
 import { dueReminders, projectDates, coverage, DEFAULT_BEFORE } from './reminders.js';
 import { emailConfigured, sendEmail } from './email.js';
 import * as A from './auth.js';
@@ -482,7 +483,9 @@ async function reconcileCheck(c, body) {
   const isPdf = buf.subarray(0, 5).toString('latin1') === '%PDF-';
   // a picture-only PDF is read in the browser (OCR): its words and their places come with the file
   const pdf = isPdf || body.ocr ? await import('./pdf.js') : null;
-  const st = readStatement(body.ocr ? pdf.tableFromPages(pdf.ocrPages(body.ocr)) : isPdf ? await pdf.readPdf(buf, str(body.password, 100)) : readTable(buf, str(body.name, 200)));
+  // or the lines the AI read from it (POST /api/reconcile/ai-read), sent back with the file
+  const st = readStatement(body.lines ? tableFromLines(body.lines) : body.ocr ? pdf.tableFromPages(pdf.ocrPages(body.ocr))
+    : isPdf ? await pdf.readPdf(buf, str(body.password, 100)) : readTable(buf, str(body.name, 200)));
   if (st.to > todayIST()) bad(`The statement has dates after today (${st.to}). Check that it is the right file.`);
   await syncEmis(c, addDays(todayIST(), HORIZON));
 
@@ -515,7 +518,7 @@ async function reconcileCheck(c, body) {
   const app = bankStatements({ banks: [bank], balances: bal.rows, entries: en.rows, from: st.to, to: st.to }).rows[0];
   const credits = st.rows.filter((r) => r.credit > 0);
   return {
-    bank, fileName: str(body.name, 200), ocr: Boolean(body.ocr), checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
+    bank, fileName: str(body.name, 200), ocr: Boolean(body.ocr) && !body.lines, ai: Boolean(body.lines), checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
     appClosing: app.closing, balanceEntered: app.balanceEntered,
     debits: debits.map((d) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount: d.debit, recorded: d.recorded ?? null, mismatch: d.mismatch ?? null,
       match: byRow.get(d.row)?.match ?? null, candidates: byRow.get(d.row)?.candidates ?? [] })),
@@ -573,7 +576,7 @@ const signIn = (ctx, user) => ctx.headers.push(['Set-Cookie', A.cookieHeader(A.m
 const routes = [
   ['GET', /^\/api\/state$/, null, async ({ user }) => {
     const { rows: [{ n }] } = await q('SELECT count(*)::int AS n FROM users');
-    return { needsSetup: n === 0, user, today: todayIST() };
+    return { needsSetup: n === 0, user, today: todayIST(), ai: aiConfigured() };
   }],
 
   // the first person to open the app creates the admin account
@@ -861,6 +864,17 @@ const routes = [
   })],
 
   ['POST', /^\/api\/reconcile\/check$/, 'editor', async ({ body }) => withTx((c) => reconcileCheck(c, body))],
+
+  // read a statement (any PDF, or a photo of one) with Claude: returns its lines, which then go to check / apply
+  ['POST', /^\/api\/reconcile\/ai-read$/, 'editor', async ({ body, user }) => {
+    const file = String(body.file ?? '');
+    if (!file || !/^[A-Za-z0-9+/=\s]+$/.test(file)) bad('Choose the bank statement file.');
+    const buf = Buffer.from(file, 'base64');
+    if (buf.length > MAX_BYTES) bad('That file is too big. Upload at most 3 MB.');
+    const r = await readWithAi(buf, str(body.name, 200));
+    await log(user.id, 'reconcile.ai_read', { file: r.file, model: r.model, lines: r.table.rows.length - 1, tokens: r.usage });
+    return { lines: r.table.rows.map((x) => x.cells), note: r.note };
+  }],
 
   // apply what was chosen: matched debits are recorded as paid (dated as in the statement); left-out payments are
   // moved to today or tomorrow, or cancelled; debits not in the app can be recorded as new payments
