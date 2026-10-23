@@ -15,6 +15,7 @@ import { emiDates } from './emi.js';
 import { bankStatements } from './ledger.js';
 import { toCsv, toXlsx } from './export.js';
 import { readTable, importRows, MAX_BYTES } from './sheet.js';
+import { readStatement, matchStatement, lineRef } from './reconcile.js';
 import { dueReminders, projectDates, coverage, DEFAULT_BEFORE } from './reminders.js';
 import { emailConfigured, sendEmail } from './email.js';
 import * as A from './auth.js';
@@ -51,7 +52,7 @@ const lastAdmin = async (c, u) => u.role === 'admin' && u.active && Number((awai
 
 // activity log filters: a type is the part of the action before the dot (older entries — people, positions, invites,
 // sign-ups, account.* — keep their own names and stay findable)
-const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user', 'account', 'password', 'access', 'invite', 'signup'], reports: ['report', 'import'] };
+const ACTIVITY_TYPES = { signin: ['login', 'logout', 'setup', 'admin'], people: ['person'], positions: ['position'], payments: ['payment'], receipts: ['receipt'], emis: ['emi'], balances: ['balance'], accounts: ['bank'], users: ['user', 'account', 'password', 'access', 'invite', 'signup'], reports: ['report', 'import', 'reconcile'] };
 const istStart = (d) => new Date(`${d}T00:00:00+05:30`).toISOString();
 
 // makes each active EMI's instalments into payments, up to `through` (once each: a cancelled one stays cancelled)
@@ -153,7 +154,7 @@ async function settle(c, { table, id, body, user }) {
   const amount = body.amount === '' || body.amount == null ? left : toPaise(body.amount, 'Amount', { allowZero: false });
   if (amount > left) bad(`Only ${(left / 100).toFixed(2)} is left on it.`);
   const bankId = await bankExists(c, body.bank_id ? intId(body.bank_id, 'Account') : x.bank_id ?? bad('Choose the account.'));
-  if (!isIn && !x.emi_id) {
+  if (!isIn && !x.emi_id && !body.fromStatement) {
     // money reserved for EMIs (in this app) can't go to anyone else; one payment per account checks at a time
     const today = todayIST();
     await c.query('SELECT pg_advisory_xact_lock(2, $1)', [bankId]);
@@ -164,7 +165,7 @@ async function settle(c, { table, id, body, user }) {
     }
   }
   let overdraft = false;
-  if (!isIn && x.emi_id) {
+  if (!isIn && x.emi_id && !body.fromStatement) {
     // confirming an EMI payment: if the account doesn't have the money, say so and ask before recording it
     const today = todayIST();
     const row = (await position(c, { today, upTo: today })).rows.find((r) => r.id === bankId);
@@ -175,7 +176,7 @@ async function settle(c, { table, id, body, user }) {
   }
   const { rows: [e] } = await c.query(`INSERT INTO entries (kind, ${isIn ? 'receipt_id' : 'payment_id'}, bank_id, amount, date, ref, ref_norm, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
     [isIn ? 'IN' : 'OUT', id, bankId, amount, date, ref, refNorm, user.id]);
-  await audit(c, user.id, isIn ? 'receipt.received' : 'payment.paid', { id, entry: e.id, bankId, amount, date, ref, ...(overdraft ? { overdraft: true } : {}) });
+  await audit(c, user.id, isIn ? 'receipt.received' : 'payment.paid', { id, entry: e.id, bankId, amount, date, ref, ...(overdraft ? { overdraft: true } : {}), ...(body.fromStatement ? { fromStatement: true } : {}) });
   return { id: e.id, left: left - amount };
 }
 
@@ -461,6 +462,64 @@ async function sheetImport(c, body) {
     r.status = r.duplicate ? 'duplicate' : 'ok';
   }
   return { fileName: str(body.name, 200), sheet: table.sheet, ...out }; // not "file": that is a download
+}
+
+// ── reconciling a bank statement: its debits are payments made; payments due but not in it are left out ──
+// Each debit is: already in the app (recorded before, by reference or same amount and date), matched to a payment
+// yet to be paid, or not in the app. Nothing changes until "apply".
+async function reconcileCheck(c, body) {
+  const bankId = intId(body.bank_id, 'Bank account');
+  const { rows: [bank] } = await c.query('SELECT id, name, bank, last4 FROM banks WHERE id = $1', [bankId]);
+  if (!bank) bad('Choose the bank account this statement is for.');
+  const file = String(body.file ?? '');
+  if (!file || !/^[A-Za-z0-9+/=\s]+$/.test(file)) bad('Choose the bank statement file (.xlsx or .csv).');
+  const buf = Buffer.from(file, 'base64');
+  if (buf.length > MAX_BYTES) bad('That file is too big. Upload at most 3 MB.');
+  // a PDF (with text in it), or Excel / CSV / text pasted from the bank's email
+  const isPdf = buf.subarray(0, 5).toString('latin1') === '%PDF-';
+  const st = readStatement(isPdf ? await (await import('./pdf.js')).readPdf(buf, str(body.password, 100)) : readTable(buf, str(body.name, 200)));
+  if (st.to > todayIST()) bad(`The statement has dates after today (${st.to}). Check that it is the right file.`);
+  await syncEmis(c, addDays(todayIST(), HORIZON));
+
+  const taken = new Set(), debits = st.rows.filter((r) => r.debit > 0).map((r) => ({ ...r, bankRef: lineRef(r, taken) }));
+  // recorded before: the same reference on this account, or the same amount within two days (each entry counted once)
+  const { rows: ents } = await c.query("SELECT id, amount, date, ref, ref_norm, payment_id FROM entries WHERE bank_id = $1 AND kind = 'OUT' AND date BETWEEN $2 AND $3 ORDER BY date, id",
+    [bankId, addDays(st.from, -3), addDays(st.to, 3)]);
+  const { rows: refEnts } = await c.query("SELECT ref_norm, payment_id FROM entries WHERE bank_id = $1 AND kind = 'OUT' AND ref_norm = ANY($2::text[])",
+    [bankId, [...new Set(debits.flatMap((d) => [normRef(d.bankRef), normRef(d.ref)]).filter(Boolean))]]);
+  const byRef = new Map(refEnts.map((e) => [e.ref_norm, e])), claimed = new Set();
+  for (const d of debits) {
+    const e = byRef.get(normRef(d.bankRef)) ?? (d.ref && byRef.get(normRef(d.ref)));
+    if (e) { d.recorded = { payment_id: e.payment_id, by: 'reference' }; const x = ents.find((y) => y.ref_norm === e.ref_norm); if (x) claimed.add(x.id); }
+  }
+  for (const d of debits.filter((x) => !x.recorded)) {
+    const e = ents.find((y) => !claimed.has(y.id) && Number(y.amount) === d.debit && Math.abs(Date.parse(y.date) - Date.parse(d.date)) <= 2 * 864e5);
+    if (e) { claimed.add(e.id); d.recorded = { payment_id: e.payment_id, by: 'amount and date', ref: e.ref, date: e.date }; }
+  }
+
+  // payments yet to be paid (or partly paid), with what is left on each
+  const { rows: pays } = await c.query(`SELECT p.id, p.payee AS name, p.ref, p.category, p.note, p.due_date, p.bank_id, p.emi_id IS NOT NULL AS emi, b.name AS bank_name,
+      (p.amount - coalesce((SELECT sum(e.amount) FROM entries e WHERE e.payment_id = p.id), 0))::bigint AS outstanding, p.amount
+    FROM payments p LEFT JOIN banks b ON b.id = p.bank_id WHERE p.status = 'OPEN' ORDER BY p.due_date, p.id`);
+  const payments = pays.map((p) => ({ ...p, outstanding: Number(p.outstanding), amount: Number(p.amount) })).filter((p) => p.outstanding > 0);
+  const lines = matchStatement(debits.filter((d) => !d.recorded), payments, bankId);
+  const byRow = new Map(lines.map((l) => [l.row, l]));
+
+  // the app's balance for this account at the statement's last date, before reconciling
+  const [bal, en] = [await c.query('SELECT id, bank_id, amount, as_of FROM balances WHERE bank_id = $1', [bankId]), await c.query('SELECT kind, bank_id, amount, date FROM entries WHERE bank_id = $1', [bankId])];
+  const app = bankStatements({ banks: [bank], balances: bal.rows, entries: en.rows, from: st.to, to: st.to }).rows[0];
+  const credits = st.rows.filter((r) => r.credit > 0);
+  return {
+    bank, fileName: str(body.name, 200), from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
+    appClosing: app.closing, balanceEntered: app.balanceEntered,
+    debits: debits.map((d) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount: d.debit, recorded: d.recorded ?? null,
+      match: byRow.get(d.row)?.match ?? null, candidates: byRow.get(d.row)?.candidates ?? [] })),
+    credits: { count: credits.length, amount: credits.reduce((n, r) => n + r.credit, 0) },
+    payments,
+    // the ones due by the statement's last date, for this account or not decided: if not matched, they are left out
+    due: payments.filter((p) => p.due_date <= st.to && (p.bank_id === bankId || p.bank_id == null)).map((p) => p.id),
+    today: todayIST(),
+  };
 }
 
 // ── deleting a bank account: what goes with it ──
@@ -796,6 +855,66 @@ const routes = [
     return result;
   })],
 
+  ['POST', /^\/api\/reconcile\/check$/, 'editor', async ({ body }) => withTx((c) => reconcileCheck(c, body))],
+
+  // apply what was chosen: matched debits are recorded as paid (dated as in the statement); left-out payments are
+  // moved to today or tomorrow, or cancelled; debits not in the app can be recorded as new payments
+  ['POST', /^\/api\/reconcile\/apply$/, 'editor', async ({ body, user }) => withTx(async (c) => {
+    const x = await reconcileCheck(c, body), bankId = x.bank.id, today = todayIST();
+    const lines = new Map(x.debits.map((d) => [d.row, d])), pays = new Map(x.payments.map((p) => [p.id, p]));
+    const rows = new Set(), paid = new Set(), out = { paid: 0, paidAmount: 0, recorded: 0, recordedAmount: 0, today: 0, tomorrow: 0, cancelled: 0, balanceSaved: false };
+    const useLine = (row) => {
+      const l = lines.get(Number(row));
+      if (!l) bad(`Statement row ${row} isn’t a payment out.`);
+      if (l.recorded) bad(`Statement row ${row} is already in the app.`);
+      if (rows.has(l.row)) bad(`Statement row ${row} is used twice.`);
+      rows.add(l.row);
+      return l;
+    };
+    for (const m of [].concat(body.matches ?? [])) {
+      const l = useLine(m.row), p = pays.get(Number(m.id));
+      if (!p) bad(`Payment P-${m.id} isn’t waiting to be paid any more.`);
+      if (paid.has(p.id)) bad(`${p.name} is matched to two statement rows.`);
+      if (l.amount > p.outstanding) bad(`${p.name}: the statement shows ${inr(l.amount)}, more than the ${inr(p.outstanding)} left to pay.`);
+      paid.add(p.id);
+      await settle(c, { table: 'payments', id: p.id, body: { bank_id: bankId, date: l.date, ref: l.bankRef, amount: (l.amount / 100).toFixed(2), fromStatement: true }, user });
+      out.paid++; out.paidAmount += l.amount;
+    }
+    for (const r of [].concat(body.record ?? [])) {
+      const l = useLine(r.row);
+      const p = await addPayment(c, { payee: str(r.payee, 120) || l.narration.slice(0, 120) || 'Bank debit', category: r.category || 'Other', amount: (l.amount / 100).toFixed(2), due_date: l.date,
+        bank_id: bankId, note: str(`From the bank statement: ${l.narration}`, 300), approved: true, confirmDuplicate: true }, user);
+      await settle(c, { table: 'payments', id: p.id, body: { bank_id: bankId, date: l.date, ref: l.bankRef, fromStatement: true }, user });
+      out.recorded++; out.recordedAmount += l.amount;
+    }
+    for (const a of [].concat(body.leftOut ?? [])) {
+      const action = oneOf(a.action, ['today', 'tomorrow', 'cancel'], 'Left out'), p = pays.get(Number(a.id));
+      if (!p) bad(`Payment P-${a.id} isn’t waiting to be paid any more.`);
+      if (paid.has(p.id)) bad(`${p.name} is both matched and left out.`);
+      if (action === 'cancel') {
+        await c.query("UPDATE payments SET status = 'CANCELLED' WHERE id = $1 AND status = 'OPEN'", [p.id]);
+        await audit(c, user.id, 'payment.cancel', { id: p.id, payee: p.name, reason: 'Not in the bank statement (reconciliation)' });
+        out.cancelled++;
+      } else {
+        // an EMI's instalment keeps its date (the EMI would make it again); it can be paid or cancelled
+        if (p.emi) bad(`${p.name} is an EMI instalment: it keeps its due date. Mark it paid, or cancel it.`);
+        const date = action === 'today' ? today : addDays(today, 1);
+        await c.query('UPDATE payments SET due_date = $2 WHERE id = $1', [p.id, date]);
+        await audit(c, user.id, 'payment.reschedule', { id: p.id, payee: p.name, amount: p.outstanding, from: p.due_date, to: date, reason: 'Not in the bank statement (reconciliation)' });
+        out[action]++;
+      }
+    }
+    if (body.saveBalance === true) {
+      if (!x.closing) bad('This statement has no balance column, so there is no closing balance to save.');
+      await c.query('INSERT INTO balances (bank_id, amount, as_of, note, created_by) VALUES ($1, $2, $3, $4, $5)', [bankId, x.closing.amount, x.closing.date, 'From the bank statement', user.id]);
+      await audit(c, user.id, 'balance.add', { bankId, amount: x.closing.amount, asOf: x.closing.date, fromStatement: true });
+      out.balanceSaved = true;
+    }
+    if (!out.paid && !out.recorded && !out.today && !out.tomorrow && !out.cancelled && !out.balanceSaved) bad('Nothing chosen to apply.');
+    await audit(c, user.id, 'reconcile.apply', { bank: x.bank.name, bankId, file: x.fileName, from: x.from, to: x.to, ...out });
+    return out;
+  })],
+
   // a sample sheet with the headings the upload understands
   ['GET', /^\/api\/import\/sample$/, 'viewer', async () => ({ file: {
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', name: 'receipts-payments-upload-sample.xlsx',
@@ -1039,7 +1158,7 @@ export async function handler(req, res) {
       // the cookie is SameSite=Lax and writes need a JSON body; refusing other origins closes the rest of CSRF
       const origin = req.headers.origin;
       if (origin && new URL(origin).host !== req.headers.host) deny('Requests from other sites are refused.');
-      ctx.body = await readJson(req, url.pathname.startsWith('/api/import/') ? 4_400_000 : 32768);
+      ctx.body = await readJson(req, ['/api/import/', '/api/reconcile/'].some((p) => url.pathname.startsWith(p)) ? 4_400_000 : 32768);
     }
     await ensureSchema();
     ctx.user = await currentUser(req);

@@ -184,5 +184,6 @@ test('bad uploads: no file, not base64, too big, and the sample sheet reads back
   const sample = await viewer('/api/import/sample');
   assert.equal(sample.status, 200);
   const r = (await upload(editor, {}, sample.body)).body;
-  assert.deepEqual(r.rows.map((x) => [x.kind, x.name, x.status]), [['OUT', 'Steel Co', 'ok'], ['OUT', 'Office rent', 'ok'], ['IN', 'Mehta Retail', 'ok']]);
+  // every sample row reads without a problem ("duplicate" is possible: on some days a row added above has the same date)
+  assert.deepEqual(r.rows.map((x) => [x.kind, x.name, x.problems.length]), [['OUT', 'Steel Co', 0], ['OUT', 'Office rent', 0], ['IN', 'Mehta Retail', 0]]);
 });

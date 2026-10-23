@@ -4,7 +4,7 @@
 const app = document.getElementById('app'), dlg = document.getElementById('dlg');
 const S = { user: null, today: '', date: '', approvedOnly: false, uncertain: true, pos: null };
 // what one signed-in person was looking at; cleared on sign-out so the next person starts fresh
-const fresh = () => Object.assign(S, { bday: null, view: 'position', af: {}, act: null, tf: null, ef: null, dash: null, notes: null, notesAt: 0, approvedOnly: false, uncertain: true });
+const fresh = () => Object.assign(S, { rec: null, bday: null, view: 'position', af: {}, act: null, tf: null, ef: null, dash: null, notes: null, notesAt: 0, approvedOnly: false, uncertain: true });
 fresh();
 
 function h(tag, attrs, ...kids) {
@@ -98,7 +98,8 @@ async function load() {
     S.user = st.user;
   } catch { /* offline for a moment: the page itself will say so */ }
   if ((S.view === 'activity' || S.view === 'users') && !can('admin')) S.view = 'position';
-  try { await ({ position: loadPosition, banks: loadBanks, transactions: loadTransactions, emis: loadEmis, users: loadUsers, activity: loadActivity })[S.view](); }
+  if (S.view === 'reconcile' && !can('editor')) S.view = 'position';
+  try { await ({ position: loadPosition, banks: loadBanks, transactions: loadTransactions, emis: loadEmis, reconcile: loadReconcile, users: loadUsers, activity: loadActivity })[S.view](); }
   catch (e) { if (S.user) app.replaceChildren(topBar(), h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again'))); }
 }
 
@@ -130,7 +131,7 @@ function go(key) {
 function topBar() {
   document.body.classList.add('has-shell');
   const items = [['position', 'Dashboard', 'home'], ['banks', 'Banks', 'bank'], ['transactions:records', 'Receipts & Payments', 'swap'], ['transactions:history', 'Transaction History', 'list'],
-    ['emis', 'EMI Management', 'calendar'], can('admin') && ['users', 'Users', 'users'], can('admin') && ['activity', 'Activity Log', 'shield']].filter(Boolean);
+    can('editor') && ['reconcile', 'Reconcile statement', 'check'], ['emis', 'EMI Management', 'calendar'], can('admin') && ['users', 'Users', 'users'], can('admin') && ['activity', 'Activity Log', 'shield']].filter(Boolean);
   const unread = S.notes?.unread ?? 0;
   if (Date.now() - S.notesAt > 60000) refreshNotes();
   return h('div', { class: 'chrome' },
@@ -562,6 +563,165 @@ function uploadDialog(kind = 'OUT') {
     result, err,
     h('div', { class: 'bar' }, addBtn, h('button', { type: 'button', onclick: () => dlg.close() }, 'Cancel')));
   dlg.showModal();
+}
+
+// ── Reconcile: the bank's statement against the payments yet to be paid ──
+// Debits in the statement that match a payment are marked paid (only these come off the balance); payments due
+// but not in the statement are "left out": paying today, next day, or cancelled.
+async function loadReconcile() {
+  const sum = await api('/api/transactions/summary');
+  S.rec ??= { bankId: sum.accounts[0] ? String(sum.accounts[0].id) : '', data: null, sent: null, choice: new Map(), payee: new Map(), left: new Map(), saveBalance: false, err: '', busy: false };
+  S.rec.accounts = sum.accounts;
+  renderReconcile();
+}
+const payLabel = (p) => `P-${p.id} · ${p.name} · due ${nice(p.due_date)} · ${inr(p.outstanding)}${p.outstanding < p.amount ? ' left' : ''}${p.bank_name ? '' : ' · bank not decided'}`;
+const HOW = { ref: ['bill / ref. no. in narration', 'c-green'], name: ['name in narration', 'c-green'], amount: ['amount only — check', 'c-amber'] };
+
+async function recCheck(file, keepNote = false) {
+  const R = S.rec;
+  R.err = ''; R.busy = true; if (!keepNote) R.note = ''; renderReconcile();
+  try {
+    if (file) {
+      if (file.size > 3 * 1024 * 1024) throw new Error('That file is too big. Upload at most 3 MB.');
+      R.sent = { file: await toBase64(file), name: file.name };
+      R.password = ''; R.needPassword = false;
+    }
+    R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId });
+    R.needPassword = false;
+    R.choice = new Map(R.data.debits.filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']));
+    R.payee = new Map(); R.left = new Map(); R.saveBalance = false;
+  } catch (e) { R.err = e.message; R.data = null; if (e.code === 'pdf_password') R.needPassword = true; }
+  R.busy = false; renderReconcile();
+}
+// bank charges, fees and the GST on them: recorded together with one button
+const CHARGE = /charge|chrg|chgs|commission|\bfee\b|fees|gst|service\s*tax|sms\s*alert|min(imum)?\s*bal/i;
+
+function renderReconcile() {
+  const R = S.rec, D = R.data;
+  const fileIn = h('input', { type: 'file', name: 'statement', accept: '.pdf,.xlsx,.csv,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv', onchange: (e) => e.target.files[0] && recCheck(e.target.files[0]) });
+  const pwIn = h('input', { type: 'password', name: 'pdfPassword', autocomplete: 'off', placeholder: 'PDF password', 'aria-label': 'PDF password' });
+  const pasteIn = h('textarea', { name: 'pasted', rows: '4', placeholder: 'Or paste the statement here: in the bank’s email, select the table (from the column headings to the last line), copy, and paste.', 'aria-label': 'Paste the statement' });
+  const step = h('section', { class: 'card rec-step' },
+    h('div', { class: 'bar grow' },
+      h('label', {}, h('span', {}, 'Bank account'), h('select', { name: 'bank', onchange: (e) => { R.bankId = e.target.value; if (R.sent) recCheck(); } },
+        R.accounts.map((b) => h('option', { value: String(b.id), selected: String(b.id) === R.bankId }, `${b.name} — ${b.bank} XXXX${b.last4}`)))),
+      h('label', {}, h('span', {}, 'Bank statement (PDF, Excel or CSV)'), fileIn)),
+    R.needPassword && h('div', { class: 'bar' }, pwIn, h('button', { class: 'small primary', onclick: () => { R.password = pwIn.value; recCheck(null, true); } }, 'Open PDF')),
+    h('div', { class: 'rec-paste' }, pasteIn, h('button', { class: 'small', onclick: () => { const t = pasteIn.value.trim(); if (t) recCheck(new File([t], 'pasted statement.txt', { type: 'text/plain' })); } }, 'Read pasted statement')),
+    h('p', { class: 'muted small' }, 'It is read for: date, narration / particulars, cheque or reference no., withdrawal (debit) and balance. A PDF must have text in it — one saved with “Microsoft Print to PDF” is only a picture: paste the email’s table instead, or use Chrome’s “Save as PDF”. Nothing changes until you press Apply.'),
+    R.sent && h('p', { class: 'small' }, 'File: ', h('strong', {}, R.sent.name), D && ` · ${nice(D.from)} – ${nice(D.to)} · ${D.debits.length} payment(s) out${D.credits.count ? `, ${D.credits.count} credit(s) in (not reconciled here)` : ''}`),
+    R.busy && h('p', { class: 'muted' }, 'Reading the statement…'),
+    R.err && h('p', { class: 'err', role: 'alert' }, R.err));
+  if (!R.accounts.length) return app.replaceChildren(topBar(), pageHead('Reconcile with the bank statement', ''), h('div', { class: 'card' }, h('p', { class: 'empty' }, 'Add a bank account first (Banks → “+ Add bank account”).')));
+  const parts = [topBar(), pageHead('Reconcile with the bank statement', 'Payments the statement shows are marked paid — only these come off the balance. Payments due but not in the statement are listed so you can decide.'), R.note && h('div', { class: 'card flash', role: 'status' }, icon('check'), h('span', {}, R.note)), step].filter(Boolean);
+  if (!D) return app.replaceChildren(...parts);
+
+  const pays = new Map(D.payments.map((p) => [String(p.id), p]));
+  const open = D.debits.filter((d) => !d.recorded), done = D.debits.filter((d) => d.recorded);
+  const chosen = new Map([...R.choice].filter(([, v]) => v && v !== 'rec').map(([row, id]) => [id, row]));
+  const matched = open.filter((d) => pays.has(R.choice.get(d.row))), notIn = open.filter((d) => !pays.has(R.choice.get(d.row)));
+  const recRows = notIn.filter((d) => R.choice.get(d.row) === 'rec');
+  const leftOut = D.due.map((id) => pays.get(String(id))).filter((p) => !chosen.has(String(p.id)));
+  const total = (xs, k = 'amount') => xs.reduce((n, x) => n + x[k], 0);
+  const paidAmt = total(matched) + total(recRows);
+  const rerender = () => keepFocus(renderReconcile);
+
+  const lineCell = (d) => h('td', {}, h('div', {}, d.narration || '—'), h('div', { class: 'muted small' }, [d.ref && `Ref. ${d.ref}`, `row ${d.row}`].filter(Boolean).join(' · ')));
+  const select = (d) => {
+    const ids = [...new Set([d.match?.id, ...d.candidates].filter(Boolean).map(String))];
+    return h('select', { 'aria-label': `Payment for statement row ${d.row}`, onchange: (e) => { R.choice.set(d.row, e.target.value); rerender(); } },
+      h('option', { value: '' }, ids.length ? 'Not in the app' : 'Not in the app (no payment of this amount)'),
+      ids.map((id) => pays.get(id)).filter(Boolean).map((p) => h('option', { value: String(p.id), selected: R.choice.get(d.row) === String(p.id), disabled: chosen.has(String(p.id)) && chosen.get(String(p.id)) !== d.row }, payLabel(p))),
+      h('option', { value: 'rec', selected: R.choice.get(d.row) === 'rec' }, '+ Record it as a new payment'));
+  };
+  const howChip = (d) => {
+    const id = R.choice.get(d.row), p = pays.get(id);
+    if (!p) return null;
+    const auto = d.match && String(d.match.id) === id ? HOW[d.match.how] : ['chosen by you', 'c-blue'];
+    return h('div', { class: 'chips' }, h('span', { class: `chip ${auto[1]}` }, auto[0]), d.amount < p.outstanding && h('span', { class: 'chip c-blue' }, `part: ${inr(p.outstanding - d.amount)} stays to pay`));
+  };
+
+  const matchedSec = h('section', { class: 'card' },
+    h('h2', {}, h('span', { class: 'dot d-green' }), `Paid — found in the statement (${matched.length})`),
+    h('p', { class: 'muted small' }, 'These are marked paid on the statement date and come off the balance. Check the ones matched on amount only; change or clear the payment if it is wrong.'),
+    matched.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Statement narration'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Payment in the app'))),
+      h('tbody', {}, matched.map((d) => h('tr', {}, h('td', { class: 'nowrap' }, nice(d.date)), lineCell(d), h('td', { class: 'num' }, money(-d.amount)), h('td', {}, select(d), howChip(d))))),
+      h('tfoot', {}, h('tr', {}, h('td', { colspan: '2' }, 'Total marked paid'), h('td', { class: 'num' }, money(-total(matched))), h('td', {})))))
+      : h('p', { class: 'empty' }, 'No statement debit matches a payment yet to be paid.'));
+
+  const leftSec = h('section', { class: 'card' },
+    h('h2', {}, h('span', { class: 'dot d-amber' }), `Left out — due by ${nice(D.to)}, not in the statement (${leftOut.length})`),
+    h('p', { class: 'muted small' }, `Payments for ${D.bank.name} (or with no bank decided) that were due by the statement’s last day but aren’t in it. They stay yet to be paid until you decide.`),
+    leftOut.length > 0 && h('div', { class: 'bar' }, h('span', { class: 'muted small' }, 'Set all:'),
+      [['today', 'Paying today'], ['tomorrow', 'Next day'], ['cancel', 'Cancelled'], ['', 'Decide later']].map(([v, t]) =>
+        h('button', { class: 'small', onclick: () => { for (const p of leftOut) if (v === '' || v === 'cancel' || !p.emi) R.left.set(p.id, v); rerender(); } }, t))),
+    leftOut.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, 'Pay to'), h('th', {}, 'Due'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'What happens'))),
+      h('tbody', {}, leftOut.map((p) => h('tr', {},
+        h('td', { class: 'nowrap tx-id' }, `P-${p.id}`),
+        h('td', {}, h('strong', {}, p.name), h('div', { class: 'muted small' }, [p.ref, p.emi ? 'EMI' : p.category, p.bank_name ?? 'bank not decided'].filter(Boolean).join(' · '))),
+        h('td', { class: 'nowrap' }, nice(p.due_date)),
+        h('td', { class: 'num' }, money(p.outstanding)),
+        h('td', {}, h('select', { 'aria-label': `What happens to P-${p.id}`, class: `left-${R.left.get(p.id) || 'none'}`, onchange: (e) => { R.left.set(p.id, e.target.value); rerender(); } },
+          [['', 'Decide later'], ['today', 'Paying today'], ['tomorrow', 'Next day'], ['cancel', 'Cancelled']].map(([v, t]) =>
+            h('option', { value: v, selected: (R.left.get(p.id) || '') === v, disabled: p.emi && (v === 'today' || v === 'tomorrow') }, t))),
+          p.emi && h('div', { class: 'muted small' }, 'EMI: keeps its date'))))),
+      h('tfoot', {}, h('tr', {}, h('td', { colspan: '3' }, 'Total left out'), h('td', { class: 'num' }, money(total(leftOut, 'outstanding'))), h('td', {})))))
+      : h('p', { class: 'empty' }, 'Nothing left out: every payment due was in the statement.'));
+
+  const notInSec = notIn.length > 0 && h('section', { class: 'card' },
+    h('h2', {}, h('span', { class: 'dot d-blue' }), `In the statement, not in the app (${notIn.length})`),
+    h('p', { class: 'muted small' }, 'Money that left the account but matches no payment here (e.g. bank charges, or a payment not in the sheet). Match it to a payment, record it as a new one, or leave it.'),
+    (() => {
+      const ch = notIn.filter((d) => CHARGE.test(d.narration) && R.choice.get(d.row) !== 'rec');
+      return ch.length > 0 && h('div', { class: 'bar' }, h('button', { class: 'small', onclick: () => { for (const d of ch) { R.choice.set(d.row, 'rec'); R.payee.set(d.row, 'Bank charges'); } rerender(); } },
+        `Record the ${ch.length} bank charge${ch.length === 1 ? '' : 's'} (${inr(total(ch))}) as payments`));
+    })(),
+    h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Statement narration'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Payment in the app'))),
+      h('tbody', {}, notIn.map((d) => h('tr', {}, h('td', { class: 'nowrap' }, nice(d.date)), lineCell(d), h('td', { class: 'num' }, money(-d.amount)),
+        h('td', {}, select(d), R.choice.get(d.row) === 'rec' && h('input', { name: `payee-${d.row}`, 'aria-label': 'Pay to', placeholder: 'Pay to', value: R.payee.get(d.row) ?? d.narration.slice(0, 60), oninput: (e) => R.payee.set(d.row, e.target.value) }))))))));
+
+  const doneSec = done.length > 0 && h('details', { class: 'card' }, h('summary', {}, `Already in the app (${done.length}) — recorded before, not counted again`),
+    h('ul', { class: 'day-moves' }, done.map((d) => h('li', {}, h('span', {}, nice(d.date), ' · ', d.narration || d.ref, h('span', { class: 'muted small' }, ` · matched by ${d.recorded.by}`)), money(-d.amount)))));
+
+  const after = D.appClosing - paidAmt;
+  const balSec = h('section', { class: 'card rec-balance' },
+    h('div', { class: 'bc-line' }, h('span', {}, `${D.bank.name} in the app on ${nice(D.to)}, now`), money(D.appClosing)),
+    h('div', { class: 'bc-line' }, h('span', {}, '− Marked paid from this statement'), money(-paidAmt, 'red')),
+    h('div', { class: 'bc-line total' }, h('span', {}, '= In the app after applying'), money(after)),
+    D.closing && h('div', { class: 'bc-line' }, h('span', {}, `Statement closing balance (${nice(D.closing.date)})`), money(D.closing.amount)),
+    D.closing && after !== D.closing.amount && h('p', { class: 'muted small' }, `Difference ${inr(D.closing.amount - after)}: money in the statement not in the app (credits, unmatched debits), or a balance not entered.`),
+    D.closing && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'saveBalance', checked: R.saveBalance, onchange: (e) => { R.saveBalance = e.target.checked; rerender(); } }),
+      `Also save ${inr(D.closing.amount)} as ${D.bank.name}’s balance at the end of ${nice(D.closing.date)} (the app then matches the bank exactly)`));
+
+  const n = (v) => [...R.left.values()].filter((x) => x === v).length;
+  const summary = [matched.length && `${matched.length} marked paid (${inr(total(matched))})`, recRows.length && `${recRows.length} recorded as new`,
+    n('today') && `${n('today')} paying today`, n('tomorrow') && `${n('tomorrow')} next day`, n('cancel') && `${n('cancel')} cancelled`, R.saveBalance && 'balance saved'].filter(Boolean);
+  const applyBtn = h('button', { class: 'primary', disabled: !summary.length || R.busy, onclick: async () => {
+    if (!confirm(`Apply to ${D.bank.name}?\n\n${summary.join('\n')}`)) return;
+    R.busy = true; renderReconcile();
+    try {
+      const r = await api('/api/reconcile/apply', { ...R.sent, password: R.password, bank_id: R.bankId, saveBalance: R.saveBalance,
+        matches: matched.map((d) => ({ row: d.row, id: Number(R.choice.get(d.row)) })),
+        record: recRows.map((d) => ({ row: d.row, payee: R.payee.get(d.row) ?? d.narration.slice(0, 60) })),
+        leftOut: [...R.left].filter(([id, v]) => v && leftOut.some((p) => p.id === id)).map(([id, action]) => ({ id, action })) });
+      R.note = [`Reconciled ${D.bank.name}:`, r.paid && `${r.paid} payment(s) marked paid (${inr(r.paidAmount)})`, r.recorded && `${r.recorded} recorded as new (${inr(r.recordedAmount)})`,
+        r.today && `${r.today} moved to today`, r.tomorrow && `${r.tomorrow} moved to tomorrow`, r.cancelled && `${r.cancelled} cancelled`, r.balanceSaved && 'statement balance saved'].filter(Boolean).join(' ');
+      R.busy = false;
+      await recCheck(null, true); // the same statement again: what was just applied now shows as already in the app
+    } catch (e) { R.busy = false; R.err = e.message; renderReconcile(); }
+  } }, summary.length ? `Apply: ${summary.join(' · ')}` : 'Nothing to apply yet');
+
+  app.replaceChildren(...parts,
+    h('div', { class: 'tiles rec-tiles' },
+      h('div', { class: 'tile t-pay' }, h('div', { class: 'tile-lbl' }, 'Paid — in the statement'), h('div', { class: 'tile-amt' }, inr(total(matched))), h('div', { class: 'tile-sub' }, `${matched.length} payment(s) matched`)),
+      h('div', { class: 'tile t-bal' }, h('div', { class: 'tile-lbl' }, 'Left out'), h('div', { class: 'tile-amt' }, inr(total(leftOut, 'outstanding'))), h('div', { class: 'tile-sub' }, `${leftOut.length} payment(s) not in the statement`)),
+      h('div', { class: 'tile t-fin' }, h('div', { class: 'tile-lbl' }, 'Not in the app'), h('div', { class: 'tile-amt' }, inr(total(notIn))), h('div', { class: 'tile-sub' }, `${notIn.length} statement debit(s)`)),
+      h('div', { class: 'tile' }, h('div', { class: 'tile-lbl' }, 'Already in the app'), h('div', { class: 'tile-amt' }, inr(total(done))), h('div', { class: 'tile-sub' }, `${done.length} recorded before`))),
+    matchedSec, leftSec, ...[notInSec, doneSec].filter(Boolean), balSec,
+    h('div', { class: 'card rec-apply' }, applyBtn, h('p', { class: 'muted small' }, 'Only what is listed on the button changes. It is recorded in the Activity Log.')));
 }
 
 const txDesc = (r) => r.note || (r.emi ? 'EMI' : r.category) || '';
@@ -1009,7 +1169,7 @@ const ACTION_LABELS = {
   'position.add': 'Added a position', 'position.edit': 'Edited a position', 'position.activate': 'Activated a position', 'position.deactivate': 'Deactivated a position',
   'payment.add': 'Added a payment', 'payment.paid': 'Marked a payment paid', 'payment.approve': 'Approved a payment', 'payment.cancel': 'Cancelled a payment',
   'receipt.add': 'Added a receipt', 'receipt.received': 'Marked a receipt received', 'receipt.cancel': 'Cancelled a receipt',
-  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account', 'bank.delete': 'Deleted a bank account', 'payment.delete': 'Deleted a payment', 'receipt.delete': 'Deleted a receipt',
+  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account', 'bank.delete': 'Deleted a bank account', 'reconcile.apply': 'Reconciled a bank statement', 'payment.reschedule': 'Moved a payment’s due date', 'payment.delete': 'Deleted a payment', 'receipt.delete': 'Deleted a receipt',
 };
 const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|setup|admin)/.test(a) ? 'c-blue' : /^(person|position|user)/.test(a) ? 'c-violet' : /cancel|deactivate|stop|delete/.test(a) ? 'c-red' : 'c-amber');
 // a short, readable summary of what was recorded
@@ -1018,6 +1178,8 @@ function describe(a, positions) {
   const fmt = (k, v) => (v == null || v === '' ? '—' : k === 'position_id' ? positions.get(v) ?? `#${v}` : /amount/i.test(k) && typeof v === 'number' ? inr(v) : String(v));
   if (a.action === 'emi.reminders') return `${d.reminders ?? 0} due · ${d.inApp ?? 0} in-app · ${d.queued ?? 0} email(s) queued · ${d.sent ?? 0} sent${d.via ? ' · daily schedule' : ''}`;
   if (a.action === 'signup.request') return `${d.email} · ${!d.matched ? 'not in People (nothing sent)' : d.emailed === 'sent' ? `link emailed (${d.role})` : d.emailed === 'not set up' ? 'email not set up: admins notified' : `email ${d.emailed}`}`;
+  if (a.action === 'reconcile.apply') return [`${d.bank} · ${d.from} to ${d.to}`, d.paid && `${d.paid} paid ${inr(d.paidAmount)}`, d.recorded && `${d.recorded} recorded as new`, d.today && `${d.today} to today`, d.tomorrow && `${d.tomorrow} to next day`, d.cancelled && `${d.cancelled} cancelled`, d.balanceSaved && 'balance saved'].filter(Boolean).join(' · ');
+  if (a.action === 'payment.reschedule') return `${d.payee} · ${inr(d.amount)} · ${d.from} → ${d.to}`;
   if (a.action === 'bank.delete') return [`${d.name} (${d.bank} XXXX${d.last4})`, d.entries && `${d.entries} transaction(s) deleted`, d.receivedAmount && `${inr(d.receivedAmount)} in`, d.paidAmount && `${inr(d.paidAmount)} out`, d.emis && `${d.emis} EMI(s)`, d.balances && `${d.balances} balance(s)`, d.nowNotDecided && `${d.nowNotDecided} now “Not decided”`].filter(Boolean).join(' · ');
   if (a.action === 'payment.delete' || a.action === 'receipt.delete') return [d.payee || d.party, inr(d.amount), d.date, d.ref, d.settled && `incl. ${inr(d.settled)} ${a.action === 'payment.delete' ? 'paid' : 'received'}`].filter(Boolean).join(' · ');
   if (a.action === 'import.add') return `${d.file || 'sheet'} · ${d.added} added (${d.payments} to pay${d.paymentAmount ? ` ${inr(d.paymentAmount)}` : ''}, ${d.receipts} to receive${d.receiptAmount ? ` ${inr(d.receiptAmount)}` : ''})${d.skipped ? ` · ${d.skipped} skipped` : ''}`;
