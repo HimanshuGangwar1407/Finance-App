@@ -87,8 +87,10 @@ function readXlsx(buf) {
 // CSV: comma, semicolon or tab separated; "quoted, fields" and "" inside quotes
 function readCsv(text) {
   text = text.replace(/^\uFEFF/, '');
-  const first = text.split(/\r?\n/, 1)[0];
-  const sep = [',', ';', '\t'].map((s) => [s, first.split(s).length]).sort((a, b) => b[1] - a[1])[0][0];
+  // the separator used most in the first lines (pasted text can start with a few lines of account details)
+  const head = text.split(/\r?\n/, 30).join('\n');
+  // a table copied from a web page or email is tab-separated (its amounts are full of commas: 21,84,089.85)
+  const sep = head.includes('\t') ? '\t' : [',', ';'].map((s) => [s, head.split(s).length]).sort((a, b) => b[1] - a[1])[0][0];
   const rows = [];
   let row = [], cell = '', quoted = false, n = 1;
   const push = () => { row.push(cell.trim()); cell = ''; };

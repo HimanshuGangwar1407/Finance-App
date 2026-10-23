@@ -1,0 +1,161 @@
+// Bank statement reconciliation: read a statement (the same .xlsx / .csv reader as the upload) and match its debits
+// to payments yet to be paid. Pure functions; the routes in index.js do the database work.
+import { parseDate } from './sheet.js';
+import { toPaise, str, normRef } from './money.js';
+
+const bad = (message) => { throw Object.assign(new Error(message), { status: 400, code: 'invalid_argument' }); };
+const norm = (v) => String(v ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+// statement columns, by heading (first match wins); banks name them differently
+const COLUMNS = {
+  date: ['txndate', 'transactiondate', 'trandate', 'date', 'postdate', 'postingdate', 'valuedate', 'valuedt', 'dt'],
+  narration: ['narration', 'description', 'particulars', 'transactiondetails', 'transactionremarks', 'transactiondescription', 'details', 'remarks', 'transactionparticulars'],
+  ref: ['chqrefno', 'chequerefno', 'refnochequeno', 'chqno', 'chequeno', 'chequenumber', 'refno', 'referenceno', 'reference', 'utrno', 'utr', 'transactionid', 'tranid', 'refchqno'],
+  debit: ['withdrawalamt', 'withdrawalamtinr', 'withdrawalamountinr', 'withdrawalamount', 'withdrawal', 'withdrawals', 'debit', 'debitamount', 'debitamt', 'debitinr', 'dr', 'debits', 'amountdebited'],
+  credit: ['depositamt', 'depositamtinr', 'depositamountinr', 'depositamount', 'deposit', 'deposits', 'credit', 'creditamount', 'creditamt', 'creditinr', 'cr', 'credits', 'amountcredited'],
+  amount: ['amount', 'amountinr', 'transactionamount', 'txnamount', 'amountrs'],
+  drcr: ['drcr', 'crdr', 'type', 'debitcredit', 'transactiontype'],
+  balance: ['closingbalance', 'balance', 'balanceinr', 'availablebalance', 'runningbalance'],
+};
+function matchHeader(cells) {
+  const heads = cells.map(norm), used = new Set(), cols = {};
+  for (const [key, names] of Object.entries(COLUMNS)) {
+    for (const name of names) {
+      const i = heads.findIndex((x, j) => x === name && !used.has(j));
+      if (i >= 0) { cols[key] = i; used.add(i); break; }
+    }
+  }
+  return cols.date != null && (cols.debit != null || (cols.amount != null && cols.drcr != null)) ? cols : null;
+}
+
+// a statement amount: 1,25,000.00 · ₹500 · "500.00 Dr" · a number; empty → 0
+function money(v) {
+  if (typeof v === 'number') return Math.round(Math.abs(v) * 100);
+  const s = String(v ?? '').trim().replace(/\s*(dr|cr)\.?$/i, '');
+  if (!s || s === '-') return 0;
+  try { return Math.abs(toPaise(s.replace(/^\((.*)\)$/, '$1'), 'Amount', { allowNegative: true })); } catch { return null; }
+}
+
+/**
+ * The statement's transactions, oldest first: { row, date, narration, ref, debit, credit, balance } (paise).
+ * Skips opening / closing balance lines and joins narration that runs onto the next line.
+ */
+export function readStatement(table) {
+  const top = table.rows.slice(0, 60);
+  const at = top.findIndex((r) => matchHeader(r.cells));
+  if (at < 0) bad('This doesn’t look like a bank statement: no heading row with a date and a withdrawal / debit amount column was found. Download the statement from net banking as Excel (.xlsx) or CSV.');
+  const header = top[at], cols = matchHeader(header.cells);
+  const cell = (r, k) => (cols[k] == null ? '' : r.cells[cols[k]] ?? '');
+  const text = (r, k, max) => str(typeof cell(r, k) === 'number' ? String(cell(r, k)) : cell(r, k), max);
+  const rows = [], skipped = [];
+  for (const r of table.rows.slice(table.rows.indexOf(header) + 1)) {
+    const rawDate = cell(r, 'date'), narration = text(r, 'narration', 300);
+    if (rows.length && r.cells.some((x) => /^\s*(statement\s+summary|summary|opening\s+balance|closing\s+balance|total)\b/i.test(String(x))) && !parseDate(rawDate, table.base1904)) break; // the summary under the transactions
+    if (rawDate === '' || rawDate == null) {
+      // narration carried onto the next line
+      if (narration && rows.length && money(cell(r, 'debit')) === 0 && money(cell(r, 'credit')) === 0) rows.at(-1).narration = str(`${rows.at(-1).narration} ${narration}`, 300);
+      continue;
+    }
+    if (/^(opening|closing)\s+balance|^(statement\s+)?summary|^total/i.test(`${narration} ${rawDate}`.trim())) continue;
+    const date = parseDate(rawDate, table.base1904);
+    if (!date) { if (/\d/.test(String(rawDate))) skipped.push({ row: r.n, why: `date “${String(rawDate).slice(0, 20)}” not understood` }); continue; }
+    let debit, credit;
+    if (cols.debit != null) { debit = money(cell(r, 'debit')); credit = money(cell(r, 'credit')); } else {
+      const a = money(cell(r, 'amount')), t = String(cell(r, 'drcr')).trim();
+      debit = /^(d|dr|debit|withdrawal)/i.test(t) ? a : 0; credit = /^(c|cr|credit|deposit)/i.test(t) ? a : 0;
+    }
+    if (debit == null || credit == null) { skipped.push({ row: r.n, why: 'amount not understood' }); continue; }
+    if (!debit && !credit) continue;
+    const bal = cols.balance != null ? money(cell(r, 'balance')) : null;
+    const neg = /dr$|^-|^\(/i.test(String(cell(r, 'balance')).trim()); // an overdrawn balance
+    rows.push({ row: r.n, date, narration, ref: text(r, 'ref', 80).replace(/^0+$/, ''), debit, credit, balance: bal == null ? null : neg ? -bal : bal });
+  }
+  if (!rows.length) bad('No transactions found under the statement’s headings.');
+  if (rows.length > 5000) bad('That statement has more than 5,000 transactions. Upload a shorter period.');
+  // newest first (some banks) → oldest first
+  if (rows.length > 1 && rows[0].date > rows.at(-1).date) rows.reverse();
+  const found = Object.fromEntries(Object.entries(cols).map(([k, i]) => [k, String(header.cells[i])]));
+  const last = rows.at(-1);
+  return { headerRow: header.n, columns: found, rows, skipped, from: rows[0].date, to: last.date, closing: last.balance == null ? null : { date: last.date, amount: last.balance } };
+}
+
+// words that say nothing about who was paid
+const STOP = new Set(['ltd', 'limited', 'pvt', 'private', 'co', 'company', 'and', 'the', 'india', 'ms', 'mr', 'mrs', 'shri', 'sri', 'llp', 'inc', 'corp', 'corporation', 'enterprises', 'traders', 'trading', 'services', 'bank']);
+// surnames shared by many people: on their own they don't say who was paid ("AJAY KUMAR" is not Shiv Kumar)
+const COMMON = new Set(['kumar', 'kumari', 'singh', 'sharma', 'verma', 'gupta', 'devi', 'lal', 'ram', 'das', 'yadav', 'jain', 'khan', 'ali', 'prasad', 'chand', 'rani', 'bai', 'patel', 'shah', 'mishra', 'pandey', 'chauhan', 'agarwal', 'aggarwal', 'thakur', 'rao', 'reddy', 'nair', 'joshi', 'mehta', 'malik', 'ahmed', 'mohammad', 'mohd', 'md']);
+const tokens = (name) => String(name ?? '').toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !STOP.has(t));
+const days = (a, b) => Math.abs(Date.parse(a) - Date.parse(b)) / 864e5;
+
+/**
+ * How well a statement line names a payment: { name: 0…1, ref: true if its bill / cheque / reference number appears }.
+ * Banks cut names short ("ANKIT KUMA", "SOMYA RANJ"), so a word the narration ends early still counts.
+ */
+export function similarity(line, p) {
+  const hay = norm(`${line.narration} ${line.ref}`);
+  const words = String(`${line.narration} ${line.ref}`).toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3 && /[a-z]/.test(w));
+  const found = (t) => hay.includes(t) || words.some((w) => t.startsWith(w));
+  const toks = tokens(p.name), weight = (t) => (COMMON.has(t) ? 0.4 : 1);
+  const total = toks.reduce((n, t) => n + weight(t), 0), hit = toks.filter(found);
+  let name = total ? hit.reduce((n, t) => n + weight(t), 0) / total : 0;
+  const whole = norm(p.name);
+  if (whole.length >= 5 && hay.includes(whole)) name = 1;
+  if (name > 0 && name < 1 && !hit.some((t) => t.length >= 4 && !COMMON.has(t))) name /= 2; // only short or common words matched
+  const r = normRef(p.ref), lineRef = normRef(line.ref);
+  // a cheque / UTR number written with words around it ("CHQ 967712", "UTR: 4512...") still counts
+  const nums = String(p.ref ?? '').match(/\d{5,}/g)?.map((n) => n.replace(/^0+/, '')) ?? [];
+  const lineNums = new Set(String(`${line.narration} ${line.ref}`).match(/\d{5,}/g)?.map((n) => n.replace(/^0+/, '')) ?? []);
+  const ref = (r.length >= 3 && (hay.includes(r.toLowerCase()) || lineRef === r)) || nums.some((n) => lineNums.has(n));
+  return { name, ref };
+}
+
+/**
+ * Statement debits ↔ payments yet to be paid (outstanding = what is left on each). Every debit gets
+ *   match: { id, how: 'ref' | 'name' | 'amount', partial } — or null, with candidates: payment ids it could be.
+ * A match on amount alone is made only when it can't be anything else (one debit and one payment of that amount).
+ */
+export function matchStatement(debits, payments, bankId) {
+  const pairs = [];
+  for (const d of debits) {
+    for (const p of payments) {
+      if (d.debit > p.outstanding) continue;
+      const s = similarity(d, p), exact = d.debit === p.outstanding;
+      const strong = s.ref || s.name >= 0.5;
+      if (!exact && !strong) continue; // part payments only when the line names the payment
+      const score = (s.ref ? 3 : 0) + 2 * s.name + (exact ? 1 : 0) + (p.bank_id === bankId ? 0.3 : p.bank_id == null ? 0.1 : 0) - Math.min(days(d.date, p.due_date), 60) / 100;
+      pairs.push({ d, p, score, how: s.ref ? 'ref' : s.name >= 0.5 ? 'name' : 'amount', partial: !exact });
+    }
+  }
+  pairs.sort((a, b) => b.score - a.score || a.d.row - b.d.row || a.p.id - b.p.id);
+  const usedD = new Set(), usedP = new Set(), out = new Map();
+  for (const x of pairs) {
+    if (x.how === 'amount') continue; // second pass
+    if (usedD.has(x.d.row) || usedP.has(x.p.id)) continue;
+    usedD.add(x.d.row); usedP.add(x.p.id);
+    out.set(x.d.row, { id: x.p.id, how: x.how, partial: x.partial });
+  }
+  // amount only: when exactly one free debit and one free payment have that amount
+  const freeD = debits.filter((d) => !usedD.has(d.row)), freeP = payments.filter((p) => !usedP.has(p.id));
+  for (const d of freeD) {
+    const sameD = freeD.filter((x) => x.debit === d.debit), sameP = freeP.filter((p) => p.outstanding === d.debit && !usedP.has(p.id));
+    if (sameD.length === 1 && sameP.length === 1) { usedP.add(sameP[0].id); usedD.add(d.row); out.set(d.row, { id: sameP[0].id, how: 'amount', partial: false }); }
+  }
+  return debits.map((d) => ({
+    ...d,
+    match: out.get(d.row) ?? null,
+    // to choose by hand: payments of exactly this amount first, then larger ones that name it
+    candidates: out.has(d.row) ? [] : payments.filter((p) => !usedP.has(p.id) && p.outstanding >= d.debit)
+      .map((p) => ({ p, s: similarity(d, p) }))
+      .filter(({ p, s }) => p.outstanding === d.debit || s.ref || s.name > 0)
+      .sort((a, b) => (b.p.outstanding === d.debit) - (a.p.outstanding === d.debit) || b.s.name - a.s.name || days(d.date, a.p.due_date) - days(d.date, b.p.due_date))
+      .slice(0, 10).map(({ p }) => p.id),
+  }));
+}
+
+/** a bank reference for a statement line: its own reference, else its narration; unique within the statement */
+export function lineRef(line, taken) {
+  let ref = str(line.ref || line.narration || `Statement ${line.date}`, 70);
+  if (!normRef(ref)) ref = `Statement ${line.date}`;
+  if (taken.has(normRef(ref))) ref = `${ref.slice(0, 60)} (row ${line.row})`;
+  taken.add(normRef(ref));
+  return ref;
+}
