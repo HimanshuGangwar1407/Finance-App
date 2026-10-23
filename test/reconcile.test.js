@@ -271,3 +271,69 @@ test('API: a statement file of a realistic size (hundreds of KB) is accepted', a
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(r.body.debits.length, 16);
 });
+
+// ── a picture-only PDF read with OCR (in the browser), and the running-balance check ──
+const { tableFromPages, ocrPages } = await import('../server/pdf.js');
+const ocrWords = () => JSON.parse(fixture('idbi-ocr-words.json').toString('utf8'));
+
+test('OCR words of an IDBI statement (as the browser reads them) make the same statement, every line confirmed', () => {
+  const st = readStatement(tableFromPages(ocrPages(ocrWords())));
+  assert.deepEqual(st.columns, { date: 'Post-date', narration: 'Particulars', ref: 'Chq. No.', debit: 'Withdrawals', credit: 'Deposits', balance: 'Balance' });
+  assert.deepEqual([st.rows.length, st.checked, st.closing, st.opening], [19, { ok: 19, of: 19 }, { date: '2026-10-21', amount: 200_444_053 }, 214_408_985]);
+});
+
+test('OCR slips that are put right: two amounts read as one word, a date whose hyphen was lost, “Cha: No.” for “Chq. No.”', () => {
+  const W = (x, y, s, w = s.length * 4.5) => ({ x, y, w, h: 8, s });
+  const page = { top: 800, words: [
+    W(54, 700, 'Post-'), W(55, 690, 'date'), W(206, 695, 'Particulars'), W(378, 700, 'Cha:'), W(381, 690, 'No.'), W(406, 695, 'Withdrawals'), W(466, 695, 'Deposits'), W(524, 695, 'Balance'),
+    W(45, 670, '21-10-'), W(45, 660, '2026'), W(83, 665, 'AT'), W(95, 665, 'BROUGHT'), W(139, 665, 'FORWARD'), W(510, 665, '21,44,089.85', 56),
+    W(45, 640, '21-10'), W(45, 630, '2026'), W(83, 635, 'NEFT-SUNNY'), W(130, 635, 'STORE'), W(465, 635, '20,288.0021,64,377.85', 101), // deposit and balance as one word
+    W(45, 610, '21-10-'), W(45, 600, '2026'), W(83, 605, 'GEETA'), W(110, 605, 'HHAH'), W(371, 605, '967708', 26), W(412, 605, '18,000.00', 43), W(510, 605, '21,46,377.85', 56),
+  ] };
+  const st = readStatement(tableFromPages(ocrPages([page])));
+  assert.equal(st.columns.ref, 'Cha: No.');
+  assert.deepEqual(st.rows.map((r) => [r.date, r.narration, r.ref, r.debit, r.credit, r.balance]), [
+    ['2026-10-21', 'NEFT-SUNNY STORE', '', 0, 2_028_800, 216_437_785], ['2026-10-21', 'GEETA HHAH', '967708', 1_800_000, 0, 214_637_785]]);
+  assert.deepEqual(st.checked, { ok: 2, of: 2 });
+  assert.throws(() => ocrPages('nope'), /couldn’t be read/);
+  assert.throws(() => ocrPages([{ top: 'x', words: [] }]), /couldn’t be read/);
+});
+
+test('a line that doesn’t add up with the running balance is flagged and never matched by itself', () => {
+  const words = ocrWords();
+  const w = words.flatMap((p) => p.words).find((x) => x.s === '25,422.00');
+  w.s = '25,472.00'; // a misread 2 → 7
+  const st = readStatement(tableFromPages(ocrPages(words)));
+  assert.deepEqual(st.checked, { ok: 18, of: 19 });
+  const bad = st.rows.find((r) => r.mismatch);
+  assert.deepEqual([bad.debit, bad.mismatch], [2_547_200, { expected: 237_890_585, shown: 237_895_585 }]);
+  const m = matchStatement([bad], [P(1, 'Sunita', 2_547_200, '2026-10-21', 'CHQ 967712')], 1);
+  assert.equal(m[0].match, null); // even with its cheque no. and the same amount
+  assert.deepEqual(m[0].candidates, [1]); // but it can be chosen by hand
+  // an ordinary CSV is checked the same way
+  const c = statement(csv('Date,Narration,Withdrawal Amt.,Deposit Amt.,Closing Balance\n21/10/2026,A,100.00,,900.00\n21/10/2026,B,50.00,,860.00\n'));
+  assert.deepEqual([c.checked, c.rows[1].mismatch], [{ ok: 1, of: 2 }, { expected: 85_000, shown: 86_000 }]);
+});
+
+test('API: a picture PDF’s OCR words are checked and applied like any statement', async () => {
+  const pdf = makePdf(SBI, { shapesOnly: true }); // what arrives: the picture PDF, and the words read from it
+  const body = { file: pdf.toString('base64'), name: 'AMINORICH IDBI.pdf', bank_id: hdfc, ocr: ocrWords() };
+  assert.equal((await editor('/api/reconcile/check', { ...body, ocr: undefined })).body.error.code, 'pdf_no_text');
+  const r = await editor('/api/reconcile/check', body);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual([r.body.ocr, r.body.checked, r.body.debits.length, r.body.debits.every((d) => d.mismatch === null)], [true, { ok: 19, of: 19 }, 16, true]);
+  assert.equal((await editor('/api/reconcile/check', { ...body, ocr: [{ top: 800, words: [{ x: 'a' }] }] })).status, 400);
+});
+
+test('the browser’s OCR files are served by the app, and the page may run them (WebAssembly) but nothing else', async () => {
+  for (const [p, type] of [['/vendor/pdf.min.mjs', 'text/javascript'], ['/vendor/pdf.worker.min.mjs', 'text/javascript'], ['/vendor/tesseract.min.js', 'text/javascript'],
+    ['/vendor/tesseract-worker.min.js', 'text/javascript'], ['/vendor/tesseract-core-simd-lstm.wasm.js', 'text/javascript'], ['/vendor/eng.traineddata.gz', 'application/octet-stream']]) {
+    const r = await fetch(base + p);
+    assert.equal(r.status, 200, p);
+    assert.ok(r.headers.get('content-type').startsWith(type), p);
+  }
+  assert.equal((await fetch(`${base}/vendor/../server/index.js`)).status, 404);
+  const csp = (await fetch(`${base}/`)).headers.get('content-security-policy');
+  assert.match(csp, /script-src 'self' 'wasm-unsafe-eval';/);
+  assert.doesNotMatch(csp, /unsafe-inline|'unsafe-eval'/);
+});

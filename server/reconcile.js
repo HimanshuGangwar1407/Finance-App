@@ -10,7 +10,7 @@ const norm = (v) => String(v ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 const COLUMNS = {
   date: ['txndate', 'transactiondate', 'trandate', 'date', 'postdate', 'postingdate', 'valuedate', 'valuedt', 'dt'],
   narration: ['narration', 'description', 'particulars', 'transactiondetails', 'transactionremarks', 'transactiondescription', 'details', 'remarks', 'transactionparticulars'],
-  ref: ['chqrefno', 'chequerefno', 'refnochequeno', 'chqno', 'chequeno', 'chequenumber', 'refno', 'referenceno', 'reference', 'utrno', 'utr', 'transactionid', 'tranid', 'refchqno'],
+  ref: ['chqrefno', 'chequerefno', 'refnochequeno', 'chqno', 'chequeno', 'chequenumber', 'refno', 'referenceno', 'reference', 'utrno', 'utr', 'transactionid', 'tranid', 'refchqno', 'chano', 'chgno', 'cheqno', 'chqnumber'],
   debit: ['withdrawalamt', 'withdrawalamtinr', 'withdrawalamountinr', 'withdrawalamount', 'withdrawal', 'withdrawals', 'debit', 'debitamount', 'debitamt', 'debitinr', 'dr', 'debits', 'amountdebited'],
   credit: ['depositamt', 'depositamtinr', 'depositamountinr', 'depositamount', 'deposit', 'deposits', 'credit', 'creditamount', 'creditamt', 'creditinr', 'cr', 'credits', 'amountcredited'],
   amount: ['amount', 'amountinr', 'transactionamount', 'txnamount', 'amountrs'],
@@ -65,18 +65,32 @@ export function readStatement(table) {
       debit = /^(d|dr|debit|withdrawal)/i.test(t) ? a : 0; credit = /^(c|cr|credit|deposit)/i.test(t) ? a : 0;
     }
     if (debit == null || credit == null) { skipped.push({ row: r.n, why: 'amount not understood' }); continue; }
-    if (!debit && !credit) continue;
-    const bal = cols.balance != null ? money(cell(r, 'balance')) : null;
+    const bal = cols.balance != null && String(cell(r, 'balance')).trim() !== '' ? money(cell(r, 'balance')) : null;
+    if (!debit && !credit && bal == null) continue;
     const neg = /dr$|^-|^\(/i.test(String(cell(r, 'balance')).trim()); // an overdrawn balance
     rows.push({ row: r.n, date, narration, ref: text(r, 'ref', 80).replace(/^0+$/, ''), debit, credit, balance: bal == null ? null : neg ? -bal : bal });
   }
+  // oldest first: by date, or (all on one day) by whichever order the running balance agrees with
+  const fits = (list) => list.reduce((n, r, i) => n + (i > 0 && list[i - 1].balance != null && r.balance != null && list[i - 1].balance - r.debit + r.credit === r.balance ? 1 : 0), 0);
+  if (rows.length > 1 && (rows[0].date > rows.at(-1).date || (rows[0].date === rows.at(-1).date && fits([...rows].reverse()) > fits(rows)))) rows.reverse();
+  // the running balance: each line's balance is the one before it − withdrawal + deposit. A line that doesn't
+  // add up has a figure misread or missing (likeliest when read from a picture): it is flagged, never matched by itself.
+  let prev = null;
+  for (const r of rows) {
+    if (r.balance != null && prev != null && prev - r.debit + r.credit !== r.balance) r.mismatch = { expected: prev - r.debit + r.credit, shown: r.balance };
+    if (r.balance != null) prev = r.balance;
+  }
+  const opening = rows.find((r) => r.balance != null && !r.debit && !r.credit);
+  rows.splice(0, rows.length, ...rows.filter((r) => r.debit || r.credit));
   if (!rows.length) bad('No transactions found under the statement’s headings.');
   if (rows.length > 5000) bad('That statement has more than 5,000 transactions. Upload a shorter period.');
-  // newest first (some banks) → oldest first
-  if (rows.length > 1 && rows[0].date > rows.at(-1).date) rows.reverse();
   const found = Object.fromEntries(Object.entries(cols).map(([k, i]) => [k, String(header.cells[i])]));
   const last = rows.at(-1);
-  return { headerRow: header.n, columns: found, rows, skipped, from: rows[0].date, to: last.date, closing: last.balance == null ? null : { date: last.date, amount: last.balance } };
+  const withBal = rows.filter((r) => r.balance != null);
+  return { headerRow: header.n, columns: found, rows, skipped, from: rows[0].date, to: last.date, closing: last.balance == null ? null : { date: last.date, amount: last.balance },
+    opening: opening ? opening.balance : null,
+    // how many lines the running balance confirms (null: the statement has no balance column)
+    checked: withBal.length ? { ok: withBal.filter((r) => !r.mismatch).length, of: withBal.length } : null };
 }
 
 // words that say nothing about who was paid
@@ -116,6 +130,7 @@ export function similarity(line, p) {
 export function matchStatement(debits, payments, bankId) {
   const pairs = [];
   for (const d of debits) {
+    if (d.mismatch) continue;
     for (const p of payments) {
       if (d.debit > p.outstanding) continue;
       const s = similarity(d, p), exact = d.debit === p.outstanding;
@@ -136,6 +151,7 @@ export function matchStatement(debits, payments, bankId) {
   // amount only: when exactly one free debit and one free payment have that amount
   const freeD = debits.filter((d) => !usedD.has(d.row)), freeP = payments.filter((p) => !usedP.has(p.id));
   for (const d of freeD) {
+    if (d.mismatch) continue;
     const sameD = freeD.filter((x) => x.debit === d.debit), sameP = freeP.filter((p) => p.outstanding === d.debit && !usedP.has(p.id));
     if (sameD.length === 1 && sameP.length === 1) { usedP.add(sameP[0].id); usedD.add(d.row); out.set(d.row, { id: sameP[0].id, how: 'amount', partial: false }); }
   }
