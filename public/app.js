@@ -586,13 +586,64 @@ async function recCheck(file, keepNote = false) {
       R.sent = { file: await toBase64(file), name: file.name };
       R.password = ''; R.needPassword = false;
     }
-    R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId });
+    try {
+      R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId });
+    } catch (e) {
+      // a picture of a statement (no text in the PDF): read it here with OCR, then check what was read
+      if (e.code !== 'pdf_no_text' || !file) throw e;
+      R.sent.ocr = await ocrPdf(file, R.password, (msg) => { R.progress = msg; renderReconcile(); });
+      R.progress = '';
+      R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId });
+    }
     R.needPassword = false;
     R.choice = new Map(R.data.debits.filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']));
     R.payee = new Map(); R.left = new Map(); R.saveBalance = false;
-  } catch (e) { R.err = e.message; R.data = null; if (e.code === 'pdf_password') R.needPassword = true; }
+  } catch (e) { R.err = e.message; R.data = null; R.progress = ''; if (e.code === 'pdf_password') R.needPassword = true; }
   R.busy = false; renderReconcile();
 }
+// ── OCR: the words on each page of a picture-only PDF, with where they are (PDF points, y up, as pdf.js gives text) ──
+const loadScript = (src) => new Promise((ok, no) => {
+  if (document.querySelector(`script[src="${src}"]`)) return ok();
+  document.head.append(h('script', { src, onload: ok, onerror: () => no(new Error('The reader for pictures of statements didn’t load. Check the connection and try again.')) }));
+});
+async function ocrPdf(file, password, progress) {
+  progress('Opening the PDF…');
+  const pdfjs = await import('/vendor/pdf.min.mjs');
+  pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.mjs';
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), password: password || undefined, isEvalSupported: false }).promise;
+  if (doc.numPages > 20) throw new Error('That picture PDF has more than 20 pages. Upload a shorter period.');
+  progress('Loading the reader (the first time takes a few seconds)…');
+  await loadScript('/vendor/tesseract.min.js');
+  const worker = await window.Tesseract.createWorker('eng', 1, {
+    workerPath: '/vendor/tesseract-worker.min.js', corePath: '/vendor/tesseract-core-simd-lstm.wasm.js', langPath: '/vendor', gzip: true, workerBlobURL: false,
+  });
+  const SCALE = 3, pages = [];
+  try {
+    await worker.setParameters({ tessedit_pageseg_mode: '11', preserve_interword_spaces: '1' }); // words wherever they are on the page
+    for (let p = 1; p <= doc.numPages; p++) {
+      progress(`Reading the picture of the statement: page ${p} of ${doc.numPages}…`);
+      const page = await doc.getPage(p), vp = page.getViewport({ scale: SCALE });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport: vp }).promise;
+      // black and white: light grey headings read as clearly as the figures
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height), d = img.data;
+      for (let i = 0; i < d.length; i += 4) { const v = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2] < 215 ? 0 : 255; d[i] = d[i + 1] = d[i + 2] = v; }
+      ctx.putImageData(img, 0, 0);
+      const { data } = await worker.recognize(canvas, {}, { blocks: true, text: false });
+      const words = [];
+      for (const b of data.blocks ?? []) for (const par of b.paragraphs) for (const l of par.lines) for (const w of l.words) {
+        const base = w.baseline && Number.isFinite(w.baseline.y0) ? (w.baseline.y0 + w.baseline.y1) / 2 : w.bbox.y1;
+        words.push({ x: w.bbox.x0 / SCALE, y: (vp.height - base) / SCALE, w: (w.bbox.x1 - w.bbox.x0) / SCALE, h: (w.bbox.y1 - w.bbox.y0) / SCALE, s: w.text });
+      }
+      pages.push({ top: vp.height / SCALE, words });
+    }
+  } finally { await worker.terminate(); }
+  return pages;
+}
+
 // bank charges, fees and the GST on them: recorded together with one button
 const CHARGE = /charge|chrg|chgs|commission|\bfee\b|fees|gst|service\s*tax|sms\s*alert|min(imum)?\s*bal/i;
 
@@ -608,9 +659,14 @@ function renderReconcile() {
       h('label', {}, h('span', {}, 'Bank statement (PDF, Excel or CSV)'), fileIn)),
     R.needPassword && h('div', { class: 'bar' }, pwIn, h('button', { class: 'small primary', onclick: () => { R.password = pwIn.value; recCheck(null, true); } }, 'Open PDF')),
     h('div', { class: 'rec-paste' }, pasteIn, h('button', { class: 'small', onclick: () => { const t = pasteIn.value.trim(); if (t) recCheck(new File([t], 'pasted statement.txt', { type: 'text/plain' })); } }, 'Read pasted statement')),
-    h('p', { class: 'muted small' }, 'It is read for: date, narration / particulars, cheque or reference no., withdrawal (debit) and balance. A PDF must have text in it — one saved with “Microsoft Print to PDF” is only a picture: paste the email’s table instead, or use Chrome’s “Save as PDF”. Nothing changes until you press Apply.'),
+    h('p', { class: 'muted small' }, 'It is read for: date, narration / particulars, cheque or reference no., withdrawal (debit) and balance. A PDF saved as a picture (e.g. with “Microsoft Print to PDF”) is read here with OCR, and every line is checked against the running balance. Nothing changes until you press Apply.'),
     R.sent && h('p', { class: 'small' }, 'File: ', h('strong', {}, R.sent.name), D && ` · ${nice(D.from)} – ${nice(D.to)} · ${D.debits.length} payment(s) out${D.credits.count ? `, ${D.credits.count} credit(s) in (not reconciled here)` : ''}`),
-    R.busy && h('p', { class: 'muted' }, 'Reading the statement…'),
+    R.busy && h('p', { class: 'muted' }, R.progress || 'Reading the statement…'),
+    D?.ocr && h('p', { class: `rec-ocr ${D.checked && D.checked.ok < D.checked.of ? 'warn' : ''}` }, icon(D.checked && D.checked.ok === D.checked.of ? 'check' : 'alert'),
+      h('span', {}, 'Read from a picture of the statement (OCR). ', D.checked
+        ? (D.checked.ok === D.checked.of ? `The running balance confirms all ${D.checked.of} lines.` : `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below and aren’t matched automatically; check them against the statement.`)
+        : 'The statement has no balance column to check the figures against — compare the amounts with the statement before applying.')),
+    D && !D.ocr && D.checked && D.checked.ok < D.checked.of && h('p', { class: 'rec-ocr warn' }, icon('alert'), h('span', {}, `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below.`)),
     R.err && h('p', { class: 'err', role: 'alert' }, R.err));
   if (!R.accounts.length) return app.replaceChildren(topBar(), pageHead('Reconcile with the bank statement', ''), h('div', { class: 'card' }, h('p', { class: 'empty' }, 'Add a bank account first (Banks → “+ Add bank account”).')));
   const parts = [topBar(), pageHead('Reconcile with the bank statement', 'Payments the statement shows are marked paid — only these come off the balance. Payments due but not in the statement are listed so you can decide.'), R.note && h('div', { class: 'card flash', role: 'status' }, icon('check'), h('span', {}, R.note)), step].filter(Boolean);
@@ -626,7 +682,8 @@ function renderReconcile() {
   const paidAmt = total(matched) + total(recRows);
   const rerender = () => keepFocus(renderReconcile);
 
-  const lineCell = (d) => h('td', {}, h('div', {}, d.narration || '—'), h('div', { class: 'muted small' }, [d.ref && `Ref. ${d.ref}`, `row ${d.row}`].filter(Boolean).join(' · ')));
+  const lineCell = (d) => h('td', {}, h('div', {}, d.narration || '—'), h('div', { class: 'muted small' }, [d.ref && `Ref. ${d.ref}`, `row ${d.row}`].filter(Boolean).join(' · ')),
+    d.mismatch && h('div', { class: 'chip c-red', title: 'The balance before it, minus this withdrawal, isn’t the balance shown on this line: a figure may be misread.' }, `doesn’t add up: balance shows ${inr(d.mismatch.shown)}, expected ${inr(d.mismatch.expected)}`));
   const select = (d) => {
     const ids = [...new Set([d.match?.id, ...d.candidates].filter(Boolean).map(String))];
     return h('select', { 'aria-label': `Payment for statement row ${d.row}`, onchange: (e) => { R.choice.set(d.row, e.target.value); rerender(); } },

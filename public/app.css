@@ -290,3 +290,6 @@ select.left-today { border-color: var(--blue); } select.left-tomorrow { border-c
 details.card summary { cursor: pointer; font-weight: 600; }
 .rec-paste { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; flex-wrap: wrap; }
 .rec-paste textarea { flex: 1; min-width: 240px; font: inherit; font-size: 13px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--input, var(--card)); color: var(--text); }
+.rec-ocr { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-radius: 10px; background: var(--green-bg); color: var(--green); font-weight: 600; font-size: 14px; }
+.rec-ocr.warn { background: var(--amber-bg); color: var(--amber); }
+table.rec .chip.c-red { display: inline-block; margin-top: 4px; white-space: normal; }

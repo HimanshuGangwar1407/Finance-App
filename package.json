@@ -16,5 +16,10 @@
     "@electric-sql/pglite": "^0.5.10",
     "pdfjs-dist": "^4.10.38",
     "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
+    "tesseract.js": "^5.1.1",
+    "tesseract.js-core": "^5.1.1"
   }
 }

@@ -71,6 +71,38 @@ function columns(ls, at) {
 export async function readPdf(buf, password) {
   const pages = await textItems(buf, password);
   if (!pages.some((p) => p.length)) fail(NO_TEXT, 'pdf_no_text');
+  return tableFromPages(pages);
+}
+
+// two amounts read as one word where the columns touch: "40,000.0021,84,089.85" → "40,000.00" and "21,84,089.85"
+const TWO_AMOUNTS = /^((?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2})((?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2})$/;
+function splitAmounts(items) {
+  return items.flatMap((it) => {
+    const m = TWO_AMOUNTS.exec(it.s);
+    if (!m) return [it];
+    const w1 = (it.w * m[1].length) / it.s.length;
+    return [{ ...it, s: m[1], w: w1 }, { ...it, s: m[2], x: it.x + w1, w: it.w - w1 }];
+  });
+}
+
+/**
+ * Words read from pictures of the pages (OCR in the browser): [{ top, words: [{ x, y, w, h, s }] }] in PDF points,
+ * y up from the bottom of the page. Checked, then read like a PDF's own text.
+ */
+export function ocrPages(ocr) {
+  if (!Array.isArray(ocr) || !ocr.length || ocr.length > 60) fail('The picture of the statement couldn’t be read. Try again.');
+  const num = (v) => (Number.isFinite(v) ? v : fail('The picture of the statement couldn’t be read. Try again.'));
+  return ocr.map((p) => {
+    const top = num(p?.top), words = Array.isArray(p?.words) ? p.words.slice(0, 6000) : [];
+    return words.filter((w) => typeof w?.s === 'string' && w.s.trim())
+      .map((w) => ({ x: num(w.x), y: num(w.y), w: num(w.w), h: num(w.h) || 8, s: w.s.trim().slice(0, 200) }))
+      .filter((it) => it.y > 30 && it.y < top - 30);
+  });
+}
+
+/** text pieces with positions, page by page → table rows */
+export function tableFromPages(pages) {
+  pages = pages.map(splitAmounts);
   let cols = null, dateCol = -1, ended = false;
   const rows = [], records = [];
   // amounts, dates, cheque numbers sit under their heading (often right-aligned): placed by their middle.
@@ -86,7 +118,17 @@ export async function readPdf(buf, password) {
     return i;
   };
   for (const items of pages) {
-    const ls = lines(items);
+    // words close together on a line are one phrase ("GEETA" "HHAH"); OCR gives single words, a PDF gives runs
+    const ls = lines(items).map((l) => {
+      const out = [];
+      for (const it of l.items) {
+        const prev = out.at(-1);
+        if (prev && it.x - (prev.x + prev.w) <= Math.max(2.5, 0.6 * it.h) && !(NUMBERISH.test(prev.s) && NUMBERISH.test(it.s))) {
+          prev.w = it.x + it.w - prev.x; prev.s = join(prev.s, it.s);
+        } else out.push({ ...it });
+      }
+      return { ...l, items: out };
+    });
     let skip = new Set();
     for (let i = 0; i < ls.length && !ended; i++) {
       const l = ls[i];
@@ -107,7 +149,12 @@ export async function readPdf(buf, password) {
       if (!records.length) continue;
       if (d && !/^\d{2,4}$/.test(d)) { ended = true; continue; } // not part of the table any more
       const last = records.at(-1); // the same transaction, carried onto another line
-      cells.forEach((v, k) => { if (v) last[k] = join(last[k], v); });
+      cells.forEach((v, k) => {
+        if (!v) return;
+        // a date broken over two lines whose separator was lost: "21-10" + "2026"
+        const sep = k === dateCol && /^\d{1,2}([-/.])\d{1,2}$/.exec(last[k]);
+        last[k] = sep && /^\d{2,4}$/.test(v) ? `${last[k]}${sep[1]}${v}` : join(last[k], v);
+      });
     }
   }
   if (!cols) fail('No statement table found in this PDF: no heading row with Particulars / Narration and Withdrawals / Debit.');

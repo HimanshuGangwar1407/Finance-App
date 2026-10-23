@@ -23,6 +23,9 @@ import { bad, deny, notFound, toPaise, normRef, str, need, ymd, oneOf, intId, to
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const STATIC = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/app.css': ['app.css', 'text/css'] };
+// reading a picture-only statement in the browser: pdf.js draws the pages, Tesseract reads them (scripts/vendor-ocr.js)
+for (const [name, type] of [['pdf.min.mjs', 'text/javascript'], ['pdf.worker.min.mjs', 'text/javascript'], ['tesseract.min.js', 'text/javascript'],
+  ['tesseract-worker.min.js', 'text/javascript'], ['tesseract-core-simd-lstm.wasm.js', 'text/javascript'], ['eng.traineddata.gz', 'application/octet-stream']]) STATIC[`/vendor/${name}`] = [`vendor/${name}`, type];
 const RANK = { viewer: 0, editor: 1, admin: 2 };
 const MAX_FAILS = 5, LOCK_MS = 15 * 60000;
 const DUMMY_HASH = A.hashPassword(crypto.randomBytes(12).toString('hex')); // unknown emails take as long as wrong passwords
@@ -477,7 +480,9 @@ async function reconcileCheck(c, body) {
   if (buf.length > MAX_BYTES) bad('That file is too big. Upload at most 3 MB.');
   // a PDF (with text in it), or Excel / CSV / text pasted from the bank's email
   const isPdf = buf.subarray(0, 5).toString('latin1') === '%PDF-';
-  const st = readStatement(isPdf ? await (await import('./pdf.js')).readPdf(buf, str(body.password, 100)) : readTable(buf, str(body.name, 200)));
+  // a picture-only PDF is read in the browser (OCR): its words and their places come with the file
+  const pdf = isPdf || body.ocr ? await import('./pdf.js') : null;
+  const st = readStatement(body.ocr ? pdf.tableFromPages(pdf.ocrPages(body.ocr)) : isPdf ? await pdf.readPdf(buf, str(body.password, 100)) : readTable(buf, str(body.name, 200)));
   if (st.to > todayIST()) bad(`The statement has dates after today (${st.to}). Check that it is the right file.`);
   await syncEmis(c, addDays(todayIST(), HORIZON));
 
@@ -510,9 +515,9 @@ async function reconcileCheck(c, body) {
   const app = bankStatements({ banks: [bank], balances: bal.rows, entries: en.rows, from: st.to, to: st.to }).rows[0];
   const credits = st.rows.filter((r) => r.credit > 0);
   return {
-    bank, fileName: str(body.name, 200), from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
+    bank, fileName: str(body.name, 200), ocr: Boolean(body.ocr), checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
     appClosing: app.closing, balanceEntered: app.balanceEntered,
-    debits: debits.map((d) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount: d.debit, recorded: d.recorded ?? null,
+    debits: debits.map((d) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount: d.debit, recorded: d.recorded ?? null, mismatch: d.mismatch ?? null,
       match: byRow.get(d.row)?.match ?? null, candidates: byRow.get(d.row)?.candidates ?? [] })),
     credits: { count: credits.length, amount: credits.reduce((n, r) => n + r.credit, 0) },
     payments,
@@ -1132,7 +1137,8 @@ async function readJson(req, limit = 32768) {
 }
 
 const SECURITY = {
-  'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  // 'wasm-unsafe-eval': the OCR engine (WebAssembly, served from here) — no other script can be evaluated
+  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' data:; img-src 'self' data: blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'Cache-Control': 'no-store',
 };
 
