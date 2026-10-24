@@ -365,6 +365,66 @@ async function bankDeleteDialog(b) {
   dlg.querySelector('button[type=submit]').classList.add('danger');
 }
 
+// several bank accounts from one sheet: every row checked first (ready / already there / a problem), then added together
+function bankUploadDialog() {
+  let sent = null, checked = null;
+  const err = h('p', { class: 'err', role: 'alert' }), result = h('div', { class: 'import-result' });
+  const fileIn = h('input', { type: 'file', name: 'banksheet', accept: '.xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv' });
+  const addBtn = h('button', { class: 'primary', type: 'button', disabled: true }, 'Add');
+  const tone = { ok: 'c-green', duplicate: 'c-amber', problem: 'c-red' }, word = { ok: 'Ready', duplicate: 'Already there', problem: 'Problem' };
+  const show = () => {
+    const rows = checked.rows, ok = rows.filter((r) => r.status === 'ok'), dup = rows.filter((r) => r.status === 'duplicate'), probs = rows.filter((r) => r.status === 'problem');
+    addBtn.textContent = ok.length ? `Add ${ok.length} bank account${ok.length === 1 ? '' : 's'}` : 'Nothing to add';
+    addBtn.disabled = !ok.length;
+    result.replaceChildren(...[
+      h('p', { class: 'import-counts' }, h('strong', {}, `${rows.length} account${rows.length === 1 ? '' : 's'}`), checked.sheet && ` in “${checked.sheet}”`, ': ',
+        h('span', { class: 'pos' }, `${ok.length} ready`), dup.length > 0 && [' · ', h('span', { class: 'amber' }, `${dup.length} already in the app`)],
+        probs.length > 0 && [' · ', h('span', { class: 'red' }, `${probs.length} with a problem (skipped)`)]),
+      h('p', { class: 'muted small' }, 'Columns used: ', Object.entries(checked.columns).map(([k, v]) => `${({ name: 'Account name', bank: 'Bank', number: 'Account number', balance: 'Opening balance', date: 'Balance date' })[k]} ← “${v}”`).join(', '), '.'),
+      h('div', { class: 'scroll import-preview' }, h('table', { class: 'tx' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'Row'), h('th', {}, ''), h('th', {}, 'Account name'), h('th', {}, 'Bank'), h('th', {}, 'Account'), h('th', { class: 'num' }, 'Opening balance'), h('th', {}, 'Notes'))),
+        h('tbody', {}, rows.map((r) => h('tr', { class: r.status === 'ok' ? '' : 'inactive' },
+          h('td', { class: 'muted' }, r.row),
+          h('td', {}, h('span', { class: `chip ${tone[r.status]}` }, word[r.status])),
+          h('td', {}, h('strong', {}, r.name || '—')),
+          h('td', {}, r.bank || '—'),
+          h('td', { class: 'nowrap' }, r.last4 ? `XXXX${r.last4}` : '—'),
+          h('td', { class: 'num' }, r.balance == null ? '—' : [money(r.balance), r.asOf && h('div', { class: 'muted small' }, `as of ${nice(r.asOf)}`)]),
+          h('td', { class: 'small' }, [...r.problems, r.duplicate, ...r.notes].filter(Boolean).join('; '))))))),
+    ].filter(Boolean));
+  };
+  fileIn.addEventListener('change', async () => {
+    err.textContent = ''; result.replaceChildren(); addBtn.disabled = true; checked = null;
+    const file = fileIn.files[0];
+    if (!file) return;
+    if (file.size > 3 * 1024 * 1024) { err.textContent = 'That file is too big. Upload at most 3 MB.'; return; }
+    result.append(h('p', { class: 'muted' }, 'Reading the sheet…'));
+    try {
+      sent = { file: await toBase64(file), name: file.name };
+      checked = await api('/api/import/banks/check', sent);
+    } catch (e) { result.replaceChildren(); err.textContent = e.message; return; }
+    show();
+  });
+  addBtn.addEventListener('click', async () => {
+    addBtn.disabled = true; err.textContent = '';
+    try {
+      const r = await api('/api/import/banks/add', sent);
+      dlg.close();
+      S.flash = `Added ${r.added} bank account${r.added === 1 ? '' : 's'}${r.balances ? ` (${r.balances} with an opening balance)` : ''}${r.skipped ? ` — ${r.skipped} skipped` : ''}.`;
+      await load();
+    } catch (e) { err.textContent = e.message; addBtn.disabled = false; }
+  });
+  dlg.className = 'wide import';
+  dlg.replaceChildren(
+    h('h2', {}, 'Upload bank accounts from Excel'),
+    h('p', { class: 'muted' }, 'Add several bank accounts at once: one account per row. Nothing is added until you check the rows below and press Add. ', h('a', { href: '/api/import/banks/sample', download: '' }, 'Download a sample sheet'), '.'),
+    h('label', {}, h('span', {}, 'Excel (.xlsx) or CSV file'), fileIn,
+      h('small', { class: 'muted' }, 'Needs a heading row with Bank and Account number (only its last 4 digits are kept). Also read if present: Account name, Opening balance and Balance date.')),
+    result, err,
+    h('div', { class: 'bar' }, addBtn, h('button', { type: 'button', onclick: () => dlg.close() }, 'Cancel')));
+  dlg.showModal();
+}
+
 function bankDialog() {
   openDialog('Add a bank account', [
     { name: 'name', label: 'Name in this app', placeholder: 'e.g. Main current account', required: true },
@@ -1008,7 +1068,8 @@ function renderBanks(d) {
     : h('div', { class: 'card' }, h('p', { class: 'empty' }, can('admin') ? 'No bank accounts yet — add your first one with “+ Add bank account” above.' : 'No bank accounts yet.'));
 
   app.replaceChildren(...[topBar(), pageHead('Banks', 'Each bank account for a day: opening balance, debits, credits, closing balance, and EMIs.',
-    can('admin') && h('button', { class: 'primary', onclick: bankDialog }, '+ Add bank account')), picker, summary, table, cards].filter(Boolean));
+    can('admin') && h('button', { class: 'primary', onclick: bankDialog }, '+ Add bank account'),
+    can('admin') && h('button', { onclick: () => bankUploadDialog() }, '⇪ Upload Excel')), flash(), picker, summary, table, cards].filter(Boolean));
 }
 const EMI_STATE_SHORT = { paid: ['paid', 'c-green'], overdue: ['unpaid', 'c-red'], due: ['due today', 'c-amber'], upcoming: ['upcoming', 'c-blue'], scheduled: ['scheduled', ''] };
 // the EMI column: what is due that day, else the next one
@@ -1310,7 +1371,7 @@ const ACTION_LABELS = {
   'position.add': 'Added a position', 'position.edit': 'Edited a position', 'position.activate': 'Activated a position', 'position.deactivate': 'Deactivated a position',
   'payment.add': 'Added a payment', 'payment.paid': 'Marked a payment paid', 'payment.approve': 'Approved a payment', 'payment.cancel': 'Cancelled a payment',
   'receipt.add': 'Added a receipt', 'receipt.received': 'Marked a receipt received', 'receipt.cancel': 'Cancelled a receipt',
-  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account', 'bank.delete': 'Deleted a bank account', 'reconcile.apply': 'Reconciled a bank statement', 'reconcile.ai_read': 'Had a statement read by AI', 'payment.reschedule': 'Moved a payment’s due date', 'payment.delete': 'Deleted a payment', 'receipt.delete': 'Deleted a receipt',
+  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account', 'bank.delete': 'Deleted a bank account', 'bank.import': 'Uploaded bank accounts from a sheet', 'reconcile.apply': 'Reconciled a bank statement', 'reconcile.ai_read': 'Had a statement read by AI', 'payment.reschedule': 'Moved a payment’s due date', 'payment.delete': 'Deleted a payment', 'receipt.delete': 'Deleted a receipt',
 };
 const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|setup|admin)/.test(a) ? 'c-blue' : /^(person|position|user)/.test(a) ? 'c-violet' : /cancel|deactivate|stop|delete/.test(a) ? 'c-red' : 'c-amber');
 // a short, readable summary of what was recorded
@@ -1322,6 +1383,7 @@ function describe(a, positions) {
   if (a.action === 'reconcile.ai_read') return `${d.file || 'statement'} · ${d.lines} line(s) read · ${d.model}`;
   if (a.action === 'reconcile.apply') return [`${d.bank} · ${d.from} to ${d.to}`, d.paid && `${d.paid} paid ${inr(d.paidAmount)}`, d.recorded && `${d.recorded} recorded as new`, d.today && `${d.today} to today`, d.tomorrow && `${d.tomorrow} to next day`, d.cancelled && `${d.cancelled} cancelled`, d.balanceSaved && 'balance saved'].filter(Boolean).join(' · ');
   if (a.action === 'payment.reschedule') return `${d.payee} · ${inr(d.amount)} · ${d.from} → ${d.to}`;
+  if (a.action === 'bank.import') return `${d.file || 'sheet'} · ${d.added} added${d.balances ? ` (${d.balances} with an opening balance)` : ''}${d.skipped ? ` · ${d.skipped} skipped` : ''}`;
   if (a.action === 'bank.delete') return [`${d.name} (${d.bank} XXXX${d.last4})`, d.entries && `${d.entries} transaction(s) deleted`, d.receivedAmount && `${inr(d.receivedAmount)} in`, d.paidAmount && `${inr(d.paidAmount)} out`, d.emis && `${d.emis} EMI(s)`, d.balances && `${d.balances} balance(s)`, d.nowNotDecided && `${d.nowNotDecided} now “Not decided”`].filter(Boolean).join(' · ');
   if (a.action === 'payment.delete' || a.action === 'receipt.delete') return [d.payee || d.party, inr(d.amount), d.date, d.ref, d.settled && `incl. ${inr(d.settled)} ${a.action === 'payment.delete' ? 'paid' : 'received'}`].filter(Boolean).join(' · ');
   if (a.action === 'import.add') return `${d.file || 'sheet'} · ${d.added} added (${d.payments} to pay${d.paymentAmount ? ` ${inr(d.paymentAmount)}` : ''}, ${d.receipts} to receive${d.receiptAmount ? ` ${inr(d.receiptAmount)}` : ''})${d.skipped ? ` · ${d.skipped} skipped` : ''}`;

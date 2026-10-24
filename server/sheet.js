@@ -244,3 +244,77 @@ export function importRows(table, { kind, banks, today }) {
   const found = Object.fromEntries(Object.entries(cols).map(([key, i]) => [key, String(header.cells[i])]));
   return { headerRow: header.n, columns: found, rows: out };
 }
+
+// ── a sheet of bank accounts: one account per row ──
+const BANK_COLUMNS = {
+  name: ['accountname', 'nameinthisapp', 'name', 'nickname', 'shortname', 'account', 'accountnickname', 'label'],
+  bank: ['bank', 'bankname', 'nameofbank'],
+  number: ['accountnumber', 'accountno', 'acno', 'acctno', 'accno', 'last4', 'last4digits', 'lastfourdigits', 'number'],
+  balance: ['openingbalance', 'balance', 'currentbalance', 'closingbalance', 'amount'],
+  date: ['balancedate', 'asof', 'ason', 'asondate', 'date', 'balanceason', 'openingdate'],
+};
+function bankHeader(cells) {
+  const heads = cells.map(norm), used = new Set(), cols = {};
+  for (const [key, names] of Object.entries(BANK_COLUMNS)) {
+    for (const name of names) {
+      const i = heads.findIndex((x, j) => x === name && !used.has(j));
+      if (i >= 0) { cols[key] = i; used.add(i); break; }
+    }
+  }
+  return cols.bank != null && cols.number != null ? cols : null;
+}
+
+/**
+ * The sheet's bank accounts, each checked: { row, name, bank, last4, balance (paise or null), asOf, problems, notes }.
+ * banks: the accounts already in the app (a row for one of them is "already there", not added twice).
+ */
+export function bankRows(table, { banks, today }) {
+  const top = table.rows.slice(0, 15);
+  const at = top.findIndex((r) => bankHeader(r.cells));
+  if (at < 0) bad('No heading row found. The sheet needs a row of column headings with at least the Bank and the Account number (or Last 4 digits) — download the sample sheet to see the layout.');
+  const header = top[at], cols = bankHeader(header.cells);
+  const body = table.rows.slice(table.rows.indexOf(header) + 1);
+  if (body.length > 200) bad(`That sheet has ${body.length} rows. Upload at most 200 bank accounts at a time.`);
+  const cell = (r, k) => (cols[k] == null ? '' : r.cells[cols[k]] ?? '');
+  const text = (r, k, max) => str(typeof cell(r, k) === 'number' ? String(cell(r, k)) : cell(r, k), max);
+  const key = (bank, last4) => `${norm(bank)}|${last4}`;
+  const have = new Set(banks.map((b) => key(b.bank, b.last4))), names = new Set(banks.map((b) => norm(b.name)));
+  const seen = new Map(), out = [];
+  for (const r of body) {
+    const bank = text(r, 'bank', 80), rawNo = cell(r, 'number');
+    if (!bank && rawNo === '') continue; // an empty line
+    // an account number may be typed, or stored by Excel as a number (it can't keep leading zeros: only the last 4 matter)
+    const digits = (typeof rawNo === 'number' ? BigInt(Math.round(rawNo)).toString() : String(rawNo)).replace(/\D/g, '');
+    const last4 = digits.slice(-4), problems = [], notes = [];
+    let name = text(r, 'name', 80);
+    if (!bank) problems.push('No bank');
+    if (digits.length < 4) problems.push(rawNo === '' ? 'No account number' : `Account number “${String(rawNo).slice(0, 20)}”: needs at least 4 digits`);
+    else if (typeof rawNo === 'number' && rawNo > Number.MAX_SAFE_INTEGER) problems.push('Account number is too long for Excel to keep exactly as a number: format that column as Text and type it again');
+    else if (/[eE]\+/.test(String(rawNo))) problems.push('Account number was turned into a number by Excel (e.g. 5.02E+13): format that column as Text and type it again');
+    if (!name && bank && last4.length === 4) { name = `${bank} ${last4}`; notes.push(`no name — called “${name}”`); }
+    let balance = null, asOf = null;
+    if (cols.balance != null && cell(r, 'balance') !== '') {
+      const a = amountOf(cell(r, 'balance'));
+      if (a.error) problems.push(`Opening balance: ${a.error}`); else balance = a.paise;
+    }
+    if (balance != null) {
+      const rawDate = cell(r, 'date');
+      if (rawDate === '') { asOf = today; notes.push('no balance date — as of today'); }
+      else if (!(asOf = parseDate(rawDate, table.base1904))) problems.push(`Balance date “${String(rawDate).slice(0, 20)}” not understood — use e.g. 21/10/2026`);
+      else if (asOf > today) problems.push('Balance date is in the future');
+    }
+    let status = problems.length ? 'problem' : 'ok', duplicate;
+    if (status === 'ok') {
+      const k = key(bank, last4), again = seen.get(k);
+      if (have.has(k)) duplicate = `Already in the app (${bank} XXXX${last4})`;
+      else if (names.has(norm(name))) duplicate = `An account called “${name}” is already in the app`;
+      else if (again) duplicate = `Same as row ${again} of this sheet`;
+      if (!again) seen.set(k, r.n);
+      if (duplicate) status = 'duplicate';
+    }
+    out.push({ row: r.n, name, bank, last4, balance, asOf, status, problems, notes, ...(duplicate ? { duplicate } : {}) });
+  }
+  if (!out.length) bad('No bank accounts found under the headings.');
+  const found = Object.fromEntries(Object.entries(cols).map(([k, i]) => [k, String(header.cells[i])]));
+  return { headerRow: header.n, columns: found, rows: out };
+}
