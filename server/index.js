@@ -14,7 +14,7 @@ import { finalBalance } from './balance.js';
 import { emiDates } from './emi.js';
 import { bankStatements } from './ledger.js';
 import { toCsv, toXlsx } from './export.js';
-import { readTable, importRows, MAX_BYTES } from './sheet.js';
+import { readTable, importRows, bankRows, MAX_BYTES } from './sheet.js';
 import { readStatement, matchStatement, lineRef, guessPayee } from './reconcile.js';
 import { readWithAi, tableFromLines, aiConfigured } from './ai.js';
 import { dueReminders, projectDates, coverage, DEFAULT_BEFORE } from './reminders.js';
@@ -437,6 +437,17 @@ async function records(f) {
 
 // ── an uploaded Excel / CSV sheet → receipts and payments yet to be paid / received (pending: balances don't move) ──
 // "check" reads the sheet and says what each row will become; "add" reads the same file again and adds the good rows.
+// a sheet of bank accounts, read and checked against the accounts already in the app
+async function bankSheet(c, body) {
+  const file = String(body.file ?? '');
+  if (!file || !/^[A-Za-z0-9+/=\s]+$/.test(file)) bad('Choose an Excel (.xlsx) or CSV file to upload.');
+  const buf = Buffer.from(file, 'base64');
+  if (buf.length > MAX_BYTES) bad('That file is too big. Upload at most 3 MB.');
+  const table = readTable(buf, str(body.name, 200));
+  const banks = (await c.query('SELECT id, name, bank, last4 FROM banks ORDER BY id')).rows;
+  return { fileName: str(body.name, 200), sheet: table.sheet, ...bankRows(table, { banks, today: todayIST() }) };
+}
+
 async function sheetImport(c, body) {
   const kind = oneOf(body.kind || 'OUT', ['IN', 'OUT'], 'These rows are');
   const file = String(body.file ?? '');
@@ -956,6 +967,37 @@ const routes = [
   })],
 
   // a sample sheet with the headings the upload understands
+  // ── several bank accounts from one sheet (admins, like adding one): check shows each row; add creates the good ones ──
+  ['POST', /^\/api\/import\/banks\/check$/, 'admin', async ({ body }) => withTx((c) => bankSheet(c, body))],
+
+  ['POST', /^\/api\/import\/banks\/add$/, 'admin', async ({ body, user }) => withTx(async (c) => {
+    const x = await bankSheet(c, body), add = x.rows.filter((r) => r.status === 'ok');
+    if (!add.length) bad('Nothing to add: every row has a problem or is already in the app.');
+    let balances = 0;
+    for (const r of add) {
+      const { rows: [b] } = await c.query('INSERT INTO banks (name, bank, last4, created_by) VALUES ($1, $2, $3, $4) RETURNING id', [r.name, r.bank, r.last4, user.id]);
+      await audit(c, user.id, 'bank.add', { id: b.id, name: r.name, bank: r.bank, last4: r.last4, fromSheet: x.fileName });
+      if (r.balance != null) {
+        await c.query('INSERT INTO balances (bank_id, amount, as_of, note, created_by) VALUES ($1, $2, $3, $4, $5)', [b.id, r.balance, r.asOf, 'From the bank account upload', user.id]);
+        await audit(c, user.id, 'balance.add', { bankId: b.id, amount: r.balance, asOf: r.asOf, fromSheet: x.fileName });
+        balances++;
+      }
+    }
+    const result = { added: add.length, balances, skipped: x.rows.length - add.length };
+    await audit(c, user.id, 'bank.import', { file: x.fileName, ...result, banks: add.map((r) => `${r.name} (${r.bank} XXXX${r.last4})`) });
+    return result;
+  })],
+
+  ['GET', /^\/api\/import\/banks\/sample$/, 'admin', async () => ({ file: {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', name: 'bank-accounts-upload-sample.xlsx',
+    body: toXlsx([
+      ['Account name', 'Bank', 'Account number', 'Opening balance', 'Balance date'],
+      ['HDFC Current', 'HDFC Bank', 'XXXXXXXX1111', 500000, '23/10/2026'],
+      ['IDBI Collections', 'IDBI Bank', 'XXXXXXXX2222', 185024.31, '23/10/2026'],
+      ['SBI Salary', 'State Bank of India', 'XXXXXXXX3333', '', ''],
+    ], 'Bank accounts'),
+  } })],
+
   ['GET', /^\/api\/import\/sample$/, 'viewer', async () => ({ file: {
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', name: 'receipts-payments-upload-sample.xlsx',
     body: toXlsx([
