@@ -724,7 +724,7 @@ function renderReconcile() {
     return h('select', { 'aria-label': `Payment for statement row ${d.row}`, onchange: (e) => { R.choice.set(d.row, e.target.value); rerender(); } },
       h('option', { value: '' }, ids.length ? 'Not in the app' : 'Not in the app (no payment of this amount)'),
       ids.map((id) => pays.get(id)).filter(Boolean).map((p) => h('option', { value: String(p.id), selected: R.choice.get(d.row) === String(p.id), disabled: chosen.has(String(p.id)) && chosen.get(String(p.id)) !== d.row }, payLabel(p))),
-      h('option', { value: 'rec', selected: R.choice.get(d.row) === 'rec' }, '+ Record it as a new payment'));
+      h('option', { value: 'rec', selected: R.choice.get(d.row) === 'rec', disabled: Boolean(d.reversedBy) }, '+ Record it as a new payment'));
   };
   const howChip = (d) => {
     const id = R.choice.get(d.row), p = pays.get(id);
@@ -766,14 +766,22 @@ function renderReconcile() {
     h('h2', {}, h('span', { class: 'dot d-blue' }), `In the statement, not in the app (${notIn.length})`),
     h('p', { class: 'muted small' }, 'Money that left the account but matches no payment here (e.g. bank charges, or a payment not in the sheet). Match it to a payment, record it as a new one, or leave it.'),
     (() => {
-      const ch = notIn.filter((d) => CHARGE.test(d.narration) && R.choice.get(d.row) !== 'rec');
-      return ch.length > 0 && h('div', { class: 'bar' }, h('button', { class: 'small', onclick: () => { for (const d of ch) { R.choice.set(d.row, 'rec'); R.payee.set(d.row, 'Bank charges'); } rerender(); } },
-        `Record the ${ch.length} bank charge${ch.length === 1 ? '' : 's'} (${inr(total(ch))}) as payments`));
+      // every one of them as a new payment in one click (not the ones the bank reversed), named from the narration
+      const open = notIn.filter((d) => !d.reversedBy), all = open.filter((d) => R.choice.get(d.row) !== 'rec');
+      const ch = all.filter((d) => CHARGE.test(d.narration)), chosen = open.filter((d) => R.choice.get(d.row) === 'rec');
+      const set = (list, v) => { for (const d of list) R.choice.set(d.row, v); rerender(); };
+      return (all.length > 0 || chosen.length > 0) && h('div', { class: 'bar rec-bulk' },
+        all.length > 0 && h('button', { class: 'small primary', onclick: () => set(all, 'rec') },
+          `+ Record all ${all.length} as new payment${all.length === 1 ? '' : 's'} (${inr(total(all))})`),
+        ch.length > 0 && ch.length < all.length && h('button', { class: 'small', onclick: () => set(ch, 'rec') },
+          `Record just the ${ch.length} bank charge${ch.length === 1 ? '' : 's'} (${inr(total(ch))})`),
+        chosen.length > 0 && h('button', { class: 'small', onclick: () => set(chosen, '') }, 'Leave them all'),
+        all.length > 0 && h('span', { class: 'muted small' }, 'Each is recorded as paid on its statement date, named from the narration — change any name before applying.'));
     })(),
     h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
       h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Statement narration'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Payment in the app'))),
       h('tbody', {}, notIn.map((d) => h('tr', {}, h('td', { class: 'nowrap' }, nice(d.date)), lineCell(d), h('td', { class: 'num' }, money(-d.amount)),
-        h('td', {}, select(d), R.choice.get(d.row) === 'rec' && h('input', { name: `payee-${d.row}`, 'aria-label': 'Pay to', placeholder: 'Pay to', value: R.payee.get(d.row) ?? d.narration.slice(0, 60), oninput: (e) => R.payee.set(d.row, e.target.value) }))))))));
+        h('td', {}, select(d), R.choice.get(d.row) === 'rec' && h('input', { name: `payee-${d.row}`, 'aria-label': 'Pay to', placeholder: 'Pay to', value: R.payee.get(d.row) ?? d.payee ?? d.narration.slice(0, 60), oninput: (e) => R.payee.set(d.row, e.target.value) }))))))));
 
   const doneSec = done.length > 0 && h('details', { class: 'card' }, h('summary', {}, `Already in the app (${done.length}) — recorded before, not counted again`),
     h('ul', { class: 'day-moves' }, done.map((d) => h('li', {}, h('span', {}, nice(d.date), ' · ', d.narration || d.ref, h('span', { class: 'muted small' }, ` · matched by ${d.recorded.by}`)), money(-d.amount)))));
@@ -797,7 +805,7 @@ function renderReconcile() {
     try {
       const r = await api('/api/reconcile/apply', { ...R.sent, password: R.password, bank_id: R.bankId, saveBalance: R.saveBalance,
         matches: matched.map((d) => ({ row: d.row, id: Number(R.choice.get(d.row)) })),
-        record: recRows.map((d) => ({ row: d.row, payee: R.payee.get(d.row) ?? d.narration.slice(0, 60) })),
+        record: recRows.map((d) => ({ row: d.row, payee: R.payee.get(d.row) ?? d.payee ?? d.narration.slice(0, 60) })),
         leftOut: [...R.left].filter(([id, v]) => v && leftOut.some((p) => p.id === id)).map(([id, action]) => ({ id, action })) });
       R.note = [`Reconciled ${D.bank.name}:`, r.paid && `${r.paid} payment(s) marked paid (${inr(r.paidAmount)})`, r.recorded && `${r.recorded} recorded as new (${inr(r.recordedAmount)})`,
         r.today && `${r.today} moved to today`, r.tomorrow && `${r.tomorrow} moved to tomorrow`, r.cancelled && `${r.cancelled} cancelled`, r.balanceSaved && 'statement balance saved'].filter(Boolean).join(' ');

@@ -183,6 +183,34 @@ export function matchStatement(debits, payments, bankId) {
 }
 
 /** a bank reference for a statement line: its own reference, else its narration; unique within the statement */
+/**
+ * Who a statement debit was paid to, from its narration — the default name when it is recorded as a new payment.
+ * "NEFT DR-KKBK0004585-SAROJ BIOTECH-ANSALS ARCAD-…" → "SAROJ BIOTECH"; "UPI-WARSI PHARMA-…" → "WARSI PHARMA";
+ * "AT 191-DELHI ,NEFT-PUNB0486700-GEETA HHAH" → "GEETA HHAH"; NEFT / GST charges → "Bank charges".
+ */
+export function guessPayee(narration) {
+  let s = String(narration ?? '').replace(/\s+/g, ' ').trim();
+  if (/charge|chrg|chgs|commission|\bfees?\b|service\s*tax|sms\s*alert|min(imum)?\s*bal/i.test(s)) return 'Bank charges';
+  s = s.replace(/^AT [^,]*,\s*/i, ''); // IDBI: the branch it went through
+  const segs = s.split(/\s*-\s*/).map((x) => x.trim()).filter(Boolean);
+  const code = (x) => /^[A-Z]{4}0[A-Z0-9]{6}$/i.test(x) || /^\d{6,}$/.test(x) || (/^[A-Z0-9]{12,}$/i.test(x) && /\d/.test(x));
+  const kind = (segs[0] ?? '').toUpperCase();
+  let name = null;
+  if (/^(NEFT|RTGS|IMPS)( (DR|CR))?$/.test(kind)) name = segs.slice(1).find((x) => !code(x));
+  else if (kind === 'UPI') name = segs[1];
+  else if (kind === 'CHQ PAID' && /^TRANSFER IN$/i.test(segs[1] ?? '')) name = segs[2];
+  else if (kind === 'FT') name = segs.slice(1).reverse().find((x) => !code(x) && !/^(DR|CR)$/i.test(x));
+  else if ((segs[1] ?? '').toUpperCase() === 'TPT') name = segs.at(-1); // a transfer within the bank: "<account>-TPT-<ref>-<name>"
+  else if (/\bIGST$/i.test(s)) name = 'IGST';
+  else if (/^[A-Z0-9]{8,}\/([A-Z][A-Z0-9 &.]+)$/i.test(s)) name = /\/([^/]+)$/.exec(s)[1].toUpperCase(); // "<code>/EPFO", "<code>/PAYUFACEBOOK"
+  else if (/^GST\//i.test(s)) name = 'GST';
+  else if (/^IB BILLPAY/i.test(s)) name = 'Bill payment (net banking)';
+  else if (/^BULK SALARY/i.test(s)) name = 'Salaries (bulk)';
+  else if (/^BULK NEFT/i.test(s)) name = 'Bulk NEFT';
+  else if (/ - CHQ PAID\b/i.test(s)) name = segs[0];
+  return str((name || s).replace(/^(M\/S\.?|MS)\s+/i, ''), 60) || 'Bank debit';
+}
+
 export function lineRef(line, taken) {
   let ref = str(line.ref || line.narration || `Statement ${line.date}`, 70);
   if (!normRef(ref)) ref = `Statement ${line.date}`;
