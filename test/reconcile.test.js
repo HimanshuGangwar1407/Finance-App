@@ -437,3 +437,18 @@ test('API: record every statement debit not in the app at once — each under it
   const again = (await editor('/api/reconcile/check', body)).body.debits.filter((x) => !x.recorded);
   assert.deepEqual(again.map((x) => x.row), [reversed.row]);
 });
+
+test('PDF: an IDBI email with its columns packed tight (the date 1.5 pt from the particulars, “Chq. No.” 1.4 pt from “Withdrawals”)', () => {
+  // the text pieces and places pdf.js gives for such a statement (the wording made up)
+  const T = (x, y, w, s) => ({ x, y, w, h: 9, s });
+  const page = [T(50.2, 553.9, 21.8, 'Name'), T(103.5, 553.9, 178.7, ': EXAMPLE HEALTH SOLUTIONS BVBA'), T(50.2, 517.9, 17.3, 'Date'), T(99.1, 517.9, 132.4, ': From:23-10-2026 To:23-10-2026'),
+    T(47.2, 470.7, 36.4, 'Post-date'), T(163.9, 470.7, 41.3, 'Particulars'), T(283.3, 470.7, 32.9, 'Chq. No.'), T(317.6, 470.7, 47, 'Withdrawals'), T(375, 470.7, 33.8, 'Deposits'), T(429.6, 470.7, 30.7, 'Balance'),
+    T(45, 446.7, 40.9, '23-10-2026'), T(87.4, 446.7, 96.9, 'AT ,BROUGHT FORWARD'), T(419.2, 446.7, 51.5, '1,85,024.31'),
+    T(45, 414.4, 40.9, '23-10-2026'), T(87.4, 414.4, 194.4, 'AT 9990-ETPC ,HDFCR52026102375837779 VET-KPI'), T(366.2, 414.4, 51.5, '4,00,000.00'), T(419.2, 414.4, 51.5, '5,85,024.31'),
+    T(43.5, 391.9, 22.6, 'Note :'), T(68.4, 391.9, 161.9, 'Clearing credits are subject to realisation.')];
+  const t = tableFromPages([page]);
+  assert.deepEqual(t.rows[0].cells, ['Post-date', 'Particulars', 'Chq. No.', 'Withdrawals', 'Deposits', 'Balance']);
+  const st = readStatement(t);
+  assert.deepEqual(st.rows.map((r) => [r.date, r.narration, r.debit, r.credit, r.balance]), [['2026-10-23', 'AT 9990-ETPC ,HDFCR52026102375837779 VET-KPI', 0, 40_000_000, 58_502_431]]);
+  assert.deepEqual([st.opening, st.checked], [18_502_431, { ok: 1, of: 1 }]);
+});

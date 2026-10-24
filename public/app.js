@@ -688,6 +688,8 @@ function renderReconcile() {
     h('div', { class: 'rec-paste' }, pasteIn, h('button', { class: 'small', onclick: () => { const t = pasteIn.value.trim(); if (t) recCheck(new File([t], 'pasted statement.txt', { type: 'text/plain' })); } }, 'Read pasted statement')),
     h('p', { class: 'muted small' }, 'It is read for: date, narration / particulars, cheque or reference no., withdrawal (debit) and balance. A PDF saved as a picture (e.g. with “Microsoft Print to PDF”) is read here with OCR, and every line is checked against the running balance. Nothing changes until you press Apply.'),
     R.sent && h('p', { class: 'small' }, 'File: ', h('strong', {}, R.sent.name), D && ` · ${nice(D.from)} – ${nice(D.to)} · ${D.debits.length} payment(s) out${D.credits.count ? `, ${D.credits.count} credit(s) in (not reconciled here)` : ''}`),
+    // read fine, but nothing left the account: say so, rather than show empty lists
+    D && !D.debits.length && h('p', { class: 'rec-ocr' }, icon('check'), h('span', {}, `Read: no payments went out of ${D.bank.name} in this statement${D.credits.count ? ` — only ${D.credits.count} deposit${D.credits.count === 1 ? '' : 's'} of ${inr(D.credits.amount)} came in` : ''}${D.closing ? `, leaving ${inr(D.closing.amount)}` : ''}. Nothing to mark paid; payments due but not in it are listed below.`)),
     R.busy && h('p', { class: 'muted' }, R.progress || 'Reading the statement…'),
     D?.ai && h('p', { class: `rec-ocr ${D.checked && D.checked.ok < D.checked.of ? 'warn' : ''}` }, icon(D.checked && D.checked.ok === D.checked.of ? 'check' : 'alert'),
       h('span', {}, 'Read by AI (Claude). ', D.checked

@@ -59,7 +59,9 @@ function columns(ls, at) {
   const heads = band.flatMap((l) => l.items.map((i) => ({ ...i, y: l.y }))).sort((a, b) => a.x - b.x);
   const cols = [];
   for (const it of heads) {
-    const c = cols.find((k) => it.x < k.r + 4 && it.x + it.w > k.l - 4);
+    // a heading split over lines ("Post-" / "date") is one column; two headings side by side on a line never are,
+    // however close ("Chq. No." "Withdrawals")
+    const c = cols.find((k) => it.x < k.r + 4 && it.x + it.w > k.l - 4 && !k.parts.some((p) => Math.abs(p.y - it.y) < 1));
     if (c) { c.parts.push(it); c.l = Math.min(c.l, it.x); c.r = Math.max(c.r, it.x + it.w); } else cols.push({ l: it.x, r: it.x + it.w, parts: [it] });
   }
   cols.sort((a, b) => a.l - b.l);
@@ -95,7 +97,7 @@ export function ocrPages(ocr) {
   return ocr.map((p) => {
     const top = num(p?.top), words = Array.isArray(p?.words) ? p.words.slice(0, 6000) : [];
     return words.filter((w) => typeof w?.s === 'string' && w.s.trim())
-      .map((w) => ({ x: num(w.x), y: num(w.y), w: num(w.w), h: num(w.h) || 8, s: w.s.trim().slice(0, 200) }))
+      .map((w) => ({ x: num(w.x), y: num(w.y), w: num(w.w), h: num(w.h) || 8, s: w.s.trim().slice(0, 200), word: true }))
       .filter((it) => it.y > 30 && it.y < top - 30);
   });
 }
@@ -121,12 +123,13 @@ export function tableFromPages(pages) {
     for (let k = 1; k < cols.length; k++) if (it.x + 2 >= cols[k - 1].r) i = k;
     return i;
   };
-  // words close together on a line are one phrase ("GEETA" "HHAH"); OCR gives single words, a PDF gives runs
+  // OCR gives single words: those close together on a line are one phrase ("GEETA" "HHAH"). A PDF's text already
+  // comes in phrases, and its columns can sit only a point or two apart ("23-10-2026"|"AT ,BROUGHT FORWARD"): never joined.
   const pageLines = pages.map((items) => lines(items).map((l) => {
     const out = [];
     for (const it of l.items) {
       const prev = out.at(-1);
-      if (prev && it.x - (prev.x + prev.w) <= Math.max(2.5, 0.6 * it.h) && !(NUMBERISH.test(prev.s) && NUMBERISH.test(it.s))) {
+      if (prev && prev.word && it.word && it.x - (prev.x + prev.w) <= Math.max(2.5, 0.6 * it.h) && !(NUMBERISH.test(prev.s) && NUMBERISH.test(it.s))) {
         prev.w = it.x + it.w - prev.x; prev.s = join(prev.s, it.s);
       } else out.push({ ...it });
     }
