@@ -59,7 +59,9 @@ function columns(ls, at) {
   const heads = band.flatMap((l) => l.items.map((i) => ({ ...i, y: l.y }))).sort((a, b) => a.x - b.x);
   const cols = [];
   for (const it of heads) {
-    const c = cols.find((k) => it.x < k.r + 4 && it.x + it.w > k.l - 4);
+    // a heading split over lines ("Post-" / "date") is one column; two headings side by side on a line never are,
+    // however close ("Chq. No." "Withdrawals")
+    const c = cols.find((k) => it.x < k.r + 4 && it.x + it.w > k.l - 4 && !k.parts.some((p) => Math.abs(p.y - it.y) < 1));
     if (c) { c.parts.push(it); c.l = Math.min(c.l, it.x); c.r = Math.max(c.r, it.x + it.w); } else cols.push({ l: it.x, r: it.x + it.w, parts: [it] });
   }
   cols.sort((a, b) => a.l - b.l);
@@ -95,7 +97,7 @@ export function ocrPages(ocr) {
   return ocr.map((p) => {
     const top = num(p?.top), words = Array.isArray(p?.words) ? p.words.slice(0, 6000) : [];
     return words.filter((w) => typeof w?.s === 'string' && w.s.trim())
-      .map((w) => ({ x: num(w.x), y: num(w.y), w: num(w.w), h: num(w.h) || 8, s: w.s.trim().slice(0, 200) }))
+      .map((w) => ({ x: num(w.x), y: num(w.y), w: num(w.w), h: num(w.h) || 8, s: w.s.trim().slice(0, 200), word: true }))
       .filter((it) => it.y > 30 && it.y < top - 30);
   });
 }
@@ -104,6 +106,7 @@ export function ocrPages(ocr) {
 export function tableFromPages(pages) {
   pages = pages.map(splitAmounts);
   let cols = null, dateCol = -1, ended = false;
+  const wraps = []; // each record's cells, line by line
   const rows = [], records = [];
   // amounts, dates, cheque numbers sit under their heading (often right-aligned): placed by their middle.
   // Words are left-aligned: placed by where they start (a short "AT ,BROUGHT FORWARD" is still Particulars).
@@ -120,12 +123,13 @@ export function tableFromPages(pages) {
     for (let k = 1; k < cols.length; k++) if (it.x + 2 >= cols[k - 1].r) i = k;
     return i;
   };
-  // words close together on a line are one phrase ("GEETA" "HHAH"); OCR gives single words, a PDF gives runs
+  // OCR gives single words: those close together on a line are one phrase ("GEETA" "HHAH"). A PDF's text already
+  // comes in phrases, and its columns can sit only a point or two apart ("23-10-2026"|"AT ,BROUGHT FORWARD"): never joined.
   const pageLines = pages.map((items) => lines(items).map((l) => {
     const out = [];
     for (const it of l.items) {
       const prev = out.at(-1);
-      if (prev && it.x - (prev.x + prev.w) <= Math.max(2.5, 0.6 * it.h) && !(NUMBERISH.test(prev.s) && NUMBERISH.test(it.s))) {
+      if (prev && prev.word && it.word && it.x - (prev.x + prev.w) <= Math.max(2.5, 0.6 * it.h) && !(NUMBERISH.test(prev.s) && NUMBERISH.test(it.s))) {
         prev.w = it.x + it.w - prev.x; prev.s = join(prev.s, it.s);
       } else out.push({ ...it });
     }
@@ -155,7 +159,8 @@ export function tableFromPages(pages) {
       }
       if (!cols || boilerplate(l)) continue; // above the table, or what every page repeats
       const cells = cols.map(() => '');
-      for (const it of l.items) { const k = colOf(it); cells[k] = join(cells[k], it.s); }
+      const xs = cols.map(() => null); // where each cell's text starts on this line
+      for (const it of l.items) { const k = colOf(it); cells[k] = join(cells[k], it.s); xs[k] ??= it.x; }
       // a long plain number under the date is the end of a wrapped description ("5718991")
       if (dateCol >= 0 && dateCol + 1 < cols.length && /^\d{5,}$/.test(cells[dateCol])) { cells[dateCol + 1] = join(cells[dateCol], cells[dateCol + 1]); cells[dateCol] = ''; }
       // below the table (a page footer) until the next headings — or a line with a date and an amount
@@ -164,12 +169,13 @@ export function tableFromPages(pages) {
       const first = cells.find(Boolean) ?? '';
       if (END.test(first) || END.test(l.text)) { if (records.length) ended = true; continue; }
       const d = dateCol >= 0 ? cells[dateCol] : '';
-      if (d && DATE_START.test(d)) { records.push(cells); continue; } // a new transaction
+      if (d && DATE_START.test(d)) { records.push(cells); wraps.push(cells.map((c, k) => (c ? [{ s: c, x: xs[k] }] : []))); continue; } // a new transaction
       if (!records.length) continue;
       if (d && !/^\d{2,4}$/.test(d)) { paused = true; continue; } // the table stops here (a page footer): until the next page's headings
       const last = records.at(-1); // the same transaction, carried onto another line
       cells.forEach((v, k) => {
         if (!v) return;
+        wraps.at(-1)[k].push({ s: v, x: xs[k] });
         // a date broken over two lines whose separator was lost: "21-10" + "2026"
         const sep = k === dateCol && /^\d{1,2}([-/.])\d{1,2}$/.exec(last[k]);
         last[k] = sep && /^\d{2,4}$/.test(v) ? `${last[k]}${sep[1]}${v}` : join(last[k], v);
@@ -177,6 +183,29 @@ export function tableFromPages(pages) {
     }
   }
   if (!cols) fail('No statement table found in this PDF: no heading row with Particulars / Narration and Withdrawals / Debit.');
+  // Some banks (HDFC) cut a description into pieces of a fixed number of characters, often mid-word ("…ROAD LIN" /
+  // "ES-ANSALS…"). When most wrapped cells of a column start with a piece of the same length, that is the width:
+  // a piece that fills it is joined to the next without a space. Wrapping at spaces (IDBI) shows no such width.
+  cols.forEach((_, k) => {
+    const multi = wraps.filter((w) => w[k].length > 1);
+    if (multi.length < 3) return;
+    const lens = new Map();
+    for (const w of multi) lens.set(w[k][0].s.length, (lens.get(w[k][0].s.length) ?? 0) + 1);
+    const [width, count] = [...lens].sort((a, b) => b[1] - a[1])[0];
+    if (width < 12 || count < 3 || count < multi.length * 0.4) return;
+    multi.forEach((w) => {
+      let text = '', piece = 0;
+      // where the column's lines usually start: a piece starting further right began with a space
+      const left = (() => { const m = new Map(); for (const v of multi) for (const p of v[k]) m.set(Math.round(p.x), (m.get(Math.round(p.x)) ?? 0) + 1); return [...m].sort((a, b) => b[1] - a[1])[0][0]; })();
+      for (const { s: part, x } of w[k]) {
+        if (!text) { text = part; piece = part.length; continue; }
+        if (x - left >= 1.2) { text = `${text} ${part}`; piece = 1 + part.length; continue; }
+        // only a piece that fills the width exactly was cut mid-word (one short usually ended in a space)
+        if (piece >= width) { text += part; piece = part.length; } else { text = join(text, part); piece += 1 + part.length; }
+      }
+      records[wraps.indexOf(w)][k] = text;
+    });
+  });
   records.forEach((cells, i) => rows.push({ n: i + 2, cells }));
   return { sheet: '', rows };
 }

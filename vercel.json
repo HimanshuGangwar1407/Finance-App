@@ -3,6 +3,6 @@
   ],
   "crons": [ { "path": "/api/cron/reminders", "schedule": "30 3 * * *" }
   ],
-  "git": { "deploymentEnabled": { "feature/add-people": false, "feature/finance-transactions": false, "additional-features": false, "feature/finance-automation": false, "feature/people-invites": false, "feature/people-signup": false, "feature/admin-accounts": false, "chore/launch-reset": false, "feature/delete-users": false, "feature/transaction-search": false, "feature/excel-import": false, "feature/excel-in-forms": false, "feature/bank-deletion": false, "feature/auto-reconcile": false, "feature/ai": false } },
+  "git": { "deploymentEnabled": { "feature/add-people": false, "feature/finance-transactions": false, "additional-features": false, "feature/finance-automation": false, "feature/people-invites": false, "feature/people-signup": false, "feature/admin-accounts": false, "chore/launch-reset": false, "feature/delete-users": false, "feature/transaction-search": false, "feature/excel-import": false, "feature/excel-in-forms": false, "feature/bank-deletion": false, "feature/auto-reconcile": false, "feature/ai": false, "feature/reconcile-record-all": false } },
   "functions": { "api/index.js": { "maxDuration": 60 } }
 }

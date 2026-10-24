@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import fs from 'node:fs';
 import { readTable } from '../server/sheet.js';
-import { readStatement, matchStatement, similarity } from '../server/reconcile.js';
+import { readStatement, matchStatement, similarity, guessPayee } from '../server/reconcile.js';
 import { setPool } from '../server/db.js';
 import { pglitePool } from '../server/local-db.js';
 import { todayIST, addDays } from '../server/money.js';
@@ -350,7 +350,7 @@ function hdfcPdf() {
   const line = (y, date, desc, ref, wd, dep, bal) => [[34, y, date, 8], ...desc.map((d, i) => [d.startsWith('~') ? 68 : 72, y - 17 * i, d.replace('~', ''), 8]),
     [353 - ref.length * 4.5, y, ref, 8], [362, y, date, 8], ...(wd ? [amt(470, wd, y)] : []), ...(dep ? [amt(548, dep, y)] : []), amt(627, bal, y)];
   const page1 = [...block, [40, 485, 'Date'], [144, 485, 'Narration'], [284, 485, 'Chq./Ref.No.'], [362, 485, 'Value Dt'], [405, 485, 'Withdrawal Amt.'], [491, 485, 'Deposit Amt.'], [564, 485, 'Closing Balance'],
-    ...line(467, '01/10/26', ['CASH DEPOSIT BY - RAMESH - MAIN ROA', 'D CITY'], '000000000000000', '', '15,800.00', '1,015,800.00'),
+    ...line(467, '01/10/26', ['CASH DEPOSIT BY - RAMESH - GURDASPUR ROA', 'D PATHANKOT'], '000000000000000', '', '15,800.00', '1,015,800.00'),
     ...line(433, '01/10/26', ['RTGS DR-JAKA0SHARAN-SHRI SAI LOGISTICS.-', 'ANSALS ARCAD-HDFCR52026100166151258'], '0000000000002151', '561,805.00', '', '453,995.00'),
     ...line(399, '01/10/26', ['RTGS CR-IBKL0000191-EXAMPLE-EXAMPLE', '~PRIV', 'ATE LIMITED-IBKLR92026100100044771'], 'IBKLR92026100100', '', '600,000.00', '1,053,995.00'), [326, 365, '044771', 8],
     ...line(348, '06/10/26', ['RTGS DR-KKBK0004629-ALPHAFACTS HEALTH'], '0000000000002154', '500,000.00', '', '553,995.00'),
@@ -373,8 +373,11 @@ test('PDF: an HDFC statement — every line on every page, nothing from the page
   assert.deepEqual([st.rows.length, st.checked, st.skipped, st.from, st.to, st.closing], [10, { ok: 10, of: 10 }, [], '2026-10-01', '2026-10-23', { date: '2026-10-23', amount: 18_000_400 }]);
   assert.deepEqual([st.rows.filter((r) => r.debit).length, st.rows.filter((r) => r.credit).length], [7, 3]);
   const by = (re) => st.rows.find((r) => re.test(r.narration));
-  assert.equal(by(/ALPHAFACTS/).narration, 'RTGS DR-KKBK0004629-ALPHAFACTS HEALTH SO LUTIONS -ANSALS ARCAD-HDFCR5202610066810 4539'); // carried over to page 2
-  assert.equal(by(/UNIFY/).narration, 'NEFT DR-UBIN0931675-UNIFY LABELS AND INN OVATIONS PVT LTD-ANSALS ARCAD-HDFCH0131 5718991'); // a wrapped 7-digit number
+  // carried over to page 2, and put back together from the bank's 40-character pieces
+  assert.equal(by(/ALPHAFACTS/).narration, 'RTGS DR-KKBK0004629-ALPHAFACTS HEALTH SOLUTIONS -ANSALS ARCAD-HDFCR52026100668104539');
+  assert.equal(by(/UNIFY/).narration, 'NEFT DR-UBIN0931675-UNIFY LABELS AND INNOVATIONS PVT LTD-ANSALS ARCAD-HDFCH0131 5718991'); // and a wrapped 7-digit number (a piece one short of the width keeps its space)
+  assert.equal(by(/RTGS CR/).narration, 'RTGS CR-IBKL0000191-EXAMPLE-EXAMPLE PRIVATE LIMITED-IBKLR92026100100044771');
+  assert.equal(by(/CASH DEPOSIT/).narration, 'CASH DEPOSIT BY - RAMESH - GURDASPUR ROAD PATHANKOT');
   assert.deepEqual([by(/SAROJ/).debit, by(/SAROJ/).date], [4_805_000, '2026-10-08']);
   assert.equal(by(/RTGS CR/).ref, 'IBKLR92026100100 044771');
   assert.ok(st.rows.every((r) => !/NOIDA|KAILASH|HDFC BANK LIMITED|Statement of account|SUMMARY/.test(r.narration)));
@@ -390,4 +393,62 @@ test('a reversal (a negative withdrawal) is money back, and it cancels the payme
   assert.equal(m[1].match.id, 1); // the salary that went through is
   // and on amount alone too: the reversed line of the same amount doesn't make it ambiguous
   assert.deepEqual(matchStatement([bulk, salary], [P(2, 'Staff salaries', 26_528_500, '2026-10-13')], 1)[1].match, { id: 2, how: 'amount', partial: false });
+});
+
+test('the name a statement debit is recorded under, from its narration', () => {
+  for (const [narration, payee] of [
+    ['NEFT DR-KKBK0004585-SAROJ BIOTECH-ANSALS ARCAD-HDFCH01315780237', 'SAROJ BIOTECH'],
+    ['RTGS DR-JAKA0SHARAN-SHRI SAI LOGISTICS.-ANSALS ARCAD-HDFCR52026100166151258', 'SHRI SAI LOGISTICS.'],
+    ['UPI-WARSI PHARMA-8958678808@PTYES-PUNB0363300-316057346656-SENT USING PAYTM U', 'WARSI PHARMA'],
+    ['IMPS-628367942372-CHARMING PUPPIES-YESB-XXXXXXXXXXX0452-IFB', 'CHARMING PUPPIES'],
+    ['AT 191-DELHI - LAJPAT NAGAR ,NEFT-PUNB0486700-GEETA HHAH', 'GEETA HHAH'],
+    ['AT 191-DELHI - LAJPAT NAGAR ,SUNITA', 'SUNITA'],
+    ['AT 191-DELHI - LAJPAT NAGAR ,NEFT-CHARGE-DR-IBKL26102199181', 'Bank charges'],
+    ['FT - DR - 50100231612823 - NEELAM SHARMA', 'NEELAM SHARMA'],
+    ['CHQ PAID-TRANSFER IN-BABA TRANSPORT CO', 'BABA TRANSPORT CO'],
+    ['RAJEEV - CHQ PAID - ANSALS ARCAD', 'RAJEEV'],
+    ['EHREZVU1ZR0KX6/EPFO', 'EPFO'], ['06126142079091/ESIC', 'ESIC'],
+    ['KYQHS4UEANZ2LPOVDY/PAYUFACEBOOK', 'PAYUFACEBOOK'], ['011026I049903378 DPO2727408602841 IGST', 'IGST'],
+    ['50200078706901-TPT-NBANWGBNGMP8AVT9-AE 1 FASHION HOUSE PRIVATE LIMITED', 'AE 1 FASHION HOUSE PRIVATE LIMITED'],
+    ['GST/BANK REFERENCE NO: R2629376501077/CI N NO: HDFC26100500049069', 'GST'],
+    ['IB BILLPAY DR-HDFC1P-442145XXXXXX0858', 'Bill payment (net banking)'],
+    ['BULK SALARY-EXAMPLE PRIVATE LIMITED DR', 'Salaries (bulk)'],
+    ['SOMETHING UNUSUAL', 'SOMETHING UNUSUAL'], ['', 'Bank debit'],
+  ]) assert.equal(guessPayee(narration), payee, narration);
+});
+
+test('API: record every statement debit not in the app at once — each under its name; a reversed one is refused', async () => {
+  const id = (await admin('/api/banks', { name: 'HDFC Bulk', bank: 'HDFC Bank', last4: '7777' })).body.id;
+  const body = { file: hdfcPdf().toString('base64'), name: 'hdfc.pdf', bank_id: id };
+  const d = (await editor('/api/reconcile/check', body)).body;
+  const open = d.debits.filter((x) => !x.recorded && !x.match);
+  const reversed = open.find((x) => x.reversedBy);
+  assert.ok(reversed);
+  assert.deepEqual(open.filter((x) => !x.reversedBy).map((x) => x.payee).sort(),
+    ['ALPHAFACTS HEALTH SOLUTIONS', 'SAROJ BIOTECH', 'SHRI SAI LOGISTICS.', 'Salaries (bulk)', 'TITAN BIOTECH LTD', 'UNIFY LABELS AND INNOVATIONS PVT LTD']);
+  assert.match((await editor('/api/reconcile/apply', { ...body, record: [{ row: reversed.row }] })).body.error.message, /reversed by the bank/);
+  const all = open.filter((x) => !x.reversedBy);
+  const r = await editor('/api/reconcile/apply', { ...body, record: all.map((x) => ({ row: x.row })) });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual([r.body.recorded, r.body.recordedAmount], [6, all.reduce((n, x) => n + x.amount, 0)]);
+  const { rows } = await pool.query("SELECT p.payee, p.amount, e.date FROM payments p JOIN entries e ON e.payment_id = p.id WHERE e.bank_id = $1 ORDER BY e.date, p.id", [id]);
+  assert.deepEqual(rows.map((x) => x.payee), ['SHRI SAI LOGISTICS.', 'ALPHAFACTS HEALTH SOLUTIONS', 'UNIFY LABELS AND INNOVATIONS PVT LTD', 'SAROJ BIOTECH', 'Salaries (bulk)', 'TITAN BIOTECH LTD']);
+  // the same statement again: all of them now already in the app; the reversed one still just shown
+  const again = (await editor('/api/reconcile/check', body)).body.debits.filter((x) => !x.recorded);
+  assert.deepEqual(again.map((x) => x.row), [reversed.row]);
+});
+
+test('PDF: an IDBI email with its columns packed tight (the date 1.5 pt from the particulars, “Chq. No.” 1.4 pt from “Withdrawals”)', () => {
+  // the text pieces and places pdf.js gives for such a statement (the wording made up)
+  const T = (x, y, w, s) => ({ x, y, w, h: 9, s });
+  const page = [T(50.2, 553.9, 21.8, 'Name'), T(103.5, 553.9, 178.7, ': EXAMPLE HEALTH SOLUTIONS BVBA'), T(50.2, 517.9, 17.3, 'Date'), T(99.1, 517.9, 132.4, ': From:23-10-2026 To:23-10-2026'),
+    T(47.2, 470.7, 36.4, 'Post-date'), T(163.9, 470.7, 41.3, 'Particulars'), T(283.3, 470.7, 32.9, 'Chq. No.'), T(317.6, 470.7, 47, 'Withdrawals'), T(375, 470.7, 33.8, 'Deposits'), T(429.6, 470.7, 30.7, 'Balance'),
+    T(45, 446.7, 40.9, '23-10-2026'), T(87.4, 446.7, 96.9, 'AT ,BROUGHT FORWARD'), T(419.2, 446.7, 51.5, '1,85,024.31'),
+    T(45, 414.4, 40.9, '23-10-2026'), T(87.4, 414.4, 194.4, 'AT 9990-ETPC ,HDFCR52026102375837779 VET-KPI'), T(366.2, 414.4, 51.5, '4,00,000.00'), T(419.2, 414.4, 51.5, '5,85,024.31'),
+    T(43.5, 391.9, 22.6, 'Note :'), T(68.4, 391.9, 161.9, 'Clearing credits are subject to realisation.')];
+  const t = tableFromPages([page]);
+  assert.deepEqual(t.rows[0].cells, ['Post-date', 'Particulars', 'Chq. No.', 'Withdrawals', 'Deposits', 'Balance']);
+  const st = readStatement(t);
+  assert.deepEqual(st.rows.map((r) => [r.date, r.narration, r.debit, r.credit, r.balance]), [['2026-10-23', 'AT 9990-ETPC ,HDFCR52026102375837779 VET-KPI', 0, 40_000_000, 58_502_431]]);
+  assert.deepEqual([st.opening, st.checked], [18_502_431, { ok: 1, of: 1 }]);
 });

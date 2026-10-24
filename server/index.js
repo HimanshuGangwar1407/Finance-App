@@ -15,7 +15,7 @@ import { emiDates } from './emi.js';
 import { bankStatements } from './ledger.js';
 import { toCsv, toXlsx } from './export.js';
 import { readTable, importRows, MAX_BYTES } from './sheet.js';
-import { readStatement, matchStatement, lineRef } from './reconcile.js';
+import { readStatement, matchStatement, lineRef, guessPayee } from './reconcile.js';
 import { readWithAi, tableFromLines, aiConfigured } from './ai.js';
 import { dueReminders, projectDates, coverage, DEFAULT_BEFORE } from './reminders.js';
 import { emailConfigured, sendEmail } from './email.js';
@@ -520,7 +520,7 @@ async function reconcileCheck(c, body) {
   return {
     bank, fileName: str(body.name, 200), ocr: Boolean(body.ocr) && !body.lines, ai: Boolean(body.lines), checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
     appClosing: app.closing, balanceEntered: app.balanceEntered,
-    debits: debits.map((d) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount: d.debit, recorded: d.recorded ?? null, mismatch: d.mismatch ?? null, reversedBy: d.reversedBy ?? null,
+    debits: debits.map((d) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount: d.debit, recorded: d.recorded ?? null, mismatch: d.mismatch ?? null, reversedBy: d.reversedBy ?? null, payee: guessPayee(d.narration),
       match: byRow.get(d.row)?.match ?? null, candidates: byRow.get(d.row)?.candidates ?? [] })),
     credits: { count: credits.length, amount: credits.reduce((n, r) => n + r.credit, 0) },
     payments,
@@ -901,7 +901,8 @@ const routes = [
     }
     for (const r of [].concat(body.record ?? [])) {
       const l = useLine(r.row);
-      const p = await addPayment(c, { payee: str(r.payee, 120) || l.narration.slice(0, 120) || 'Bank debit', category: r.category || 'Other', amount: (l.amount / 100).toFixed(2), due_date: l.date,
+      if (l.reversedBy) bad(`Statement row ${l.row} was reversed by the bank (row ${l.reversedBy}): it isn’t a payment to record.`);
+      const p = await addPayment(c, { payee: str(r.payee, 120) || l.payee || 'Bank debit', category: r.category || 'Other', amount: (l.amount / 100).toFixed(2), due_date: l.date,
         bank_id: bankId, note: str(`From the bank statement: ${l.narration}`, 300), approved: true, confirmDuplicate: true }, user);
       await settle(c, { table: 'payments', id: p.id, body: { bank_id: bankId, date: l.date, ref: l.bankRef, fromStatement: true }, user });
       out.recorded++; out.recordedAmount += l.amount;
