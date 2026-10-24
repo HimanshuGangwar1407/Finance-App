@@ -73,7 +73,7 @@ export function readStatement(table) {
     const bal = cols.balance != null && String(cell(r, 'balance')).trim() !== '' ? money(cell(r, 'balance')) : null;
     if (!debit && !credit && bal == null) continue;
     const neg = /dr$|^-|^\(/i.test(String(cell(r, 'balance')).trim()); // an overdrawn balance
-    const reversal = cols.debit != null && (/^\s*(-|\()/.test(String(cell(r, 'debit'))) || /^\s*(-|\()/.test(String(cell(r, 'credit')))) || /^\s*reversal\b/i.test(narration);
+    const reversal = cols.debit != null && (/^\s*(-|\()/.test(String(cell(r, 'debit'))) || /^\s*(-|\()/.test(String(cell(r, 'credit')))) || /^\s*reversal\b|\bRET(URN|URNED)?\b/i.test(narration); // a reversal, or a returned cheque ("CHQ DEP RET-…")
     rows.push({ row: r.n, date, narration, ref: text(r, 'ref', 80).replace(/^0+$/, ''), debit, credit, balance: bal == null ? null : neg ? -bal : bal, ...(reversal ? { reversal: true } : {}) });
   }
   // oldest first: by date, or (all on one day) by whichever order the running balance agrees with
@@ -141,13 +141,15 @@ export function similarity(line, p) {
  *   match: { id, how: 'ref' | 'name' | 'amount', partial } — or null, with candidates: payment ids it could be.
  * A match on amount alone is made only when it can't be anything else (one debit and one payment of that amount).
  */
-export function matchStatement(debits, payments, bankId) {
+export function matchStatement(debits, payments, bankId, key = 'debit') {
+  // a line's amount; a line that doesn't add up, or a reversal pair, is never matched by itself
+  const amt = (d) => d[key], off = (d) => d.mismatch || d.reversedBy || d.reverses;
   const pairs = [];
   for (const d of debits) {
-    if (d.mismatch || d.reversedBy) continue;
+    if (off(d)) continue;
     for (const p of payments) {
-      if (d.debit > p.outstanding) continue;
-      const s = similarity(d, p), exact = d.debit === p.outstanding;
+      if (amt(d) > p.outstanding) continue;
+      const s = similarity(d, p), exact = amt(d) === p.outstanding;
       const strong = s.ref || s.name >= 0.5;
       if (!exact && !strong) continue; // part payments only when the line names the payment
       const score = (s.ref ? 3 : 0) + 2 * s.name + (exact ? 1 : 0) + (p.bank_id === bankId ? 0.3 : p.bank_id == null ? 0.1 : 0) - Math.min(days(d.date, p.due_date), 60) / 100;
@@ -164,20 +166,20 @@ export function matchStatement(debits, payments, bankId) {
   }
   // amount only: when exactly one free debit and one free payment have that amount
   // (a line the bank reversed isn't a payment: it doesn't make another line of the same amount ambiguous)
-  const freeD = debits.filter((d) => !usedD.has(d.row) && !d.reversedBy), freeP = payments.filter((p) => !usedP.has(p.id));
+  const freeD = debits.filter((d) => !usedD.has(d.row) && !d.reversedBy && !d.reverses), freeP = payments.filter((p) => !usedP.has(p.id));
   for (const d of freeD) {
-    if (d.mismatch || d.reversedBy) continue;
-    const sameD = freeD.filter((x) => x.debit === d.debit), sameP = freeP.filter((p) => p.outstanding === d.debit && !usedP.has(p.id));
+    if (off(d)) continue;
+    const sameD = freeD.filter((x) => amt(x) === amt(d)), sameP = freeP.filter((p) => p.outstanding === amt(d) && !usedP.has(p.id));
     if (sameD.length === 1 && sameP.length === 1) { usedP.add(sameP[0].id); usedD.add(d.row); out.set(d.row, { id: sameP[0].id, how: 'amount', partial: false }); }
   }
   return debits.map((d) => ({
     ...d,
     match: out.get(d.row) ?? null,
     // to choose by hand: payments of exactly this amount first, then larger ones that name it
-    candidates: out.has(d.row) || d.reversedBy ? [] : payments.filter((p) => !usedP.has(p.id) && p.outstanding >= d.debit)
+    candidates: out.has(d.row) || d.reversedBy || d.reverses ? [] : payments.filter((p) => !usedP.has(p.id) && p.outstanding >= amt(d))
       .map((p) => ({ p, s: similarity(d, p) }))
-      .filter(({ p, s }) => p.outstanding === d.debit || s.ref || s.name > 0)
-      .sort((a, b) => (b.p.outstanding === d.debit) - (a.p.outstanding === d.debit) || b.s.name - a.s.name || days(d.date, a.p.due_date) - days(d.date, b.p.due_date))
+      .filter(({ p, s }) => p.outstanding === amt(d) || s.ref || s.name > 0)
+      .sort((a, b) => (b.p.outstanding === amt(d)) - (a.p.outstanding === amt(d)) || b.s.name - a.s.name || days(d.date, a.p.due_date) - days(d.date, b.p.due_date))
       .slice(0, 10).map(({ p }) => p.id),
   }));
 }
@@ -199,7 +201,7 @@ export function guessPayee(narration) {
   if (/^(NEFT|RTGS|IMPS)( (DR|CR))?$/.test(kind)) name = segs.slice(1).find((x) => !code(x));
   else if (kind === 'UPI') name = segs[1];
   else if (kind === 'CHQ PAID' && /^TRANSFER IN$/i.test(segs[1] ?? '')) name = segs[2];
-  else if (kind === 'FT') name = segs.slice(1).reverse().find((x) => !code(x) && !/^(DR|CR)$/i.test(x));
+  else if (kind === 'FT') name = /^FT\s*-\s*(DR|CR)\s*-\s*\S+\s*-\s*(.+)$/i.exec(s)?.[2] ?? segs.slice(1).reverse().find((x) => !code(x) && !/^(DR|CR)$/i.test(x)); // the name may have a hyphen ("VET-KPI")
   else if ((segs[1] ?? '').toUpperCase() === 'TPT') name = segs.at(-1); // a transfer within the bank: "<account>-TPT-<ref>-<name>"
   else if (/\bIGST$/i.test(s)) name = 'IGST';
   else if (/^[A-Z0-9]{8,}\/([A-Z][A-Z0-9 &.]+)$/i.test(s)) name = /\/([^/]+)$/.exec(s)[1].toUpperCase(); // "<code>/EPFO", "<code>/PAYUFACEBOOK"
@@ -208,6 +210,14 @@ export function guessPayee(narration) {
   else if (/^BULK SALARY/i.test(s)) name = 'Salaries (bulk)';
   else if (/^BULK NEFT/i.test(s)) name = 'Bulk NEFT';
   else if (/ - CHQ PAID\b/i.test(s)) name = segs[0];
+  // money in
+  else if (/^CASH DEPOSIT\b/i.test(s)) name = `Cash deposit${segs[1] ? ` (${segs[1]})` : ''}`;
+  else if (/^INW\b/i.test(s)) name = `Inward remittance${/\b(USD|EUR|GBP|AED|SGD|AUD|CAD|JPY|CHF)\s?[\d.]/i.test(s) ? ` (${/\b(USD|EUR|GBP|AED|SGD|AUD|CAD|JPY|CHF)/i.exec(s)[1].toUpperCase()})` : ''}`;
+  else if (/^CHQ DEP\b.*?:\s*([^:]+?)\s*:/i.test(s)) name = /^CHQ DEP\b.*?:\s*([^:]+?)\s*:/i.exec(s)[1]; // "CHQ DEP - … -: BAXI MEDICAL STORE :INDIAN OVERSEAS BANK"
+  else if (/\bCR - \d{6,} - (.+)$/i.test(s)) name = /\bCR - \d{6,} - (.+)$/i.exec(s)[1]; // "… CR - 99999810773791 - VET-KPI"
+  else if (/^\d{6,}$/.test(segs[0] ?? '') && segs[1]) name = segs.slice(1).join('-').replace(/\s+R N BR$/i, ''); // "9004193861-MANKIND PHARMA LIMITED R N BR"
+  // whatever else: without the long reference codes in it ("HDFCR52026102375837779 VET-KPI" → "VET-KPI")
+  if (!name) s = s.replace(/\b[A-Z0-9]*\d[A-Z0-9]{10,}\b/gi, '').replace(/\s+/g, ' ').trim() || s;
   return str((name || s).replace(/^(M\/S\.?|MS)\s+/i, ''), 60) || 'Bank debit';
 }
 

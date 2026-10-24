@@ -122,7 +122,7 @@ test('check: matches the statement, lists what is due, changes nothing', async (
   const d = r.body;
   assert.deepEqual([d.bank.name, d.from, d.to, d.closing], ['HDFC Current', yday, yday, { date: yday, amount: 44_224_100 }]); // the last line is the ₹80,000 credit
   assert.equal(d.appClosing, 50_000_000);
-  assert.deepEqual(d.credits, { count: 1, amount: 8_000_000 });
+  assert.deepEqual(d.credits.map((x) => [x.amount, x.payee, x.match, x.recorded]), [[8_000_000, 'MEHTA RETAIL', null, null]]); // money in: no receipt expected for it
   assert.deepEqual(d.debits.map((x) => [x.amount, x.match?.id ?? null, x.match?.how ?? null, x.recorded]), [
     [12_500_000, ids.steel, 'ref', null], [820_000, ids.gupta, 'name', null], [450_000, ids.supplies, 'amount', null], [5_900, null, null, null]]);
   // due by the statement's day, for this account or not decided: the matched three, rent, Sharma, the EMI — not Later Co
@@ -149,7 +149,8 @@ test('apply: matched debits are paid (only these leave the balance); left-out on
     leftOut: [{ id: ids.rent, action: 'today' }, { id: ids.sharma, action: 'tomorrow' }, { id: ids.emi, action: 'cancel' }],
   });
   assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.deepEqual(r.body, { paid: 3, paidAmount: 13_770_000, recorded: 1, recordedAmount: 5_900, today: 1, tomorrow: 1, cancelled: 1, balanceSaved: false });
+  assert.deepEqual(r.body, { paid: 3, paidAmount: 13_770_000, recorded: 1, recordedAmount: 5_900, today: 1, tomorrow: 1, cancelled: 1,
+    received: 0, receivedAmount: 0, recordedIn: 0, recordedInAmount: 0, inToday: 0, inTomorrow: 0, inCancelled: 0, balanceSaved: false });
   const { rows: e } = await pool.query("SELECT p.payee, e.amount, e.date, e.ref, e.bank_id FROM entries e JOIN payments p ON p.id = e.payment_id ORDER BY e.id");
   assert.deepEqual(e.map((x) => [x.payee, Number(x.amount), x.date, x.ref, x.bank_id]), [
     ['Steel Co', 12_500_000, yday, 'N295123456', hdfc], ['Gupta Transport', 820_000, yday, '229512345678', hdfc], ['Office Supplies', 450_000, yday, '123456789012', hdfc],
@@ -451,4 +452,67 @@ test('PDF: an IDBI email with its columns packed tight (the date 1.5 pt from the
   const st = readStatement(t);
   assert.deepEqual(st.rows.map((r) => [r.date, r.narration, r.debit, r.credit, r.balance]), [['2026-10-23', 'AT 9990-ETPC ,HDFCR52026102375837779 VET-KPI', 0, 40_000_000, 58_502_431]]);
   assert.deepEqual([st.opening, st.checked], [18_502_431, { ok: 1, of: 1 }]);
+});
+
+// ── money in: receipts reconciled too, for the bank's actual position ──
+test('who money came from, from the narration', () => {
+  for (const [narration, payer] of [
+    ['9004193861-MANKIND PHARMA LIMITED R N BR', 'MANKIND PHARMA LIMITED'],
+    ['CASH DEPOSIT BY - RANISH - GURDASPUR ROAD PATHANKOT', 'Cash deposit (RANISH)'],
+    ['INW 011026I049903378 EUR16330.0@106.31', 'Inward remittance (EUR)'],
+    ['CHQ DEP - CTS CLG2 - NOIDA - CTS CLG2 -: BAXI MEDICAL STORE :INDIAN OVERSEAS BANK', 'BAXI MEDICAL STORE'],
+    ['NEFT CR-SBIN0004266-EPAO CUSTOMS DUTY DRAWBACK PAYMENTS-EXAMPLE PRIVATE LIMITED-SBIC300359490828', 'EPAO CUSTOMS DUTY DRAWBACK PAYMENTS'],
+    ['FT - CR - 99999810773791 - VET-KPI', 'VET-KPI'], ['EXAMPLE PRIVATE LIMITED CR - 50200076549894 - GHENT NUTRITION', 'GHENT NUTRITION'],
+    ['AT 9990-ETPC ,HDFCR52026102375837779 VET-KPI', 'VET-KPI'], ['UPI-WARSI PHARMA-8958678808@PTYES-PUNB0363300-316057346656-SENT USING PAYTM U', 'WARSI PHARMA'],
+  ]) assert.equal(guessPayee(narration), payer, narration);
+});
+
+test('a returned cheque (“CHQ DEP RET”) cancels the deposit it returns: neither is a receipt or a payment', () => {
+  const st = statement(csv('Date,Narration,Chq./Ref.No.,Withdrawal Amt.,Deposit Amt.,Closing Balance\n'
+    + '09/10/26,CHQ DEP - TRANSFER OW 1 - NOIDA WBO: VET-KPI :HDFC BANK LTD,0000000000002002,,50000.00,150000.00\n'
+    + '09/10/26,CHQ DEP RET- DRAWER SIGNATURE DIFFERS,0000000000002002,50000.00,,100000.00\n'));
+  const [dep, ret] = st.rows;
+  assert.deepEqual([dep.credit, dep.reversedBy, ret.debit, ret.reverses], [5_000_000, ret.row, 5_000_000, dep.row]);
+  assert.equal(matchStatement([dep], [P(1, 'VET-KPI', 5_000_000, '2026-10-09')], 1, 'credit')[0].match, null);
+  assert.equal(matchStatement([ret], [P(2, 'Anyone', 5_000_000, '2026-10-09')], 1)[0].match, null);
+});
+
+test('API: money in — receipts found in the statement are received, new ones recorded, the missing one moved; the app then matches the bank', async () => {
+  const bank = (await admin('/api/banks', { name: 'Receipts Bank', bank: 'HDFC Bank', last4: '4444' })).body.id;
+  await admin('/api/balances', { bank_id: bank, amount: '1,00,000', as_of: addDays(today, -5) });
+  const rec = async (party, amount, x = {}) => (await editor('/api/transactions', { kind: 'IN', status: 'pending', party, amount, date: yday, bank_id: bank, ...x })).body.id;
+  const ids = { mankind: await rec('Mankind Pharma Ltd', '1,07,365'), baxi: await rec('Baxi Medical Store', '14,417'), late: await rec('Late Customer', '20,000'),
+    saroj: await pay('Saroj Biotech', '48,050', yday, { bank_id: bank }) };
+  const s = csv(`Date,Narration,Chq./Ref.No.,Withdrawal Amt.,Deposit Amt.,Closing Balance
+${dmy(yday)},9004193861-MANKIND PHARMA LIMITED R N BR,0000610018639090,,"1,07,365.00","2,07,365.00"
+${dmy(yday)},CHQ DEP - CTS CLG2 - NOIDA - CTS CLG2 -: BAXI MEDICAL STORE :INDIAN OVERSEAS BANK,0000000000559812,,"14,417.00","2,21,782.00"
+${dmy(yday)},CASH DEPOSIT BY - RANISH - GURDASPUR ROAD PATHANKOT,000000000000000,,"15,800.00","2,37,582.00"
+${dmy(yday)},CHQ DEP - TRANSFER OW 1 - NOIDA WBO: VET-KPI :HDFC BANK LTD,0000000000002002,,"50,000.00","2,87,582.00"
+${dmy(yday)},CHQ DEP RET- DRAWER SIGNATURE DIFFERS,0000000000002002,"50,000.00",,"2,37,582.00"
+${dmy(yday)},NEFT DR-KKBK0004585-SAROJ BIOTECH-ANSALS ARCAD-HDFCH01315780237,0000000000002153,"48,050.00",,"1,89,532.00"
+${dmy(yday)},SERVICE CHARGES - NEFT GST,,59.00,,"1,89,473.00"
+`);
+  const body = { file: s.toString('base64'), name: 'hdfc.csv', bank_id: bank };
+  const d = (await editor('/api/reconcile/check', body)).body;
+  assert.deepEqual(d.credits.map((x) => [x.amount, x.match?.id ?? null, x.match?.how ?? null, x.payee, Boolean(x.reversedBy)]), [
+    [10_736_500, ids.mankind, 'name', 'MANKIND PHARMA LIMITED', false], [1_441_700, ids.baxi, 'name', 'BAXI MEDICAL STORE', false],
+    [1_580_000, null, null, 'Cash deposit (RANISH)', false], [5_000_000, null, null, 'VET-KPI', true]]);
+  assert.ok(d.dueIn.includes(ids.late) && d.receipts.some((r) => r.id === ids.late));
+  const cheque = d.credits.find((x) => x.reversedBy), charges = d.debits.find((x) => /SERVICE/.test(x.narration)), cash = d.credits.find((x) => /CASH/.test(x.narration));
+  assert.match((await editor('/api/reconcile/apply', { ...body, recordIn: [{ row: cheque.row }] })).body.error.message, /reversed by the bank/);
+
+  const r = await editor('/api/reconcile/apply', { ...body,
+    matches: [{ row: d.debits.find((x) => x.match).row, id: ids.saroj }], record: [{ row: charges.row }],
+    matchesIn: d.credits.filter((x) => x.match).map((x) => ({ row: x.row, id: x.match.id })), recordIn: [{ row: cash.row }], leftOutIn: [{ id: ids.late, action: 'tomorrow' }] });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual([r.body.paid, r.body.recorded, r.body.received, r.body.receivedAmount, r.body.recordedIn, r.body.recordedInAmount, r.body.inTomorrow], [1, 1, 2, 12_178_200, 1, 1_580_000, 1]);
+  // the app now shows the bank's actual position: its balance is the statement's closing balance
+  const sum = (await editor(`/api/transactions/summary?bank=${bank}&from=${addDays(today, -4)}&to=${yday}`)).body.total;
+  assert.equal(sum.closing, 18_947_300);
+  const { rows } = await pool.query("SELECT party, expected_date, (SELECT sum(amount) FROM entries e WHERE e.receipt_id = r.id)::bigint AS got FROM receipts r WHERE bank_id = $1 ORDER BY id", [bank]);
+  assert.deepEqual(rows.map((x) => [x.party, x.expected_date, Number(x.got ?? 0)]), [
+    ['Mankind Pharma Ltd', yday, 10_736_500], ['Baxi Medical Store', yday, 1_441_700], ['Late Customer', addDays(today, 1), 0], ['Cash deposit (RANISH)', yday, 1_580_000]]);
+  // the same statement again: everything already in the app, except the returned cheque and its return
+  const again = (await editor('/api/reconcile/check', body)).body;
+  assert.deepEqual([...again.debits, ...again.credits].filter((x) => !x.recorded).map((x) => x.narration.slice(0, 12)).sort(), ['CHQ DEP - TR', 'CHQ DEP RET-']);
 });

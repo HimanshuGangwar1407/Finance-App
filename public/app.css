@@ -295,3 +295,5 @@ details.card summary { cursor: pointer; font-weight: 600; }
 table.rec .chip.c-red { display: inline-block; margin-top: 4px; white-space: normal; }
 .rec-ai { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; padding: 8px 12px; border: 1px dashed var(--line); border-radius: 10px; }
 .rec-ai.urge { border-color: var(--amber); background: var(--amber-bg); }
+.rec-all { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.rec-all button { white-space: normal; text-align: left; }
