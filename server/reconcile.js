@@ -60,7 +60,12 @@ export function readStatement(table) {
     const date = parseDate(rawDate, table.base1904);
     if (!date) { if (/\d/.test(String(rawDate))) skipped.push({ row: r.n, why: `date “${String(rawDate).slice(0, 20)}” not understood` }); continue; }
     let debit, credit;
-    if (cols.debit != null) { debit = money(cell(r, 'debit')); credit = money(cell(r, 'credit')); } else {
+    if (cols.debit != null) {
+      debit = money(cell(r, 'debit')); credit = money(cell(r, 'credit'));
+      // a reversal printed as a negative withdrawal ("-265,285.00") is money coming back, and the other way round
+      const neg = (k) => /^\s*(-|\()/.test(String(cell(r, k)));
+      if (debit != null && credit != null && (neg('debit') || neg('credit'))) [debit, credit] = [(neg('debit') ? 0 : debit) + (neg('credit') ? credit : 0), (neg('credit') ? 0 : credit) + (neg('debit') ? debit : 0)];
+    } else {
       const a = money(cell(r, 'amount')), t = String(cell(r, 'drcr')).trim();
       debit = /^(d|dr|debit|withdrawal)/i.test(t) ? a : 0; credit = /^(c|cr|credit|deposit)/i.test(t) ? a : 0;
     }
@@ -68,7 +73,8 @@ export function readStatement(table) {
     const bal = cols.balance != null && String(cell(r, 'balance')).trim() !== '' ? money(cell(r, 'balance')) : null;
     if (!debit && !credit && bal == null) continue;
     const neg = /dr$|^-|^\(/i.test(String(cell(r, 'balance')).trim()); // an overdrawn balance
-    rows.push({ row: r.n, date, narration, ref: text(r, 'ref', 80).replace(/^0+$/, ''), debit, credit, balance: bal == null ? null : neg ? -bal : bal });
+    const reversal = cols.debit != null && (/^\s*(-|\()/.test(String(cell(r, 'debit'))) || /^\s*(-|\()/.test(String(cell(r, 'credit')))) || /^\s*reversal\b/i.test(narration);
+    rows.push({ row: r.n, date, narration, ref: text(r, 'ref', 80).replace(/^0+$/, ''), debit, credit, balance: bal == null ? null : neg ? -bal : bal, ...(reversal ? { reversal: true } : {}) });
   }
   // oldest first: by date, or (all on one day) by whichever order the running balance agrees with
   const fits = (list) => list.reduce((n, r, i) => n + (i > 0 && list[i - 1].balance != null && r.balance != null && list[i - 1].balance - r.debit + r.credit === r.balance ? 1 : 0), 0);
@@ -80,6 +86,14 @@ export function readStatement(table) {
     if (r.balance != null && prev != null && prev - r.debit + r.credit !== r.balance) r.mismatch = { expected: prev - r.debit + r.credit, shown: r.balance };
     if (r.balance != null) prev = r.balance;
   }
+  // a reversal cancels the earlier line with the same reference and amount (a payment the bank sent back): neither is
+  // a payment made, so neither is matched
+  rows.forEach((rv, i) => {
+    if (!rv.reversal) return;
+    const amt = rv.credit || rv.debit, ref = normRef(rv.ref);
+    const orig = rows.slice(0, i).reverse().find((x) => !x.reversal && !x.reversedBy && (rv.credit ? x.debit : x.credit) === amt && (!ref || normRef(x.ref) === ref));
+    if (orig) { orig.reversedBy = rv.row; rv.reverses = orig.row; }
+  });
   const opening = rows.find((r) => r.balance != null && !r.debit && !r.credit);
   rows.splice(0, rows.length, ...rows.filter((r) => r.debit || r.credit));
   if (!rows.length) bad('No transactions found under the statement’s headings.');
@@ -130,7 +144,7 @@ export function similarity(line, p) {
 export function matchStatement(debits, payments, bankId) {
   const pairs = [];
   for (const d of debits) {
-    if (d.mismatch) continue;
+    if (d.mismatch || d.reversedBy) continue;
     for (const p of payments) {
       if (d.debit > p.outstanding) continue;
       const s = similarity(d, p), exact = d.debit === p.outstanding;
@@ -149,9 +163,10 @@ export function matchStatement(debits, payments, bankId) {
     out.set(x.d.row, { id: x.p.id, how: x.how, partial: x.partial });
   }
   // amount only: when exactly one free debit and one free payment have that amount
-  const freeD = debits.filter((d) => !usedD.has(d.row)), freeP = payments.filter((p) => !usedP.has(p.id));
+  // (a line the bank reversed isn't a payment: it doesn't make another line of the same amount ambiguous)
+  const freeD = debits.filter((d) => !usedD.has(d.row) && !d.reversedBy), freeP = payments.filter((p) => !usedP.has(p.id));
   for (const d of freeD) {
-    if (d.mismatch) continue;
+    if (d.mismatch || d.reversedBy) continue;
     const sameD = freeD.filter((x) => x.debit === d.debit), sameP = freeP.filter((p) => p.outstanding === d.debit && !usedP.has(p.id));
     if (sameD.length === 1 && sameP.length === 1) { usedP.add(sameP[0].id); usedD.add(d.row); out.set(d.row, { id: sameP[0].id, how: 'amount', partial: false }); }
   }
@@ -159,7 +174,7 @@ export function matchStatement(debits, payments, bankId) {
     ...d,
     match: out.get(d.row) ?? null,
     // to choose by hand: payments of exactly this amount first, then larger ones that name it
-    candidates: out.has(d.row) ? [] : payments.filter((p) => !usedP.has(p.id) && p.outstanding >= d.debit)
+    candidates: out.has(d.row) || d.reversedBy ? [] : payments.filter((p) => !usedP.has(p.id) && p.outstanding >= d.debit)
       .map((p) => ({ p, s: similarity(d, p) }))
       .filter(({ p, s }) => p.outstanding === d.debit || s.ref || s.name > 0)
       .sort((a, b) => (b.p.outstanding === d.debit) - (a.p.outstanding === d.debit) || b.s.name - a.s.name || days(d.date, a.p.due_date) - days(d.date, b.p.due_date))

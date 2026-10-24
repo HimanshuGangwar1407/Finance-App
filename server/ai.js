@@ -44,6 +44,8 @@ const SCHEMA = {
 const PROMPT = `This is a bank account statement from an Indian bank. Copy every transaction line of its table into "lines", in the order printed, across all pages.
 
 - Copy each figure exactly as printed, digit for digit — never calculate, round, correct or fill in a value. Leave a field "" when the statement leaves it empty.
+- Keep a minus sign or brackets on an amount exactly as printed (a reversal is often shown as "-265,285.00" in the withdrawal column).
+- A description that wraps onto the next line, or carries over to the next page, belongs to the line above it — join it on.
 - Include an opening line such as "BROUGHT FORWARD" or "Opening Balance" if the table has one (it has only a balance).
 - Leave out column headings, page headers and footers, totals, summaries and disclaimers.
 - If a figure can't be read with certainty, copy what you can see and say which line in "note".`;

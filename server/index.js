@@ -520,7 +520,7 @@ async function reconcileCheck(c, body) {
   return {
     bank, fileName: str(body.name, 200), ocr: Boolean(body.ocr) && !body.lines, ai: Boolean(body.lines), checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
     appClosing: app.closing, balanceEntered: app.balanceEntered,
-    debits: debits.map((d) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount: d.debit, recorded: d.recorded ?? null, mismatch: d.mismatch ?? null,
+    debits: debits.map((d) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount: d.debit, recorded: d.recorded ?? null, mismatch: d.mismatch ?? null, reversedBy: d.reversedBy ?? null,
       match: byRow.get(d.row)?.match ?? null, candidates: byRow.get(d.row)?.candidates ?? [] })),
     credits: { count: credits.length, amount: credits.reduce((n, r) => n + r.credit, 0) },
     payments,

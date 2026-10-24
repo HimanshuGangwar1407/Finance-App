@@ -107,9 +107,12 @@ export function tableFromPages(pages) {
   const rows = [], records = [];
   // amounts, dates, cheque numbers sit under their heading (often right-aligned): placed by their middle.
   // Words are left-aligned: placed by where they start (a short "AT ,BROUGHT FORWARD" is still Particulars).
+  // A short run of digits ("4539", "2026") is usually the end of a wrapped description or date: placed by where it
+  // starts. A long one (a cheque / reference no., "081400") sits under its heading.
   const NUMBERISH = /^(-?[\d,]+\.\d{1,2}(\s*(dr|cr))?|\d{1,2}[-/.].*|\d{1,8})$/i;
+  const CENTRED = /^(-?[\d,]+\.\d{1,2}(\s*(dr|cr))?|\d{1,2}[-/.].*|\d{6,8})$/i;
   const colOf = (it) => {
-    if (NUMBERISH.test(it.s)) {
+    if (CENTRED.test(it.s)) {
       const m = it.x + it.w / 2, i = cols.findIndex((c, k) => m < (k + 1 < cols.length ? (c.mid + cols[k + 1].mid) / 2 : Infinity));
       return i < 0 ? cols.length - 1 : i;
     }
@@ -117,37 +120,53 @@ export function tableFromPages(pages) {
     for (let k = 1; k < cols.length; k++) if (it.x + 2 >= cols[k - 1].r) i = k;
     return i;
   };
-  for (const items of pages) {
-    // words close together on a line are one phrase ("GEETA" "HHAH"); OCR gives single words, a PDF gives runs
-    const ls = lines(items).map((l) => {
-      const out = [];
-      for (const it of l.items) {
-        const prev = out.at(-1);
-        if (prev && it.x - (prev.x + prev.w) <= Math.max(2.5, 0.6 * it.h) && !(NUMBERISH.test(prev.s) && NUMBERISH.test(it.s))) {
-          prev.w = it.x + it.w - prev.x; prev.s = join(prev.s, it.s);
-        } else out.push({ ...it });
-      }
-      return { ...l, items: out };
-    });
+  // words close together on a line are one phrase ("GEETA" "HHAH"); OCR gives single words, a PDF gives runs
+  const pageLines = pages.map((items) => lines(items).map((l) => {
+    const out = [];
+    for (const it of l.items) {
+      const prev = out.at(-1);
+      if (prev && it.x - (prev.x + prev.w) <= Math.max(2.5, 0.6 * it.h) && !(NUMBERISH.test(prev.s) && NUMBERISH.test(it.s))) {
+        prev.w = it.x + it.w - prev.x; prev.s = join(prev.s, it.s);
+      } else out.push({ ...it });
+    }
+    return { ...l, items: out };
+  }));
+  // what every page repeats in the same place — the bank's name and address, "Statement of account", the footer — is
+  // the page, not the table (statements often carry on page after page without repeating the column headings)
+  // A line is the page's when every piece of it is on another page in the same place — a statement line never is
+  // (its description and amounts differ). Never a line that starts with a date, or one without a letter in it.
+  const where = (it) => `${Math.round(it.x / 2)}|${Math.round(it.y / 2)}|${it.s}`;
+  const seen = new Map();
+  for (const ls of pageLines) for (const k of new Set(ls.flatMap((l) => l.items.map(where)))) seen.set(k, (seen.get(k) ?? 0) + 1);
+  const boilerplate = (l) => pageLines.length > 1 && /[a-z]/i.test(l.text) && !DATE_START.test(l.text) && l.items.every((it) => seen.get(where(it)) > 1);
+  for (const ls of pageLines) {
     let skip = new Set();
+    // a page that repeats the headings: what is above them (bank name, address, "Page No") isn't the table.
+    // A page without them carries straight on from the page before.
+    let paused = ls.some((l) => isHeader(l.text));
     for (let i = 0; i < ls.length && !ended; i++) {
       const l = ls[i];
       if (skip.has(l)) continue;
       if (isHeader(l.text)) { // the headings (again, on a later page)
         const c = columns(ls, i);
-        skip = c.band;
+        skip = c.band; paused = false;
         if (!cols) { cols = c.cols; dateCol = cols.findIndex((k) => DATE_HEAD.test(k.text)); rows.push({ n: 1, cells: cols.map((k) => k.text) }); }
         continue;
       }
-      if (!cols) continue; // above the table
+      if (!cols || boilerplate(l)) continue; // above the table, or what every page repeats
       const cells = cols.map(() => '');
       for (const it of l.items) { const k = colOf(it); cells[k] = join(cells[k], it.s); }
+      // a long plain number under the date is the end of a wrapped description ("5718991")
+      if (dateCol >= 0 && dateCol + 1 < cols.length && /^\d{5,}$/.test(cells[dateCol])) { cells[dateCol + 1] = join(cells[dateCol], cells[dateCol + 1]); cells[dateCol] = ''; }
+      // below the table (a page footer) until the next headings — or a line with a date and an amount
+      if (paused && !(dateCol >= 0 && DATE_START.test(cells[dateCol]) && cells.some((c, k) => k !== dateCol && /\d[\d,]*\.\d\d\b/.test(c)))) continue;
+      paused = false;
       const first = cells.find(Boolean) ?? '';
       if (END.test(first) || END.test(l.text)) { if (records.length) ended = true; continue; }
       const d = dateCol >= 0 ? cells[dateCol] : '';
       if (d && DATE_START.test(d)) { records.push(cells); continue; } // a new transaction
       if (!records.length) continue;
-      if (d && !/^\d{2,4}$/.test(d)) { ended = true; continue; } // not part of the table any more
+      if (d && !/^\d{2,4}$/.test(d)) { paused = true; continue; } // the table stops here (a page footer): until the next page's headings
       const last = records.at(-1); // the same transaction, carried onto another line
       cells.forEach((v, k) => {
         if (!v) return;

@@ -337,3 +337,57 @@ test('the browser’s OCR files are served by the app, and the page may run them
   assert.match(csp, /script-src 'self' 'wasm-unsafe-eval';/);
   assert.doesNotMatch(csp, /unsafe-inline|'unsafe-eval'/);
 });
+
+// ── an HDFC net-banking statement PDF: headings only on page 1, the address block and footer on every page,
+//    descriptions wrapping across lines and pages, a reversal printed as a negative withdrawal ──
+function hdfcPdf() {
+  const block = [[34, 545, 'M/S. EXAMPLE PRIVATE LIMITED'], [340, 548, 'Account Branch : SECTOR 18 NOIDA'], [403, 540, 'NOIDA'],
+    [34, 530, 'KAILASH ENCLAVE PART-1'], [340, 530, 'OD Limit'], [397, 530, ': 0.00'], [34, 505, 'From : 01/10/2026'], [154, 505, 'To : 24/10/2026'], [340, 505, 'Statement of account']];
+  const footer = [[28, 50, 'HDFC BANK LIMITED'], [28, 41, '*Closing balance includes funds earmarked for hold and uncleared funds']];
+  const amt = (right, s, y) => [right - s.length * 4.5, y, s, 8];
+  // one statement line: date, description lines, ref, withdrawal / deposit, balance
+  // (8 pt, as the bank prints it)
+  const line = (y, date, desc, ref, wd, dep, bal) => [[34, y, date, 8], ...desc.map((d, i) => [d.startsWith('~') ? 68 : 72, y - 17 * i, d.replace('~', ''), 8]),
+    [353 - ref.length * 4.5, y, ref, 8], [362, y, date, 8], ...(wd ? [amt(470, wd, y)] : []), ...(dep ? [amt(548, dep, y)] : []), amt(627, bal, y)];
+  const page1 = [...block, [40, 485, 'Date'], [144, 485, 'Narration'], [284, 485, 'Chq./Ref.No.'], [362, 485, 'Value Dt'], [405, 485, 'Withdrawal Amt.'], [491, 485, 'Deposit Amt.'], [564, 485, 'Closing Balance'],
+    ...line(467, '01/10/26', ['CASH DEPOSIT BY - RAMESH - MAIN ROA', 'D CITY'], '000000000000000', '', '15,800.00', '1,015,800.00'),
+    ...line(433, '01/10/26', ['RTGS DR-JAKA0SHARAN-SHRI SAI LOGISTICS.-', 'ANSALS ARCAD-HDFCR52026100166151258'], '0000000000002151', '561,805.00', '', '453,995.00'),
+    ...line(399, '01/10/26', ['RTGS CR-IBKL0000191-EXAMPLE-EXAMPLE', '~PRIV', 'ATE LIMITED-IBKLR92026100100044771'], 'IBKLR92026100100', '', '600,000.00', '1,053,995.00'), [326, 365, '044771', 8],
+    ...line(348, '06/10/26', ['RTGS DR-KKBK0004629-ALPHAFACTS HEALTH'], '0000000000002154', '500,000.00', '', '553,995.00'),
+    ...footer];
+  const page2 = [...block, [68, 490, 'SO', 8], [72, 473, 'LUTIONS -ANSALS ARCAD-HDFCR5202610066810', 8], [72, 456, '4539', 8],
+    ...line(439, '07/10/26', ['NEFT DR-UBIN0931675-UNIFY LABELS AND INN', 'OVATIONS PVT LTD-ANSALS', '~ARCAD-HDFCH0131', '5718991'], '0000000000002160', '44,406.00', '', '509,589.00'),
+    ...line(371, '08/10/26', ['NEFT DR-KKBK0004585-SAROJ', '~BIOTECH-ANSALS'], '0000000000002153', '48,050.00', '', '461,539.00'),
+    ...line(337, '13/10/26', ['BULK NEFT- EXAMPLE PRIVATE LIMITED DR -'], '0000000000002169', '265,285.00', '', '196,254.00'),
+    ...line(320, '13/10/26', ['REVERSAL BULK NEFT- EXAMPLE PRIVATE', '~LIMI'], '0000000000002169', '-265,285.00', '', '461,539.00'),
+    ...line(286, '14/10/26', ['BULK SALARY-EXAMPLE PRIVATE LIMITED DR'], '0000000000002169', '265,285.00', '', '196,254.00'),
+    ...footer];
+  const page3 = [...block, ...line(490, '23/10/26', ['RTGS DR-ICIC0001353-TITAN BIOTECH LTD-A'], '0000000000001903', '16,250.00', '', '180,004.00'),
+    [60, 440, 'STATEMENT SUMMARY :-'], [100, 425, 'Opening Balance'], [300, 425, 'Dr Count'], [100, 410, '1,000,000.00'], [300, 410, '7'], [100, 380, 'Generated On: 24-Oct-2026 12:26'], ...footer];
+  return makePdf({ pages: [page1, page2, page3] });
+}
+
+test('PDF: an HDFC statement — every line on every page, nothing from the page header or footer, the running balance confirms all', async () => {
+  const st = readStatement(await readPdf(hdfcPdf()));
+  assert.deepEqual(st.columns, { date: 'Date', narration: 'Narration', ref: 'Chq./Ref.No.', debit: 'Withdrawal Amt.', credit: 'Deposit Amt.', balance: 'Closing Balance' });
+  assert.deepEqual([st.rows.length, st.checked, st.skipped, st.from, st.to, st.closing], [10, { ok: 10, of: 10 }, [], '2026-10-01', '2026-10-23', { date: '2026-10-23', amount: 18_000_400 }]);
+  assert.deepEqual([st.rows.filter((r) => r.debit).length, st.rows.filter((r) => r.credit).length], [7, 3]);
+  const by = (re) => st.rows.find((r) => re.test(r.narration));
+  assert.equal(by(/ALPHAFACTS/).narration, 'RTGS DR-KKBK0004629-ALPHAFACTS HEALTH SO LUTIONS -ANSALS ARCAD-HDFCR5202610066810 4539'); // carried over to page 2
+  assert.equal(by(/UNIFY/).narration, 'NEFT DR-UBIN0931675-UNIFY LABELS AND INN OVATIONS PVT LTD-ANSALS ARCAD-HDFCH0131 5718991'); // a wrapped 7-digit number
+  assert.deepEqual([by(/SAROJ/).debit, by(/SAROJ/).date], [4_805_000, '2026-10-08']);
+  assert.equal(by(/RTGS CR/).ref, 'IBKLR92026100100 044771');
+  assert.ok(st.rows.every((r) => !/NOIDA|KAILASH|HDFC BANK LIMITED|Statement of account|SUMMARY/.test(r.narration)));
+});
+
+test('a reversal (a negative withdrawal) is money back, and it cancels the payment it reverses — that one is never matched', async () => {
+  const st = readStatement(await readPdf(hdfcPdf()));
+  const [bulk, rev, salary] = st.rows.filter((r) => r.ref === '0000000000002169');
+  assert.deepEqual([bulk.debit, bulk.reversedBy, rev.credit, rev.debit, rev.reverses, salary.debit, salary.reversedBy], [26_528_500, rev.row, 26_528_500, 0, bulk.row, 26_528_500, undefined]);
+  const m = matchStatement([bulk, salary], [P(1, 'Example Private Limited salaries', 26_528_500, '2026-10-14')], 1);
+  assert.equal(m[0].match, null);
+  assert.deepEqual(m[0].candidates, []); // the reversed one can't even be chosen
+  assert.equal(m[1].match.id, 1); // the salary that went through is
+  // and on amount alone too: the reversed line of the same amount doesn't make it ambiguous
+  assert.deepEqual(matchStatement([bulk, salary], [P(2, 'Staff salaries', 26_528_500, '2026-10-13')], 1)[1].match, { id: 2, how: 'amount', partial: false });
+});

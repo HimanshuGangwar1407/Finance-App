@@ -18,14 +18,15 @@ function rc4(key, data) {
 const esc = (t) => String(t).replace(/[\\()]/g, (c) => `\\${c}`);
 
 /**
- * texts: [[x, y, 'text', size?]] in points from the bottom left of an A4-landscape page.
+ * texts: [[x, y, 'text', size?]] in points from the bottom left of an A4-landscape page — or { pages: [texts, …] }.
  * { password } locks it; { shapesOnly } draws boxes instead of text (like a "printed" picture of a page).
  */
 export function makePdf(texts, { password, shapesOnly = false } = {}) {
-  const content = shapesOnly
-    ? texts.map(([x, y, t]) => `${x} ${y} ${String(t).length * 4} 6 re f`).join('\n')
-    : texts.map(([x, y, t, size = 9]) => `BT /F1 ${size} Tf 1 0 0 1 ${x} ${y} Tm (${esc(t)}) Tj ET`).join('\n');
-  const id = crypto.createHash('md5').update(content).digest();
+  const pages = Array.isArray(texts) ? [texts] : texts.pages;
+  const contents = pages.map((list) => (shapesOnly
+    ? list.map(([x, y, t]) => `${x} ${y} ${String(t).length * 4} 6 re f`).join('\n')
+    : list.map(([x, y, t, size = 9]) => `BT /F1 ${size} Tf 1 0 0 1 ${x} ${y} Tm (${esc(t)}) Tj ET`).join('\n')));
+  const id = crypto.createHash('md5').update(contents.join('\f')).digest();
   let key = null, encrypt = '';
   if (password) {
     const P = -44, p4 = Buffer.alloc(4); p4.writeInt32LE(P);
@@ -35,14 +36,17 @@ export function makePdf(texts, { password, shapesOnly = false } = {}) {
     encrypt = `<< /Filter /Standard /V 1 /R 2 /O <${O.toString('hex')}> /U <${U.toString('hex')}> /P ${P} >>`;
   }
   const objKey = (n) => md5(key, Buffer.from([n & 255, (n >> 8) & 255, (n >> 16) & 255, 0, 0])).subarray(0, 10);
-  let stream = Buffer.from(content, 'latin1');
-  if (key) stream = rc4(objKey(5), stream);
+  // objects: 1 catalog, 2 page tree, 3 font, then each page (4, 6, …) and its contents (5, 7, …), then the lock
   const objs = [
     '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    `<< /Type /Pages /Kids [${pages.map((_, i) => `${4 + 2 * i} 0 R`).join(' ')}] /Count ${pages.length} >>`,
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>',
-    Buffer.concat([Buffer.from(`<< /Length ${stream.length} >>\nstream\n`, 'latin1'), stream, Buffer.from('\nendstream', 'latin1')]),
+    ...contents.flatMap((content, i) => {
+      let stream = Buffer.from(content, 'latin1');
+      if (key) stream = rc4(objKey(5 + 2 * i), stream);
+      return [`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] /Resources << /Font << /F1 3 0 R >> >> /Contents ${5 + 2 * i} 0 R >>`,
+        Buffer.concat([Buffer.from(`<< /Length ${stream.length} >>\nstream\n`, 'latin1'), stream, Buffer.from('\nendstream', 'latin1')])];
+    }),
     ...(encrypt ? [encrypt] : []),
   ];
   const parts = [Buffer.from('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n', 'latin1')], offsets = [];

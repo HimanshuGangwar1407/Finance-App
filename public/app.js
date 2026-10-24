@@ -717,7 +717,8 @@ function renderReconcile() {
   const rerender = () => keepFocus(renderReconcile);
 
   const lineCell = (d) => h('td', {}, h('div', {}, d.narration || '—'), h('div', { class: 'muted small' }, [d.ref && `Ref. ${d.ref}`, `row ${d.row}`].filter(Boolean).join(' · ')),
-    d.mismatch && h('div', { class: 'chip c-red', title: 'The balance before it, minus this withdrawal, isn’t the balance shown on this line: a figure may be misread.' }, `doesn’t add up: balance shows ${inr(d.mismatch.shown)}, expected ${inr(d.mismatch.expected)}`));
+    d.mismatch && h('div', { class: 'chip c-red', title: 'The balance before it, minus this withdrawal, isn’t the balance shown on this line: a figure may be misread.' }, `doesn’t add up: balance shows ${inr(d.mismatch.shown)}, expected ${inr(d.mismatch.expected)}`),
+    d.reversedBy && h('div', { class: 'chip', title: 'The bank sent this money back later in the statement: it isn’t a payment made.' }, `reversed by the bank (row ${d.reversedBy}) — not a payment`));
   const select = (d) => {
     const ids = [...new Set([d.match?.id, ...d.candidates].filter(Boolean).map(String))];
     return h('select', { 'aria-label': `Payment for statement row ${d.row}`, onchange: (e) => { R.choice.set(d.row, e.target.value); rerender(); } },
