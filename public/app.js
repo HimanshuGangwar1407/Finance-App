@@ -574,7 +574,6 @@ async function loadReconcile() {
   S.rec.accounts = sum.accounts;
   renderReconcile();
 }
-const payLabel = (p) => `P-${p.id} · ${p.name} · due ${nice(p.due_date)} · ${inr(p.outstanding)}${p.outstanding < p.amount ? ' left' : ''}${p.bank_name ? '' : ' · bank not decided'}`;
 const HOW = { ref: ['bill / ref. no. in narration', 'c-green'], name: ['name in narration', 'c-green'], amount: ['amount only — check', 'c-amber'] };
 
 async function recCheck(file, keepNote = false) {
@@ -601,8 +600,8 @@ async function recCheck(file, keepNote = false) {
       R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId });
     }
     R.needPassword = false;
-    R.choice = new Map(R.data.debits.filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']));
-    R.payee = new Map(); R.left = new Map(); R.saveBalance = false;
+    R.choice = new Map([...R.data.debits, ...R.data.credits].filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']));
+    R.payee = new Map(); R.left = new Map(); R.leftIn = new Map(); R.saveBalance = false;
   } catch (e) { R.err = e.message; R.data = null; R.progress = ''; if (e.code === 'pdf_password') R.needPassword = true; }
   R.busy = false; renderReconcile();
 }
@@ -617,8 +616,8 @@ async function recAi(busy = false) {
     R.aiNote = r.note;
     R.progress = 'Checking what was read…'; renderReconcile();
     R.data = await api('/api/reconcile/check', { ...R.sent, bank_id: R.bankId });
-    R.choice = new Map(R.data.debits.filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']));
-    R.payee = new Map(); R.left = new Map(); R.saveBalance = false;
+    R.choice = new Map([...R.data.debits, ...R.data.credits].filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']));
+    R.payee = new Map(); R.left = new Map(); R.leftIn = new Map(); R.saveBalance = false;
   } catch (e) { R.err = e.message; R.data = null; }
   R.progress = ''; R.busy = false; renderReconcile();
 }
@@ -687,9 +686,9 @@ function renderReconcile() {
     R.needPassword && h('div', { class: 'bar' }, pwIn, h('button', { class: 'small primary', onclick: () => { R.password = pwIn.value; recCheck(null, true); } }, 'Open PDF')),
     h('div', { class: 'rec-paste' }, pasteIn, h('button', { class: 'small', onclick: () => { const t = pasteIn.value.trim(); if (t) recCheck(new File([t], 'pasted statement.txt', { type: 'text/plain' })); } }, 'Read pasted statement')),
     h('p', { class: 'muted small' }, 'It is read for: date, narration / particulars, cheque or reference no., withdrawal (debit) and balance. A PDF saved as a picture (e.g. with “Microsoft Print to PDF”) is read here with OCR, and every line is checked against the running balance. Nothing changes until you press Apply.'),
-    R.sent && h('p', { class: 'small' }, 'File: ', h('strong', {}, R.sent.name), D && ` · ${nice(D.from)} – ${nice(D.to)} · ${D.debits.length} payment(s) out${D.credits.count ? `, ${D.credits.count} credit(s) in (not reconciled here)` : ''}`),
-    // read fine, but nothing left the account: say so, rather than show empty lists
-    D && !D.debits.length && h('p', { class: 'rec-ocr' }, icon('check'), h('span', {}, `Read: no payments went out of ${D.bank.name} in this statement${D.credits.count ? ` — only ${D.credits.count} deposit${D.credits.count === 1 ? '' : 's'} of ${inr(D.credits.amount)} came in` : ''}${D.closing ? `, leaving ${inr(D.closing.amount)}` : ''}. Nothing to mark paid; payments due but not in it are listed below.`)),
+    R.sent && h('p', { class: 'small' }, 'File: ', h('strong', {}, R.sent.name), D && ` · ${nice(D.from)} – ${nice(D.to)} · ${D.debits.length} payment(s) out, ${D.credits.length} credit(s) in`),
+    // read fine, but nothing moved in the account
+    D && !D.debits.length && !D.credits.length && h('p', { class: 'rec-ocr' }, icon('check'), h('span', {}, `Read: no money went in or out of ${D.bank.name} in this statement.`)),
     R.busy && h('p', { class: 'muted' }, R.progress || 'Reading the statement…'),
     D?.ai && h('p', { class: `rec-ocr ${D.checked && D.checked.ok < D.checked.of ? 'warn' : ''}` }, icon(D.checked && D.checked.ok === D.checked.of ? 'check' : 'alert'),
       h('span', {}, 'Read by AI (Claude). ', D.checked
@@ -705,124 +704,157 @@ function renderReconcile() {
     aiOffer,
     !S.ai && can('admin') && h('p', { class: 'muted small' }, 'AI reading (for statements this page can’t read, and photos of statements) is off: add an ANTHROPIC_API_KEY to the app’s settings to turn it on.'));
   if (!R.accounts.length) return app.replaceChildren(topBar(), pageHead('Reconcile with the bank statement', ''), h('div', { class: 'card' }, h('p', { class: 'empty' }, 'Add a bank account first (Banks → “+ Add bank account”).')));
-  const parts = [topBar(), pageHead('Reconcile with the bank statement', 'Payments the statement shows are marked paid — only these come off the balance. Payments due but not in the statement are listed so you can decide.'), R.note && h('div', { class: 'card flash', role: 'status' }, icon('check'), h('span', {}, R.note)), step].filter(Boolean);
+  const parts = [topBar(), pageHead('Reconcile with the bank statement', 'What the statement shows went out is marked paid, and what came in is marked received — so the app shows the bank’s actual position. What was due but isn’t in it is listed so you can decide.'), R.note && h('div', { class: 'card flash', role: 'status' }, icon('check'), h('span', {}, R.note)), step].filter(Boolean);
   if (!D) return app.replaceChildren(...parts);
 
-  const pays = new Map(D.payments.map((p) => [String(p.id), p]));
-  const open = D.debits.filter((d) => !d.recorded), done = D.debits.filter((d) => d.recorded);
-  const chosen = new Map([...R.choice].filter(([, v]) => v && v !== 'rec').map(([row, id]) => [id, row]));
-  const matched = open.filter((d) => pays.has(R.choice.get(d.row))), notIn = open.filter((d) => !pays.has(R.choice.get(d.row)));
-  const recRows = notIn.filter((d) => R.choice.get(d.row) === 'rec');
-  const leftOut = D.due.map((id) => pays.get(String(id))).filter((p) => !chosen.has(String(p.id)));
   const total = (xs, k = 'amount') => xs.reduce((n, x) => n + x[k], 0);
-  const paidAmt = total(matched) + total(recRows);
   const rerender = () => keepFocus(renderReconcile);
-
-  const lineCell = (d) => h('td', {}, h('div', {}, d.narration || '—'), h('div', { class: 'muted small' }, [d.ref && `Ref. ${d.ref}`, `row ${d.row}`].filter(Boolean).join(' · ')),
-    d.mismatch && h('div', { class: 'chip c-red', title: 'The balance before it, minus this withdrawal, isn’t the balance shown on this line: a figure may be misread.' }, `doesn’t add up: balance shows ${inr(d.mismatch.shown)}, expected ${inr(d.mismatch.expected)}`),
-    d.reversedBy && h('div', { class: 'chip', title: 'The bank sent this money back later in the statement: it isn’t a payment made.' }, `reversed by the bank (row ${d.reversedBy}) — not a payment`));
-  const select = (d) => {
-    const ids = [...new Set([d.match?.id, ...d.candidates].filter(Boolean).map(String))];
-    return h('select', { 'aria-label': `Payment for statement row ${d.row}`, onchange: (e) => { R.choice.set(d.row, e.target.value); rerender(); } },
-      h('option', { value: '' }, ids.length ? 'Not in the app' : 'Not in the app (no payment of this amount)'),
-      ids.map((id) => pays.get(id)).filter(Boolean).map((p) => h('option', { value: String(p.id), selected: R.choice.get(d.row) === String(p.id), disabled: chosen.has(String(p.id)) && chosen.get(String(p.id)) !== d.row }, payLabel(p))),
-      h('option', { value: 'rec', selected: R.choice.get(d.row) === 'rec', disabled: Boolean(d.reversedBy) }, '+ Record it as a new payment'));
+  // the two sides: money out (statement debits ↔ payments yet to be paid) and money in (credits ↔ receipts yet to be received)
+  const side = (out) => {
+    const lines = out ? D.debits : D.credits, list = out ? D.payments : D.receipts, left = out ? R.left : R.leftIn;
+    const items = new Map(list.map((p) => [String(p.id), p]));
+    const open = lines.filter((d) => !d.recorded), done = lines.filter((d) => d.recorded);
+    const matched = open.filter((d) => items.has(R.choice.get(d.row))), notIn = open.filter((d) => !items.has(R.choice.get(d.row)));
+    const chosen = new Map(matched.map((d) => [R.choice.get(d.row), d.row]));
+    const leftOut = (out ? D.due : D.dueIn).map((id) => items.get(String(id))).filter((p) => p && !chosen.has(String(p.id)));
+    return { out, lines, items, open, done, matched, notIn, chosen, leftOut, left, rec: notIn.filter((d) => R.choice.get(d.row) === 'rec'),
+      w: out ? { id: 'P', thing: 'payment', things: 'payments', did: 'paid', to: 'Pay to', due: 'due', yet: 'yet to be paid', soon: 'Paying today', sign: -1, verb: 'pay' }
+        : { id: 'R', thing: 'receipt', things: 'receipts', did: 'received', to: 'Received from', due: 'expected', yet: 'yet to be received', soon: 'Expected today', sign: 1, verb: 'receive' } };
   };
-  const howChip = (d) => {
-    const id = R.choice.get(d.row), p = pays.get(id);
+  const O = side(true), I = side(false);
+  const recLabel = (S, p) => `${S.w.id}-${p.id} · ${p.name} · ${S.w.due} ${nice(p.due_date)} · ${inr(p.outstanding)}${p.outstanding < p.amount ? ' left' : ''}${p.bank_name ? '' : ' · bank not decided'}`;
+  const amountCell = (S, d) => h('td', { class: 'num' }, money(S.w.sign * d.amount, S.out ? '' : 'pos'));
+
+  const lineCell = (S, d) => h('td', {}, h('div', {}, d.narration || '—'), h('div', { class: 'muted small' }, [d.ref && `Ref. ${d.ref}`, `row ${d.row}`].filter(Boolean).join(' · ')),
+    d.mismatch && h('div', { class: 'chip c-red', title: 'The balance before it, with this line, isn’t the balance shown on this line: a figure may be misread.' }, `doesn’t add up: balance shows ${inr(d.mismatch.shown)}, expected ${inr(d.mismatch.expected)}`),
+    d.reversedBy && h('div', { class: 'chip', title: 'The bank undid this later in the statement (a reversal, or a returned cheque).' }, `reversed by the bank (row ${d.reversedBy}) — not a ${S.w.thing}`),
+    d.reverses && h('div', { class: 'chip', title: 'This undoes an earlier line of the statement (a reversal, or a returned cheque).' }, `the bank undoing row ${d.reverses} — not a ${S.w.thing}`));
+  const select = (S, d) => {
+    const ids = [...new Set([d.match?.id, ...d.candidates].filter(Boolean).map(String))];
+    return h('select', { 'aria-label': `${S.out ? 'Payment' : 'Receipt'} for statement row ${d.row}`, onchange: (e) => { R.choice.set(d.row, e.target.value); rerender(); } },
+      h('option', { value: '' }, ids.length ? 'Not in the app' : `Not in the app (no ${S.w.thing} of this amount)`),
+      ids.map((id) => S.items.get(id)).filter(Boolean).map((p) => h('option', { value: String(p.id), selected: R.choice.get(d.row) === String(p.id), disabled: S.chosen.has(String(p.id)) && S.chosen.get(String(p.id)) !== d.row }, recLabel(S, p))),
+      h('option', { value: 'rec', selected: R.choice.get(d.row) === 'rec', disabled: Boolean(d.reversedBy || d.reverses) }, `+ Record it as a new ${S.w.thing}`));
+  };
+  const howChip = (S, d) => {
+    const id = R.choice.get(d.row), p = S.items.get(id);
     if (!p) return null;
     const auto = d.match && String(d.match.id) === id ? HOW[d.match.how] : ['chosen by you', 'c-blue'];
-    return h('div', { class: 'chips' }, h('span', { class: `chip ${auto[1]}` }, auto[0]), d.amount < p.outstanding && h('span', { class: 'chip c-blue' }, `part: ${inr(p.outstanding - d.amount)} stays to pay`));
+    return h('div', { class: 'chips' }, h('span', { class: `chip ${auto[1]}` }, auto[0]), d.amount < p.outstanding && h('span', { class: 'chip c-blue' }, `part: ${inr(p.outstanding - d.amount)} stays to ${S.w.verb}`));
   };
+  const table = (S, rows, head, cells, foot) => h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
+    h('thead', {}, h('tr', {}, head.map((t, i) => h('th', { class: i === 2 ? 'num' : '' }, t)))), h('tbody', {}, rows.map((d) => h('tr', {}, cells(d)))), foot && h('tfoot', {}, foot)));
 
-  const matchedSec = h('section', { class: 'card' },
-    h('h2', {}, h('span', { class: 'dot d-green' }), `Paid — found in the statement (${matched.length})`),
-    h('p', { class: 'muted small' }, 'These are marked paid on the statement date and come off the balance. Check the ones matched on amount only; change or clear the payment if it is wrong.'),
-    matched.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Statement narration'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Payment in the app'))),
-      h('tbody', {}, matched.map((d) => h('tr', {}, h('td', { class: 'nowrap' }, nice(d.date)), lineCell(d), h('td', { class: 'num' }, money(-d.amount)), h('td', {}, select(d), howChip(d))))),
-      h('tfoot', {}, h('tr', {}, h('td', { colspan: '2' }, 'Total marked paid'), h('td', { class: 'num' }, money(-total(matched))), h('td', {})))))
-      : h('p', { class: 'empty' }, 'No statement debit matches a payment yet to be paid.'));
+  const matchedSec = (S) => h('section', { class: 'card' },
+    h('h2', {}, h('span', { class: `dot ${S.out ? 'd-red' : 'd-green'}` }, ), `${S.out ? 'Paid' : 'Received'} — found in the statement (${S.matched.length})`),
+    h('p', { class: 'muted small' }, `These are marked ${S.w.did} on the statement date and ${S.out ? 'come off' : 'are added to'} the balance. Check the ones matched on amount only; change or clear the ${S.w.thing} if it is wrong.`),
+    S.matched.length ? table(S, S.matched, ['Date', 'Statement narration', 'Amount', `${S.out ? 'Payment' : 'Receipt'} in the app`],
+      (d) => [h('td', { class: 'nowrap' }, nice(d.date)), lineCell(S, d), amountCell(S, d), h('td', {}, select(S, d), howChip(S, d))],
+      h('tr', {}, h('td', { colspan: '2' }, `Total marked ${S.w.did}`), h('td', { class: 'num' }, money(S.w.sign * total(S.matched), S.out ? '' : 'pos')), h('td', {})))
+      : h('p', { class: 'empty' }, `No statement ${S.out ? 'debit' : 'credit'} matches a ${S.w.thing} ${S.w.yet}.`));
 
-  const leftSec = h('section', { class: 'card' },
-    h('h2', {}, h('span', { class: 'dot d-amber' }), `Left out — due by ${nice(D.to)}, not in the statement (${leftOut.length})`),
-    h('p', { class: 'muted small' }, `Payments for ${D.bank.name} (or with no bank decided) that were due by the statement’s last day but aren’t in it. They stay yet to be paid until you decide.`),
-    leftOut.length > 0 && h('div', { class: 'bar' }, h('span', { class: 'muted small' }, 'Set all:'),
-      [['today', 'Paying today'], ['tomorrow', 'Next day'], ['cancel', 'Cancelled'], ['', 'Decide later']].map(([v, t]) =>
-        h('button', { class: 'small', onclick: () => { for (const p of leftOut) if (v === '' || v === 'cancel' || !p.emi) R.left.set(p.id, v); rerender(); } }, t))),
-    leftOut.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, 'Pay to'), h('th', {}, 'Due'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'What happens'))),
-      h('tbody', {}, leftOut.map((p) => h('tr', {},
-        h('td', { class: 'nowrap tx-id' }, `P-${p.id}`),
+  const leftSec = (S) => h('section', { class: 'card' },
+    h('h2', {}, h('span', { class: 'dot d-amber' }), S.out ? `Left out — due by ${nice(D.to)}, not in the statement (${S.leftOut.length})` : `Expected but not in the statement — due by ${nice(D.to)} (${S.leftOut.length})`),
+    h('p', { class: 'muted small' }, `${S.out ? 'Payments' : 'Receipts'} for ${D.bank.name} (or with no bank decided) that were ${S.w.due} by the statement’s last day but aren’t in it. They stay ${S.w.yet} until you decide.`),
+    S.leftOut.length > 0 && h('div', { class: 'bar' }, h('span', { class: 'muted small' }, 'Set all:'),
+      [['today', S.w.soon], ['tomorrow', 'Next day'], ['cancel', 'Cancelled'], ['', 'Decide later']].map(([v, t]) =>
+        h('button', { class: 'small', onclick: () => { for (const p of S.leftOut) if (v === '' || v === 'cancel' || !p.emi) S.left.set(p.id, v); rerender(); } }, t))),
+    S.leftOut.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, S.w.to), h('th', {}, S.out ? 'Due' : 'Expected'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'What happens'))),
+      h('tbody', {}, S.leftOut.map((p) => h('tr', {},
+        h('td', { class: 'nowrap tx-id' }, `${S.w.id}-${p.id}`),
         h('td', {}, h('strong', {}, p.name), h('div', { class: 'muted small' }, [p.ref, p.emi ? 'EMI' : p.category, p.bank_name ?? 'bank not decided'].filter(Boolean).join(' · '))),
         h('td', { class: 'nowrap' }, nice(p.due_date)),
         h('td', { class: 'num' }, money(p.outstanding)),
-        h('td', {}, h('select', { 'aria-label': `What happens to P-${p.id}`, class: `left-${R.left.get(p.id) || 'none'}`, onchange: (e) => { R.left.set(p.id, e.target.value); rerender(); } },
-          [['', 'Decide later'], ['today', 'Paying today'], ['tomorrow', 'Next day'], ['cancel', 'Cancelled']].map(([v, t]) =>
-            h('option', { value: v, selected: (R.left.get(p.id) || '') === v, disabled: p.emi && (v === 'today' || v === 'tomorrow') }, t))),
+        h('td', {}, h('select', { 'aria-label': `What happens to ${S.w.id}-${p.id}`, class: `left-${S.left.get(p.id) || 'none'}`, onchange: (e) => { S.left.set(p.id, e.target.value); rerender(); } },
+          [['', 'Decide later'], ['today', S.w.soon], ['tomorrow', 'Next day'], ['cancel', 'Cancelled']].map(([v, t]) =>
+            h('option', { value: v, selected: (S.left.get(p.id) || '') === v, disabled: p.emi && (v === 'today' || v === 'tomorrow') }, t))),
           p.emi && h('div', { class: 'muted small' }, 'EMI: keeps its date'))))),
-      h('tfoot', {}, h('tr', {}, h('td', { colspan: '3' }, 'Total left out'), h('td', { class: 'num' }, money(total(leftOut, 'outstanding'))), h('td', {})))))
-      : h('p', { class: 'empty' }, 'Nothing left out: every payment due was in the statement.'));
+      h('tfoot', {}, h('tr', {}, h('td', { colspan: '3' }, 'Total'), h('td', { class: 'num' }, money(total(S.leftOut, 'outstanding'))), h('td', {})))))
+      : h('p', { class: 'empty' }, `Nothing left out: every ${S.w.thing} ${S.w.due} was in the statement.`));
 
-  const notInSec = notIn.length > 0 && h('section', { class: 'card' },
-    h('h2', {}, h('span', { class: 'dot d-blue' }), `In the statement, not in the app (${notIn.length})`),
-    h('p', { class: 'muted small' }, 'Money that left the account but matches no payment here (e.g. bank charges, or a payment not in the sheet). Match it to a payment, record it as a new one, or leave it.'),
+  // record every line not in the app with one click (not the ones the bank reversed), named from the narration
+  const recordable = (S) => S.notIn.filter((d) => !d.reversedBy && !d.reverses);
+  const setRec = (list, v) => { for (const d of list) R.choice.set(d.row, v); rerender(); };
+  const notInSec = (S) => S.notIn.length > 0 && h('section', { class: 'card' },
+    h('h2', {}, h('span', { class: 'dot d-blue' }), `Money ${S.out ? 'out' : 'in'}, not in the app (${S.notIn.length})`),
+    h('p', { class: 'muted small' }, S.out ? 'Money that left the account but matches no payment here (e.g. bank charges, or a payment not in the sheet). Match it to a payment, record it as a new one, or leave it.'
+      : 'Money that came into the account but matches no receipt here (e.g. a customer’s payment, a cash deposit, a refund). Match it to a receipt, record it as a new one, or leave it.'),
     (() => {
-      // every one of them as a new payment in one click (not the ones the bank reversed), named from the narration
-      const open = notIn.filter((d) => !d.reversedBy), all = open.filter((d) => R.choice.get(d.row) !== 'rec');
-      const ch = all.filter((d) => CHARGE.test(d.narration)), chosen = open.filter((d) => R.choice.get(d.row) === 'rec');
-      const set = (list, v) => { for (const d of list) R.choice.set(d.row, v); rerender(); };
+      const all = recordable(S).filter((d) => R.choice.get(d.row) !== 'rec'), chosen = recordable(S).filter((d) => R.choice.get(d.row) === 'rec');
+      const ch = S.out ? all.filter((d) => CHARGE.test(d.narration)) : [];
       return (all.length > 0 || chosen.length > 0) && h('div', { class: 'bar rec-bulk' },
-        all.length > 0 && h('button', { class: 'small primary', onclick: () => set(all, 'rec') },
-          `+ Record all ${all.length} as new payment${all.length === 1 ? '' : 's'} (${inr(total(all))})`),
-        ch.length > 0 && ch.length < all.length && h('button', { class: 'small', onclick: () => set(ch, 'rec') },
-          `Record just the ${ch.length} bank charge${ch.length === 1 ? '' : 's'} (${inr(total(ch))})`),
-        chosen.length > 0 && h('button', { class: 'small', onclick: () => set(chosen, '') }, 'Leave them all'),
-        all.length > 0 && h('span', { class: 'muted small' }, 'Each is recorded as paid on its statement date, named from the narration — change any name before applying.'));
+        all.length > 0 && h('button', { class: 'small primary', onclick: () => setRec(all, 'rec') }, `+ Record all ${all.length} as new ${all.length === 1 ? S.w.thing : S.w.things} (${inr(total(all))})`),
+        ch.length > 0 && ch.length < all.length && h('button', { class: 'small', onclick: () => setRec(ch, 'rec') }, `Record just the ${ch.length} bank charge${ch.length === 1 ? '' : 's'} (${inr(total(ch))})`),
+        chosen.length > 0 && h('button', { class: 'small', onclick: () => setRec(chosen, '') }, 'Leave them all'),
+        all.length > 0 && h('span', { class: 'muted small' }, `Each is recorded as ${S.w.did} on its statement date, named from the narration — change any name before applying.`));
     })(),
-    h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Statement narration'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Payment in the app'))),
-      h('tbody', {}, notIn.map((d) => h('tr', {}, h('td', { class: 'nowrap' }, nice(d.date)), lineCell(d), h('td', { class: 'num' }, money(-d.amount)),
-        h('td', {}, select(d), R.choice.get(d.row) === 'rec' && h('input', { name: `payee-${d.row}`, 'aria-label': 'Pay to', placeholder: 'Pay to', value: R.payee.get(d.row) ?? d.payee ?? d.narration.slice(0, 60), oninput: (e) => R.payee.set(d.row, e.target.value) }))))))));
+    table(S, S.notIn, ['Date', 'Statement narration', 'Amount', `${S.out ? 'Payment' : 'Receipt'} in the app`],
+      (d) => [h('td', { class: 'nowrap' }, nice(d.date)), lineCell(S, d), amountCell(S, d),
+        h('td', {}, select(S, d), R.choice.get(d.row) === 'rec' && h('input', { name: `payee-${d.row}`, 'aria-label': S.w.to, placeholder: S.w.to, value: R.payee.get(d.row) ?? d.payee ?? d.narration.slice(0, 60), oninput: (e) => R.payee.set(d.row, e.target.value) }))]));
 
+  const done = [...O.done, ...I.done].sort((a, b) => a.row - b.row);
   const doneSec = done.length > 0 && h('details', { class: 'card' }, h('summary', {}, `Already in the app (${done.length}) — recorded before, not counted again`),
-    h('ul', { class: 'day-moves' }, done.map((d) => h('li', {}, h('span', {}, nice(d.date), ' · ', d.narration || d.ref, h('span', { class: 'muted small' }, ` · matched by ${d.recorded.by}`)), money(-d.amount)))));
+    h('ul', { class: 'day-moves' }, done.map((d) => h('li', {}, h('span', {}, nice(d.date), ' · ', d.narration || d.ref, h('span', { class: 'muted small' }, ` · matched by ${d.recorded.by}`)),
+      money(d.recorded.payment_id !== undefined ? -d.amount : d.amount, d.recorded.payment_id !== undefined ? '' : 'pos')))));
 
-  const after = D.appClosing - paidAmt;
+  // the final position: the app after applying, against the statement's closing balance
+  const paidAmt = total(O.matched) + total(O.rec), recvAmt = total(I.matched) + total(I.rec);
+  const after = D.appClosing - paidAmt + recvAmt;
   const balSec = h('section', { class: 'card rec-balance' },
     h('div', { class: 'bc-line' }, h('span', {}, `${D.bank.name} in the app on ${nice(D.to)}, now`), money(D.appClosing)),
-    h('div', { class: 'bc-line' }, h('span', {}, '− Marked paid from this statement'), money(-paidAmt, 'red')),
+    h('div', { class: 'bc-line' }, h('span', {}, '− Paid, from this statement'), money(-paidAmt, 'red')),
+    h('div', { class: 'bc-line' }, h('span', {}, '+ Received, from this statement'), money(recvAmt, 'pos')),
     h('div', { class: 'bc-line total' }, h('span', {}, '= In the app after applying'), money(after)),
     D.closing && h('div', { class: 'bc-line' }, h('span', {}, `Statement closing balance (${nice(D.closing.date)})`), money(D.closing.amount)),
-    D.closing && after !== D.closing.amount && h('p', { class: 'muted small' }, `Difference ${inr(D.closing.amount - after)}: money in the statement not in the app (credits, unmatched debits), or a balance not entered.`),
+    D.closing && (after === D.closing.amount
+      ? h('p', { class: 'rec-ocr' }, icon('check'), h('span', {}, 'After applying, the app matches the bank exactly.'))
+      : h('p', { class: 'muted small' }, `Difference ${inr(D.closing.amount - after)}: lines in the statement not recorded above, or a balance not entered for ${D.bank.name}.`)),
     D.closing && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'saveBalance', checked: R.saveBalance, onchange: (e) => { R.saveBalance = e.target.checked; rerender(); } }),
-      `Also save ${inr(D.closing.amount)} as ${D.bank.name}’s balance at the end of ${nice(D.closing.date)} (the app then matches the bank exactly)`));
+      `Also save ${inr(D.closing.amount)} as ${D.bank.name}’s balance at the end of ${nice(D.closing.date)}`));
 
-  const n = (v) => [...R.left.values()].filter((x) => x === v).length;
-  const summary = [matched.length && `${matched.length} marked paid (${inr(total(matched))})`, recRows.length && `${recRows.length} recorded as new`,
-    n('today') && `${n('today')} paying today`, n('tomorrow') && `${n('tomorrow')} next day`, n('cancel') && `${n('cancel')} cancelled`, R.saveBalance && 'balance saved'].filter(Boolean);
+  // everything not in the app, out and in, in one click — for the bank's actual position
+  const allOut = recordable(O).filter((d) => R.choice.get(d.row) !== 'rec'), allIn = recordable(I).filter((d) => R.choice.get(d.row) !== 'rec');
+  const everything = allOut.length > 0 && allIn.length > 0 && h('div', { class: 'card rec-all' },
+    h('button', { class: 'primary', onclick: () => setRec([...allOut, ...allIn], 'rec') },
+      `+ Record everything not in the app: ${allOut.length} payment${allOut.length === 1 ? '' : 's'} (${inr(total(allOut))}) and ${allIn.length} receipt${allIn.length === 1 ? '' : 's'} (${inr(total(allIn))})`),
+    h('span', { class: 'muted small' }, 'With what is matched, the app then shows the bank’s actual position. Review the names below, then Apply.'));
+
+  const n = (m, v) => [...m.values()].filter((x) => x === v).length;
+  const summary = [O.matched.length && `${O.matched.length} marked paid (${inr(total(O.matched))})`, O.rec.length && `${O.rec.length} payment${O.rec.length === 1 ? '' : 's'} recorded as new`,
+    I.matched.length && `${I.matched.length} marked received (${inr(total(I.matched))})`, I.rec.length && `${I.rec.length} receipt${I.rec.length === 1 ? '' : 's'} recorded as new`,
+    n(R.left, 'today') && `${n(R.left, 'today')} paying today`, n(R.left, 'tomorrow') && `${n(R.left, 'tomorrow')} next day`, n(R.left, 'cancel') && `${n(R.left, 'cancel')} cancelled`,
+    n(R.leftIn, 'today') && `${n(R.leftIn, 'today')} expected today`, n(R.leftIn, 'tomorrow') && `${n(R.leftIn, 'tomorrow')} receipt${n(R.leftIn, 'tomorrow') === 1 ? '' : 's'} next day`,
+    n(R.leftIn, 'cancel') && `${n(R.leftIn, 'cancel')} receipt${n(R.leftIn, 'cancel') === 1 ? '' : 's'} cancelled`, R.saveBalance && 'balance saved'].filter(Boolean);
+  const name = (d) => R.payee.get(d.row) ?? d.payee ?? d.narration.slice(0, 60);
+  const lefts = (S) => [...S.left].filter(([id, v]) => v && S.leftOut.some((p) => p.id === id)).map(([id, action]) => ({ id, action }));
   const applyBtn = h('button', { class: 'primary', disabled: !summary.length || R.busy, onclick: async () => {
     if (!confirm(`Apply to ${D.bank.name}?\n\n${summary.join('\n')}`)) return;
     R.busy = true; renderReconcile();
     try {
       const r = await api('/api/reconcile/apply', { ...R.sent, password: R.password, bank_id: R.bankId, saveBalance: R.saveBalance,
-        matches: matched.map((d) => ({ row: d.row, id: Number(R.choice.get(d.row)) })),
-        record: recRows.map((d) => ({ row: d.row, payee: R.payee.get(d.row) ?? d.payee ?? d.narration.slice(0, 60) })),
-        leftOut: [...R.left].filter(([id, v]) => v && leftOut.some((p) => p.id === id)).map(([id, action]) => ({ id, action })) });
-      R.note = [`Reconciled ${D.bank.name}:`, r.paid && `${r.paid} payment(s) marked paid (${inr(r.paidAmount)})`, r.recorded && `${r.recorded} recorded as new (${inr(r.recordedAmount)})`,
-        r.today && `${r.today} moved to today`, r.tomorrow && `${r.tomorrow} moved to tomorrow`, r.cancelled && `${r.cancelled} cancelled`, r.balanceSaved && 'statement balance saved'].filter(Boolean).join(' ');
+        matches: O.matched.map((d) => ({ row: d.row, id: Number(R.choice.get(d.row)) })), record: O.rec.map((d) => ({ row: d.row, payee: name(d) })), leftOut: lefts(O),
+        matchesIn: I.matched.map((d) => ({ row: d.row, id: Number(R.choice.get(d.row)) })), recordIn: I.rec.map((d) => ({ row: d.row, party: name(d) })), leftOutIn: lefts(I) });
+      R.note = [`Reconciled ${D.bank.name}:`, r.paid && `${r.paid} payment(s) marked paid (${inr(r.paidAmount)})`, r.recorded && `${r.recorded} payment(s) recorded as new (${inr(r.recordedAmount)})`,
+        r.received && `${r.received} receipt(s) marked received (${inr(r.receivedAmount)})`, r.recordedIn && `${r.recordedIn} receipt(s) recorded as new (${inr(r.recordedInAmount)})`,
+        r.today && `${r.today} moved to today`, r.tomorrow && `${r.tomorrow} moved to tomorrow`, r.cancelled && `${r.cancelled} cancelled`,
+        r.inToday && `${r.inToday} receipt(s) expected today`, r.inTomorrow && `${r.inTomorrow} receipt(s) moved to tomorrow`, r.inCancelled && `${r.inCancelled} receipt(s) cancelled`,
+        r.balanceSaved && 'statement balance saved'].filter(Boolean).join(' ');
       R.busy = false;
       await recCheck(null, true); // the same statement again: what was just applied now shows as already in the app
     } catch (e) { R.busy = false; R.err = e.message; renderReconcile(); }
   } }, summary.length ? `Apply: ${summary.join(' · ')}` : 'Nothing to apply yet');
 
+  const tile = (cls, label, amt, sub) => h('div', { class: `tile ${cls}` }, h('div', { class: 'tile-lbl' }, label), h('div', { class: 'tile-amt' }, typeof amt === 'number' ? inr(amt) : amt), h('div', { class: 'tile-sub' }, sub));
   app.replaceChildren(...parts,
     h('div', { class: 'tiles rec-tiles' },
-      h('div', { class: 'tile t-pay' }, h('div', { class: 'tile-lbl' }, 'Paid — in the statement'), h('div', { class: 'tile-amt' }, inr(total(matched))), h('div', { class: 'tile-sub' }, `${matched.length} payment(s) matched`)),
-      h('div', { class: 'tile t-bal' }, h('div', { class: 'tile-lbl' }, 'Left out'), h('div', { class: 'tile-amt' }, inr(total(leftOut, 'outstanding'))), h('div', { class: 'tile-sub' }, `${leftOut.length} payment(s) not in the statement`)),
-      h('div', { class: 'tile t-fin' }, h('div', { class: 'tile-lbl' }, 'Not in the app'), h('div', { class: 'tile-amt' }, inr(total(notIn))), h('div', { class: 'tile-sub' }, `${notIn.length} statement debit(s)`)),
-      h('div', { class: 'tile' }, h('div', { class: 'tile-lbl' }, 'Already in the app'), h('div', { class: 'tile-amt' }, inr(total(done))), h('div', { class: 'tile-sub' }, `${done.length} recorded before`))),
-    matchedSec, leftSec, ...[notInSec, doneSec].filter(Boolean), balSec,
+      tile('t-pay', 'Paid — in the statement', total(O.matched), `${O.matched.length} payment(s) matched`),
+      tile('t-rec', 'Received — in the statement', total(I.matched), `${I.matched.length} receipt(s) matched`),
+      // (money out and money in apart: added together they mean nothing)
+      tile('t-fin', 'Not in the app', `${O.notIn.length} out · ${I.notIn.length} in`, `−${inr(total(O.notIn))} out · +${inr(total(I.notIn))} in`),
+      tile('t-bal', 'Left out', total(O.leftOut, 'outstanding') + total(I.leftOut, 'outstanding'), `${O.leftOut.length} payment(s) · ${I.leftOut.length} receipt(s) not in it`)),
+    ...[everything].filter(Boolean),
+    matchedSec(O), matchedSec(I), leftSec(O), ...[I.leftOut.length > 0 && leftSec(I), notInSec(O), notInSec(I), doneSec].filter(Boolean), balSec,
     h('div', { class: 'card rec-apply' }, applyBtn, h('p', { class: 'muted small' }, 'Only what is listed on the button changes. It is recorded in the Activity Log.')));
 }
 

@@ -489,43 +489,51 @@ async function reconcileCheck(c, body) {
   if (st.to > todayIST()) bad(`The statement has dates after today (${st.to}). Check that it is the right file.`);
   await syncEmis(c, addDays(todayIST(), HORIZON));
 
-  const taken = new Set(), debits = st.rows.filter((r) => r.debit > 0).map((r) => ({ ...r, bankRef: lineRef(r, taken) }));
+  // every line gets the bank reference it is recorded under (unique within the statement)
+  const taken = new Set(), all = st.rows.map((r) => ({ ...r, bankRef: lineRef(r, taken) }));
+  const debits = all.filter((r) => r.debit > 0), credits = all.filter((r) => r.credit > 0);
   // recorded before: the same reference on this account, or the same amount within two days (each entry counted once)
-  const { rows: ents } = await c.query("SELECT id, amount, date, ref, ref_norm, payment_id FROM entries WHERE bank_id = $1 AND kind = 'OUT' AND date BETWEEN $2 AND $3 ORDER BY date, id",
-    [bankId, addDays(st.from, -3), addDays(st.to, 3)]);
-  const { rows: refEnts } = await c.query("SELECT ref_norm, payment_id FROM entries WHERE bank_id = $1 AND kind = 'OUT' AND ref_norm = ANY($2::text[])",
-    [bankId, [...new Set(debits.flatMap((d) => [normRef(d.bankRef), normRef(d.ref)]).filter(Boolean))]]);
-  const byRef = new Map(refEnts.map((e) => [e.ref_norm, e])), claimed = new Set();
-  for (const d of debits) {
-    const e = byRef.get(normRef(d.bankRef)) ?? (d.ref && byRef.get(normRef(d.ref)));
-    if (e) { d.recorded = { payment_id: e.payment_id, by: 'reference' }; const x = ents.find((y) => y.ref_norm === e.ref_norm); if (x) claimed.add(x.id); }
-  }
-  for (const d of debits.filter((x) => !x.recorded)) {
-    const e = ents.find((y) => !claimed.has(y.id) && Number(y.amount) === d.debit && Math.abs(Date.parse(y.date) - Date.parse(d.date)) <= 2 * 864e5);
-    if (e) { claimed.add(e.id); d.recorded = { payment_id: e.payment_id, by: 'amount and date', ref: e.ref, date: e.date }; }
-  }
+  const markRecorded = async (lines, kind, amt, col) => {
+    const { rows: ents } = await c.query(`SELECT id, amount, date, ref, ref_norm, ${col} AS rec FROM entries WHERE bank_id = $1 AND kind = $2 AND date BETWEEN $3 AND $4 ORDER BY date, id`,
+      [bankId, kind, addDays(st.from, -3), addDays(st.to, 3)]);
+    const { rows: refEnts } = await c.query(`SELECT ref_norm, ${col} AS rec FROM entries WHERE bank_id = $1 AND kind = $2 AND ref_norm = ANY($3::text[])`,
+      [bankId, kind, [...new Set(lines.flatMap((d) => [normRef(d.bankRef), normRef(d.ref)]).filter(Boolean))]]);
+    const byRef = new Map(refEnts.map((e) => [e.ref_norm, e])), claimed = new Set();
+    for (const d of lines) {
+      const e = byRef.get(normRef(d.bankRef)) ?? (d.ref && byRef.get(normRef(d.ref)));
+      if (e) { d.recorded = { [col]: e.rec, by: 'reference' }; const x = ents.find((y) => y.ref_norm === e.ref_norm); if (x) claimed.add(x.id); }
+    }
+    for (const d of lines.filter((x) => !x.recorded)) {
+      const e = ents.find((y) => !claimed.has(y.id) && Number(y.amount) === amt(d) && Math.abs(Date.parse(y.date) - Date.parse(d.date)) <= 2 * 864e5);
+      if (e) { claimed.add(e.id); d.recorded = { [col]: e.rec, by: 'amount and date', ref: e.ref, date: e.date }; }
+    }
+  };
+  await markRecorded(debits, 'OUT', (d) => d.debit, 'payment_id');
+  await markRecorded(credits, 'IN', (d) => d.credit, 'receipt_id');
 
-  // payments yet to be paid (or partly paid), with what is left on each
-  const { rows: pays } = await c.query(`SELECT p.id, p.payee AS name, p.ref, p.category, p.note, p.due_date, p.bank_id, p.emi_id IS NOT NULL AS emi, b.name AS bank_name,
+  // payments yet to be paid and receipts yet to be received (or partly), with what is left on each
+  const open = (rows) => rows.map((p) => ({ ...p, outstanding: Number(p.outstanding), amount: Number(p.amount) })).filter((p) => p.outstanding > 0);
+  const payments = open((await c.query(`SELECT p.id, p.payee AS name, p.ref, p.category, p.note, p.due_date, p.bank_id, p.emi_id IS NOT NULL AS emi, b.name AS bank_name,
       (p.amount - coalesce((SELECT sum(e.amount) FROM entries e WHERE e.payment_id = p.id), 0))::bigint AS outstanding, p.amount
-    FROM payments p LEFT JOIN banks b ON b.id = p.bank_id WHERE p.status = 'OPEN' ORDER BY p.due_date, p.id`);
-  const payments = pays.map((p) => ({ ...p, outstanding: Number(p.outstanding), amount: Number(p.amount) })).filter((p) => p.outstanding > 0);
-  const lines = matchStatement(debits.filter((d) => !d.recorded), payments, bankId);
-  const byRow = new Map(lines.map((l) => [l.row, l]));
+    FROM payments p LEFT JOIN banks b ON b.id = p.bank_id WHERE p.status = 'OPEN' ORDER BY p.due_date, p.id`)).rows);
+  const receipts = open((await c.query(`SELECT r.id, r.party AS name, r.ref, '' AS category, r.note, r.expected_date AS due_date, r.bank_id, false AS emi, b.name AS bank_name,
+      (r.amount - coalesce((SELECT sum(e.amount) FROM entries e WHERE e.receipt_id = r.id), 0))::bigint AS outstanding, r.amount
+    FROM receipts r LEFT JOIN banks b ON b.id = r.bank_id WHERE r.status = 'OPEN' ORDER BY r.expected_date, r.id`)).rows);
+  const outMatch = new Map(matchStatement(debits.filter((d) => !d.recorded), payments, bankId).map((l) => [l.row, l]));
+  const inMatch = new Map(matchStatement(credits.filter((d) => !d.recorded), receipts, bankId, 'credit').map((l) => [l.row, l]));
 
   // the app's balance for this account at the statement's last date, before reconciling
   const [bal, en] = [await c.query('SELECT id, bank_id, amount, as_of FROM balances WHERE bank_id = $1', [bankId]), await c.query('SELECT kind, bank_id, amount, date FROM entries WHERE bank_id = $1', [bankId])];
   const app = bankStatements({ banks: [bank], balances: bal.rows, entries: en.rows, from: st.to, to: st.to }).rows[0];
-  const credits = st.rows.filter((r) => r.credit > 0);
+  const line = (d, amount, m) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount, recorded: d.recorded ?? null, mismatch: d.mismatch ?? null,
+    reversedBy: d.reversedBy ?? null, reverses: d.reverses ?? null, payee: guessPayee(d.narration), match: m.get(d.row)?.match ?? null, candidates: m.get(d.row)?.candidates ?? [] });
+  // due by the statement's last date, for this account or not decided: if not matched, they are left out
+  const due = (list) => list.filter((p) => p.due_date <= st.to && (p.bank_id === bankId || p.bank_id == null)).map((p) => p.id);
   return {
     bank, fileName: str(body.name, 200), ocr: Boolean(body.ocr) && !body.lines, ai: Boolean(body.lines), checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
-    appClosing: app.closing, balanceEntered: app.balanceEntered,
-    debits: debits.map((d) => ({ row: d.row, date: d.date, narration: d.narration, ref: d.ref, bankRef: d.bankRef, amount: d.debit, recorded: d.recorded ?? null, mismatch: d.mismatch ?? null, reversedBy: d.reversedBy ?? null, payee: guessPayee(d.narration),
-      match: byRow.get(d.row)?.match ?? null, candidates: byRow.get(d.row)?.candidates ?? [] })),
-    credits: { count: credits.length, amount: credits.reduce((n, r) => n + r.credit, 0) },
-    payments,
-    // the ones due by the statement's last date, for this account or not decided: if not matched, they are left out
-    due: payments.filter((p) => p.due_date <= st.to && (p.bank_id === bankId || p.bank_id == null)).map((p) => p.id),
+    opening: st.opening, appClosing: app.closing, balanceEntered: app.balanceEntered,
+    debits: debits.map((d) => line(d, d.debit, outMatch)), credits: credits.map((d) => line(d, d.credit, inMatch)),
+    payments, receipts, due: due(payments), dueIn: due(receipts),
     today: todayIST(),
   };
 }
@@ -876,52 +884,64 @@ const routes = [
     return { lines: r.table.rows.map((x) => x.cells), note: r.note };
   }],
 
-  // apply what was chosen: matched debits are recorded as paid (dated as in the statement); left-out payments are
-  // moved to today or tomorrow, or cancelled; debits not in the app can be recorded as new payments
+  // apply what was chosen, money out and money in: matched lines are recorded as paid / received (dated as in the
+  // statement); left-out payments and receipts are moved to today or tomorrow, or cancelled; lines not in the app can be
+  // recorded as new payments / receipts
   ['POST', /^\/api\/reconcile\/apply$/, 'editor', async ({ body, user }) => withTx(async (c) => {
     const x = await reconcileCheck(c, body), bankId = x.bank.id, today = todayIST();
-    const lines = new Map(x.debits.map((d) => [d.row, d])), pays = new Map(x.payments.map((p) => [p.id, p]));
-    const rows = new Set(), paid = new Set(), out = { paid: 0, paidAmount: 0, recorded: 0, recordedAmount: 0, today: 0, tomorrow: 0, cancelled: 0, balanceSaved: false };
-    const useLine = (row) => {
-      const l = lines.get(Number(row));
-      if (!l) bad(`Statement row ${row} isn’t a payment out.`);
-      if (l.recorded) bad(`Statement row ${row} is already in the app.`);
-      if (rows.has(l.row)) bad(`Statement row ${row} is used twice.`);
-      rows.add(l.row);
-      return l;
-    };
-    for (const m of [].concat(body.matches ?? [])) {
-      const l = useLine(m.row), p = pays.get(Number(m.id));
-      if (!p) bad(`Payment P-${m.id} isn’t waiting to be paid any more.`);
-      if (paid.has(p.id)) bad(`${p.name} is matched to two statement rows.`);
-      if (l.amount > p.outstanding) bad(`${p.name}: the statement shows ${inr(l.amount)}, more than the ${inr(p.outstanding)} left to pay.`);
-      paid.add(p.id);
-      await settle(c, { table: 'payments', id: p.id, body: { bank_id: bankId, date: l.date, ref: l.bankRef, amount: (l.amount / 100).toFixed(2), fromStatement: true }, user });
-      out.paid++; out.paidAmount += l.amount;
-    }
-    for (const r of [].concat(body.record ?? [])) {
-      const l = useLine(r.row);
-      if (l.reversedBy) bad(`Statement row ${l.row} was reversed by the bank (row ${l.reversedBy}): it isn’t a payment to record.`);
-      const p = await addPayment(c, { payee: str(r.payee, 120) || l.payee || 'Bank debit', category: r.category || 'Other', amount: (l.amount / 100).toFixed(2), due_date: l.date,
-        bank_id: bankId, note: str(`From the bank statement: ${l.narration}`, 300), approved: true, confirmDuplicate: true }, user);
-      await settle(c, { table: 'payments', id: p.id, body: { bank_id: bankId, date: l.date, ref: l.bankRef, fromStatement: true }, user });
-      out.recorded++; out.recordedAmount += l.amount;
-    }
-    for (const a of [].concat(body.leftOut ?? [])) {
-      const action = oneOf(a.action, ['today', 'tomorrow', 'cancel'], 'Left out'), p = pays.get(Number(a.id));
-      if (!p) bad(`Payment P-${a.id} isn’t waiting to be paid any more.`);
-      if (paid.has(p.id)) bad(`${p.name} is both matched and left out.`);
-      if (action === 'cancel') {
-        await c.query("UPDATE payments SET status = 'CANCELLED' WHERE id = $1 AND status = 'OPEN'", [p.id]);
-        await audit(c, user.id, 'payment.cancel', { id: p.id, payee: p.name, reason: 'Not in the bank statement (reconciliation)' });
-        out.cancelled++;
-      } else {
-        // an EMI's instalment keeps its date (the EMI would make it again); it can be paid or cancelled
-        if (p.emi) bad(`${p.name} is an EMI instalment: it keeps its due date. Mark it paid, or cancel it.`);
-        const date = action === 'today' ? today : addDays(today, 1);
-        await c.query('UPDATE payments SET due_date = $2 WHERE id = $1', [p.id, date]);
-        await audit(c, user.id, 'payment.reschedule', { id: p.id, payee: p.name, amount: p.outstanding, from: p.due_date, to: date, reason: 'Not in the bank statement (reconciliation)' });
-        out[action]++;
+    const rows = new Set(), out = { paid: 0, paidAmount: 0, recorded: 0, recordedAmount: 0, today: 0, tomorrow: 0, cancelled: 0,
+      received: 0, receivedAmount: 0, recordedIn: 0, recordedInAmount: 0, inToday: 0, inTomorrow: 0, inCancelled: 0, balanceSaved: false };
+    // the two sides: money out (statement debits ↔ payments) and money in (credits ↔ receipts)
+    const sides = [
+      { out: true, lines: x.debits, list: x.payments, table: 'payments', word: 'payment out', what: 'Payment', id: 'P', matches: body.matches, record: body.record, leftOut: body.leftOut,
+        n: { done: 'paid', amt: 'paidAmount', rec: 'recorded', recAmt: 'recordedAmount', today: 'today', tomorrow: 'tomorrow', cancel: 'cancelled' } },
+      { out: false, lines: x.credits, list: x.receipts, table: 'receipts', word: 'credit in', what: 'Receipt', id: 'R', matches: body.matchesIn, record: body.recordIn, leftOut: body.leftOutIn,
+        n: { done: 'received', amt: 'receivedAmount', rec: 'recordedIn', recAmt: 'recordedInAmount', today: 'inToday', tomorrow: 'inTomorrow', cancel: 'inCancelled' } },
+    ];
+    for (const side of sides) {
+      const lines = new Map(side.lines.map((d) => [d.row, d])), items = new Map(side.list.map((p) => [p.id, p])), used = new Set();
+      const useLine = (row) => {
+        const l = lines.get(Number(row));
+        if (!l) bad(`Statement row ${row} isn’t a ${side.word}.`);
+        if (l.recorded) bad(`Statement row ${row} is already in the app.`);
+        if (rows.has(l.row)) bad(`Statement row ${row} is used twice.`);
+        if (l.reversedBy || l.reverses) bad(`Statement row ${l.row} was ${l.reversedBy ? `reversed by the bank (row ${l.reversedBy})` : `the bank reversing row ${l.reverses}`}: it isn’t a ${side.out ? 'payment' : 'receipt'}.`);
+        rows.add(l.row);
+        return l;
+      };
+      const item = (id) => items.get(Number(id)) ?? bad(`${side.what} ${side.id}-${id} isn’t waiting to be ${side.out ? 'paid' : 'received'} any more.`);
+      for (const m of [].concat(side.matches ?? [])) {
+        const l = useLine(m.row), p = item(m.id);
+        if (used.has(p.id)) bad(`${p.name} is matched to two statement rows.`);
+        if (l.amount > p.outstanding) bad(`${p.name}: the statement shows ${inr(l.amount)}, more than the ${inr(p.outstanding)} left to ${side.out ? 'pay' : 'receive'}.`);
+        used.add(p.id);
+        await settle(c, { table: side.table, id: p.id, body: { bank_id: bankId, date: l.date, ref: l.bankRef, amount: (l.amount / 100).toFixed(2), fromStatement: true }, user });
+        out[side.n.done]++; out[side.n.amt] += l.amount;
+      }
+      for (const r of [].concat(side.record ?? [])) {
+        const l = useLine(r.row), name = str(r.payee ?? r.party, 120) || l.payee || (side.out ? 'Bank debit' : 'Bank credit');
+        const note = str(`From the bank statement: ${l.narration}`, 300), amount = (l.amount / 100).toFixed(2);
+        const p = side.out
+          ? await addPayment(c, { payee: name, category: r.category || 'Other', amount, due_date: l.date, bank_id: bankId, note, approved: true, confirmDuplicate: true }, user)
+          : await addReceipt(c, { party: name, amount, expected_date: l.date, bank_id: bankId, certainty: 'FIRM', note, confirmDuplicate: true }, user);
+        await settle(c, { table: side.table, id: p.id, body: { bank_id: bankId, date: l.date, ref: l.bankRef, fromStatement: true }, user });
+        out[side.n.rec]++; out[side.n.recAmt] += l.amount;
+      }
+      for (const a of [].concat(side.leftOut ?? [])) {
+        const action = oneOf(a.action, ['today', 'tomorrow', 'cancel'], 'Left out'), p = item(a.id), one = side.table.slice(0, -1);
+        if (used.has(p.id)) bad(`${p.name} is both matched and left out.`);
+        if (action === 'cancel') {
+          await c.query(`UPDATE ${side.table} SET status = 'CANCELLED' WHERE id = $1 AND status = 'OPEN'`, [p.id]);
+          await audit(c, user.id, `${one}.cancel`, { id: p.id, [side.out ? 'payee' : 'party']: p.name, reason: 'Not in the bank statement (reconciliation)' });
+          out[side.n.cancel]++;
+        } else {
+          // an EMI's instalment keeps its date (the EMI would make it again); it can be paid or cancelled
+          if (p.emi) bad(`${p.name} is an EMI instalment: it keeps its due date. Mark it paid, or cancel it.`);
+          const date = action === 'today' ? today : addDays(today, 1);
+          await c.query(`UPDATE ${side.table} SET ${side.out ? 'due_date' : 'expected_date'} = $2 WHERE id = $1`, [p.id, date]);
+          await audit(c, user.id, `${one}.reschedule`, { id: p.id, [side.out ? 'payee' : 'party']: p.name, amount: p.outstanding, from: p.due_date, to: date, reason: 'Not in the bank statement (reconciliation)' });
+          out[side.n[action]]++;
+        }
       }
     }
     if (body.saveBalance === true) {
@@ -930,7 +950,7 @@ const routes = [
       await audit(c, user.id, 'balance.add', { bankId, amount: x.closing.amount, asOf: x.closing.date, fromStatement: true });
       out.balanceSaved = true;
     }
-    if (!out.paid && !out.recorded && !out.today && !out.tomorrow && !out.cancelled && !out.balanceSaved) bad('Nothing chosen to apply.');
+    if (!Object.entries(out).some(([k, v]) => !/Amount$/.test(k) && v)) bad('Nothing chosen to apply.');
     await audit(c, user.id, 'reconcile.apply', { bank: x.bank.name, bankId, file: x.fileName, from: x.from, to: x.to, ...out });
     return out;
   })],
