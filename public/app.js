@@ -600,11 +600,18 @@ async function recCheck(file, keepNote = false) {
       R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId });
     }
     R.needPassword = false;
-    R.choice = new Map([...R.data.debits, ...R.data.credits].filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']));
+    R.choice = firstChoices(R.data);
     R.payee = new Map(); R.left = new Map(); R.leftIn = new Map(); R.saveBalance = false;
   } catch (e) { R.err = e.message; R.data = null; R.progress = ''; if (e.code === 'pdf_password') R.needPassword = true; }
   R.busy = false; renderReconcile();
 }
+// what each statement line starts as: its matched payment / receipt; money that came in and matches nothing is set to
+// be recorded as a new receipt (so Apply brings the account to the bank's position) — unless it might be one of the
+// receipts expected (same amount), was reversed, or doesn't add up: those wait for a choice
+const firstChoices = (data) => new Map([
+  ...data.debits.filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']),
+  ...data.credits.filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : !d.reversedBy && !d.reverses && !d.mismatch && !d.candidates.length ? 'rec' : '']),
+]);
 // read the chosen file with Claude (any PDF, or a photo): its lines are then checked like any other statement
 async function recAi(busy = false) {
   const R = S.rec;
@@ -616,7 +623,7 @@ async function recAi(busy = false) {
     R.aiNote = r.note;
     R.progress = 'Checking what was read…'; renderReconcile();
     R.data = await api('/api/reconcile/check', { ...R.sent, bank_id: R.bankId });
-    R.choice = new Map([...R.data.debits, ...R.data.credits].filter((d) => !d.recorded).map((d) => [d.row, d.match ? String(d.match.id) : '']));
+    R.choice = firstChoices(R.data);
     R.payee = new Map(); R.left = new Map(); R.leftIn = new Map(); R.saveBalance = false;
   } catch (e) { R.err = e.message; R.data = null; }
   R.progress = ''; R.busy = false; renderReconcile();
@@ -815,9 +822,9 @@ function renderReconcile() {
 
   // everything not in the app, out and in, in one click — for the bank's actual position
   const allOut = recordable(O).filter((d) => R.choice.get(d.row) !== 'rec'), allIn = recordable(I).filter((d) => R.choice.get(d.row) !== 'rec');
-  const everything = allOut.length > 0 && allIn.length > 0 && h('div', { class: 'card rec-all' },
+  const everything = allOut.length + allIn.length > 0 && h('div', { class: 'card rec-all' },
     h('button', { class: 'primary', onclick: () => setRec([...allOut, ...allIn], 'rec') },
-      `+ Record everything not in the app: ${allOut.length} payment${allOut.length === 1 ? '' : 's'} (${inr(total(allOut))}) and ${allIn.length} receipt${allIn.length === 1 ? '' : 's'} (${inr(total(allIn))})`),
+      `+ Record everything not in the app: ${[allOut.length && `${allOut.length} payment${allOut.length === 1 ? '' : 's'} (${inr(total(allOut))})`, allIn.length && `${allIn.length} receipt${allIn.length === 1 ? '' : 's'} (${inr(total(allIn))})`].filter(Boolean).join(' and ')}`),
     h('span', { class: 'muted small' }, 'With what is matched, the app then shows the bank’s actual position. Review the names below, then Apply.'));
 
   const n = (m, v) => [...m.values()].filter((x) => x === v).length;
