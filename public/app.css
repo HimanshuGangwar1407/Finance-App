@@ -256,6 +256,7 @@ table.users td.acts-cell button { margin: 2px 0 2px 4px; }
 .tx-search input.search { flex: 1; min-width: 220px; font-size: 16px; padding: 10px 12px; }
 td.tx-id { font-family: ui-monospace, Consolas, monospace; font-size: 13px; color: var(--muted); }
 .result-count { font-weight: 600; }
+.bank-search input.search { font-size: 16px; padding: 10px 12px; }
 
 /* ── upload from Excel ── */
 .flash { display: flex; gap: 10px; align-items: center; background: var(--green-bg); color: var(--green); font-weight: 600; }

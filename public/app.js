@@ -1036,22 +1036,36 @@ function renderBanks(d) {
     (T.emiDue > 0 || T.reserved > 0) && h('div', { class: 'hold-strip' }, h('span', { class: 'badge-emi' }, 'EMI'),
       h('span', {}, T.emiDue ? [h('strong', {}, inr(T.emiDue)), ' of EMIs due on this day. '] : '', isToday && T.reserved ? [h('strong', {}, inr(T.reserved)), ' reserved for EMIs in this app now.'] : '')));
 
-  const table = d.banks.length && h('section', { class: 'card' }, h('h2', {}, h('span', { class: 'dot d-blue' }), `Bank-wise · ${nice(d.date)}`),
+  // search: the accounts whose name, bank or last 4 digits have every word typed (here, as you type — no reload)
+  const q = (S.bq ?? '').trim().toLowerCase(), words = q.split(/\s+/).filter(Boolean);
+  const shown = d.banks.filter((b) => words.every((w) => `${b.name} ${b.bank}`.toLowerCase().includes(w)));
+  const setQ = (v) => { S.bq = v; keepFocus(() => renderBanks(d)); };
+  const search = d.banks.length > 0 && h('div', { class: 'card toolbar bank-search', role: 'search' },
+    h('input', { type: 'search', name: 'bq', class: 'search', placeholder: 'Search bank accounts — name, bank or last 4 digits', value: S.bq ?? '', 'aria-label': 'Search bank accounts', oninput: (e) => setQ(e.target.value) }),
+    q && h('span', { class: 'muted small result-count' }, `${shown.length} of ${d.banks.length} bank account${d.banks.length === 1 ? '' : 's'}`),
+    q && h('button', { class: 'small', 'aria-label': 'Clear search', onclick: () => setQ('') }, '✕ Clear'));
+  const sum = (k) => shown.reduce((m, b) => m + b[k], 0);
+  const F = q ? { label: `Matching (${shown.length})`, opening: sum('opening'), paid: sum('paid'), received: sum('received'), closing: sum('closing'), emiDue: shown.reduce((m, b) => m + b.emisDue.reduce((n, e) => n + e.amount, 0), 0) }
+    : { label: 'All banks', ...T };
+
+  const table = shown.length > 0 && h('section', { class: 'card' }, h('h2', {}, h('span', { class: 'dot d-blue' }), `Bank-wise · ${nice(d.date)}`),
     h('div', { class: 'scroll' }, h('table', { class: 'tx' },
       h('thead', {}, h('tr', {}, h('th', {}, 'Bank account'), h('th', { class: 'num' }, 'Opening'), h('th', { class: 'num' }, '− Debits'), h('th', { class: 'num' }, '+ Credits'), h('th', { class: 'num' }, '= Closing'), h('th', {}, 'EMI'))),
-      h('tbody', {}, d.banks.map((b) => h('tr', {},
+      h('tbody', {}, shown.map((b) => h('tr', {},
         h('td', {}, h('strong', {}, b.name), h('div', { class: 'muted small' }, b.bank)),
         h('td', { class: 'num' }, money(b.opening)), h('td', { class: 'num' }, money(b.paid, b.paid ? 'red' : '')), h('td', { class: 'num' }, money(b.received, b.received ? 'pos' : '')),
         h('td', { class: 'num' }, h('strong', {}, money(b.closing))),
         h('td', {}, emiSummary(b, isToday))))),
-      h('tfoot', {}, h('tr', {}, h('td', {}, 'All banks'), h('td', { class: 'num' }, money(T.opening)), h('td', { class: 'num' }, money(T.paid, 'red')), h('td', { class: 'num' }, money(T.received, 'pos')), h('td', { class: 'num' }, money(T.closing)), h('td', {}, T.emiDue ? `${inr(T.emiDue)} due` : '—'))))));
+      h('tfoot', {}, h('tr', {}, h('td', {}, F.label), h('td', { class: 'num' }, money(F.opening)), h('td', { class: 'num' }, money(F.paid, 'red')), h('td', { class: 'num' }, money(F.received, 'pos')), h('td', { class: 'num' }, money(F.closing)), h('td', {}, F.emiDue ? `${inr(F.emiDue)} due` : '—'))))));
 
   const line = (label, p, cls = '') => h('div', { class: 'bc-line' }, h('span', { class: 'muted' }, label), money(p, cls));
   const moves = (list, out) => list.length
     ? h('ul', { class: 'day-moves' }, list.map((m) => h('li', {}, h('span', {}, m.name, m.note && h('span', { class: 'muted small' }, ` · ${m.note}`), h('span', { class: 'muted small' }, ` · ${m.ref}`)), money(out ? -m.amount : m.amount, out ? '' : 'pos'))))
     : h('div', { class: 'muted small day-none' }, out ? 'No debits' : 'No credits');
-  const cards = d.banks.length
-    ? h('div', { class: 'bank-cards' }, d.banks.map((b) => h('section', { class: `bank-card ${b.closing < 0 ? 'short' : ''}` },
+  const cards = d.banks.length && !shown.length
+    ? h('div', { class: 'card' }, h('p', { class: 'empty' }, `No bank account matches “${S.bq.trim()}”. `, h('button', { class: 'link', onclick: () => setQ('') }, 'Show all bank accounts')))
+    : d.banks.length
+    ? h('div', { class: 'bank-cards' }, shown.map((b) => h('section', { class: `bank-card ${b.closing < 0 ? 'short' : ''}` },
       h('div', { class: 'bc-head' }, h('div', {}, h('strong', {}, b.name), h('div', { class: 'muted small' }, b.bank)),
         h('div', { class: 'bc-acts' },
           !b.balanceEntered && h('span', { class: 'chip c-amber', title: 'Enter a bank balance on the Dashboard so this starts from the right figure.' }, 'no balance entered'),
@@ -1069,7 +1083,7 @@ function renderBanks(d) {
 
   app.replaceChildren(...[topBar(), pageHead('Banks', 'Each bank account for a day: opening balance, debits, credits, closing balance, and EMIs.',
     can('admin') && h('button', { class: 'primary', onclick: bankDialog }, '+ Add bank account'),
-    can('admin') && h('button', { onclick: () => bankUploadDialog() }, '⇪ Upload Excel')), flash(), picker, summary, table, cards].filter(Boolean));
+    can('admin') && h('button', { onclick: () => bankUploadDialog() }, '⇪ Upload Excel')), flash(), search, picker, summary, table, cards].filter(Boolean));
 }
 const EMI_STATE_SHORT = { paid: ['paid', 'c-green'], overdue: ['unpaid', 'c-red'], due: ['due today', 'c-amber'], upcoming: ['upcoming', 'c-blue'], scheduled: ['scheduled', ''] };
 // the EMI column: what is due that day, else the next one
