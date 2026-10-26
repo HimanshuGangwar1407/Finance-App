@@ -18,14 +18,18 @@ function rc4(key, data) {
 const esc = (t) => String(t).replace(/[\\()]/g, (c) => `\\${c}`);
 
 /**
- * texts: [[x, y, 'text', size?]] in points from the bottom left of an A4-landscape page — or { pages: [texts, …] }.
+ * texts: [[x, y, 'text', size?, degrees?]] in points from the bottom left of an A4-landscape page — or { pages: [texts, …] }.
+ * degrees turns the text (a watermark).
  * { password } locks it; { shapesOnly } draws boxes instead of text (like a "printed" picture of a page).
  */
 export function makePdf(texts, { password, shapesOnly = false } = {}) {
   const pages = Array.isArray(texts) ? [texts] : texts.pages;
   const contents = pages.map((list) => (shapesOnly
     ? list.map(([x, y, t]) => `${x} ${y} ${String(t).length * 4} 6 re f`).join('\n')
-    : list.map(([x, y, t, size = 9]) => `BT /F1 ${size} Tf 1 0 0 1 ${x} ${y} Tm (${esc(t)}) Tj ET`).join('\n')));
+    : list.map(([x, y, t, size = 9, deg = 0]) => {
+      const c = Math.cos((deg * Math.PI) / 180).toFixed(4), s = Math.sin((deg * Math.PI) / 180).toFixed(4);
+      return `BT /F1 ${size} Tf ${deg ? `${c} ${s} ${-s} ${c}` : '1 0 0 1'} ${x} ${y} Tm (${esc(t)}) Tj ET`;
+    }).join('\n')));
   const id = crypto.createHash('md5').update(contents.join('\f')).digest();
   let key = null, encrypt = '';
   if (password) {

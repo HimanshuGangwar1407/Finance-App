@@ -11,8 +11,8 @@ const COLUMNS = {
   date: ['txndate', 'transactiondate', 'trandate', 'date', 'postdate', 'postingdate', 'valuedate', 'valuedt', 'dt'],
   narration: ['narration', 'description', 'particulars', 'transactiondetails', 'transactionremarks', 'transactiondescription', 'details', 'remarks', 'transactionparticulars'],
   ref: ['chqrefno', 'chequerefno', 'refnochequeno', 'chqno', 'chequeno', 'chequenumber', 'refno', 'referenceno', 'reference', 'utrno', 'utr', 'transactionid', 'tranid', 'refchqno', 'chano', 'chgno', 'cheqno', 'chqnumber'],
-  debit: ['withdrawalamt', 'withdrawalamtinr', 'withdrawalamountinr', 'withdrawalamount', 'withdrawal', 'withdrawals', 'debit', 'debitamount', 'debitamt', 'debitinr', 'dr', 'debits', 'amountdebited'],
-  credit: ['depositamt', 'depositamtinr', 'depositamountinr', 'depositamount', 'deposit', 'deposits', 'credit', 'creditamount', 'creditamt', 'creditinr', 'cr', 'credits', 'amountcredited'],
+  debit: ['withdrawalamt', 'withdrawalamtinr', 'withdrawalamountinr', 'withdrawalamount', 'withdrawal', 'withdrawals', 'withdrawaldr', 'withdrawalsdr', 'debit', 'debitamount', 'debitamt', 'debitinr', 'dr', 'debits', 'amountdebited'],
+  credit: ['depositamt', 'depositamtinr', 'depositamountinr', 'depositamount', 'deposit', 'deposits', 'depositcr', 'depositscr', 'credit', 'creditamount', 'creditamt', 'creditinr', 'cr', 'credits', 'amountcredited'],
   amount: ['amount', 'amountinr', 'transactionamount', 'txnamount', 'amountrs'],
   drcr: ['drcr', 'crdr', 'type', 'debitcredit', 'transactiontype'],
   balance: ['closingbalance', 'balance', 'balanceinr', 'availablebalance', 'runningbalance'],
@@ -28,11 +28,11 @@ function matchHeader(cells) {
   return cols.date != null && (cols.debit != null || (cols.amount != null && cols.drcr != null)) ? cols : null;
 }
 
-// a statement amount: 1,25,000.00 · ₹500 · "500.00 Dr" · a number; empty → 0
+// a statement amount: 1,25,000.00 · ₹500 · "500.00 Dr" · a number; empty (or a dash) → 0
 function money(v) {
   if (typeof v === 'number') return Math.round(Math.abs(v) * 100);
   const s = String(v ?? '').trim().replace(/\s*(dr|cr)\.?$/i, '');
-  if (!s || s === '-') return 0;
+  if (!s || /^[-–—]$/.test(s)) return 0;
   try { return Math.abs(toPaise(s.replace(/^\((.*)\)$/, '$1'), 'Amount', { allowNegative: true })); } catch { return null; }
 }
 
@@ -70,7 +70,7 @@ export function readStatement(table) {
       debit = /^(d|dr|debit|withdrawal)/i.test(t) ? a : 0; credit = /^(c|cr|credit|deposit)/i.test(t) ? a : 0;
     }
     if (debit == null || credit == null) { skipped.push({ row: r.n, why: 'amount not understood' }); continue; }
-    const bal = cols.balance != null && String(cell(r, 'balance')).trim() !== '' ? money(cell(r, 'balance')) : null;
+    const bal = cols.balance != null && !/^[-–—]?$/.test(String(cell(r, 'balance')).trim()) ? money(cell(r, 'balance')) : null;
     if (!debit && !credit && bal == null) continue;
     const neg = /dr$|^-|^\(/i.test(String(cell(r, 'balance')).trim()); // an overdrawn balance
     const reversal = cols.debit != null && (/^\s*(-|\()/.test(String(cell(r, 'debit'))) || /^\s*(-|\()/.test(String(cell(r, 'credit')))) || /^\s*reversal\b|\bRET(URN|URNED)?\b/i.test(narration); // a reversal, or a returned cheque ("CHQ DEP RET-…")

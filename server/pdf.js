@@ -11,7 +11,8 @@ export const NO_TEXT = 'This PDF has no text in it — it is a picture of the st
 const isHeader = (text) => /particulars|narration|description|details|remarks/i.test(text) && /withdrawal|debit|\bdr\b|deposit|credit/i.test(text);
 const DATE_HEAD = /date|\bdt\b/i;
 const END = /^(note\b|disclaimer|statement\s+summary|end\s+of\s+statement|\*{3,}|total\b|grand\s+total|opening\s+balance\s*:|closing\s+balance\s*:|this\s+is\s+a\s+(system|computer))/i;
-const DATE_START = /^\d{1,2}[-/. ](\d{1,2}|[a-z]{3,9})([-/. ]|$)/i;
+const SUMMARY = /^(opening\s+balance|closing\s+balance|debit\s+count|credit\s+count|total\s+(withdrawals?|deposits?|debits?|credits?))\b/i;
+const DATE_START =/^\d{1,2}[-/. ](\d{1,2}|[a-z]{3,9})([-/. ]|$)/i;
 const join = (a, b) => (!a ? b : !b ? a : /[-/]$/.test(a) ? a + b : `${a} ${b}`);
 
 async function load() {
@@ -35,7 +36,8 @@ async function textItems(buf, password) {
   const pages = [];
   for (let p = 1; p <= doc.numPages; p++) {
     const page = await doc.getPage(p), [, , , top] = page.view, tc = await page.getTextContent();
-    pages.push(tc.items.filter((it) => it.str && it.str.trim()).map((it) => ({ x: it.transform[4], y: it.transform[5], w: it.width, h: Math.abs(it.transform[3]) || it.height || 8, s: it.str.trim() }))
+    // slanted / turned text is a watermark ("SAMPLE • TEST DATA ONLY") or a margin note, never a statement figure
+    pages.push(tc.items.filter((it) => it.str && it.str.trim() && !it.transform[1] && !it.transform[2]).map((it) => ({ x: it.transform[4], y: it.transform[5], w: it.width, h: Math.abs(it.transform[3]) || it.height || 8, s: it.str.trim() }))
       .filter((it) => it.y > 30 && it.y < top - 30)); // the browser's print header and footer
   }
   await doc.destroy();
@@ -53,10 +55,36 @@ function lines(items) {
   return out;
 }
 
+// two headings printed as one piece of text ("Value Dt Withdrawal Amt."): cut where the next column's name starts,
+// each part as wide as its share of the letters. "Closing Balance", "Debit / Credit", "Amount Credited" stay whole.
+const HEAD_WORD = /^(value|withdrawals?|deposits?|debits?|credits?|closing|balance|chq\.?|cheque|narration|particulars|description)$/i;
+function splitHeading(it) {
+  const words = it.s.split(/\s+/), parts = [];
+  words.forEach((w, i) => {
+    const prev = words[i - 1];
+    const start = i > 0 && HEAD_WORD.test(w.replace(/[^\w.]/g, '')) && !/\/$/.test(prev) && !(/^balance$/i.test(w) && /^(closing|available|running|ledger|book|clear(ed)?)$/i.test(prev));
+    if (start || !parts.length) parts.push([w]); else parts.at(-1).push(w);
+  });
+  if (parts.length < 2) return [it];
+  let x = it.x;
+  return parts.map((p) => {
+    const s = p.join(' '), w = (it.w * s.length) / it.s.length;
+    const out = { ...it, s, x, w };
+    x += w + it.w / it.s.length; // and the space after it
+    return out;
+  });
+}
+
 // the columns, from the heading line and the heading words just above / below it ("Post-" / "date", "Chq." / "No.")
 function columns(ls, at) {
-  const band = ls.filter((l) => Math.abs(l.y - ls[at].y) <= ls[at].h * 1.6 && l.items.every((i) => i.s.length <= 25 && !/\d[\d,]*\.\d\d/.test(i.s)));
-  const heads = band.flatMap((l) => l.items.map((i) => ({ ...i, y: l.y }))).sort((a, b) => a.x - b.x);
+  const head = ls[at], reach = head.h * 1.6;
+  // a box of account details beside the headings ("RTGS/NEFT IFSC  SAMP0000000", "Branch Code  000") can run into
+  // their lines: its lines start where the details above them start (label, value), which a heading never does
+  const above = ls.filter((l) => l.y > head.y + reach && l.y < head.y + 100);
+  const aligned = (it) => above.filter((l) => l.items.some((j) => Math.abs(j.x - it.x) < 1.5)).length >= 2;
+  const details = (l) => { const n = l.items.filter(aligned).length; return n >= 2 && n * 2 >= l.items.length; };
+  const band = ls.filter((l) => Math.abs(l.y - head.y) <= reach && (l === head || !details(l)) && l.items.every((i) => i.s.length <= 25 && !/\d[\d,]*\.\d\d/.test(i.s)));
+  const heads = band.flatMap((l) => l.items.flatMap(splitHeading).map((i) => ({ ...i, y: l.y }))).sort((a, b) => a.x - b.x);
   const cols = [];
   for (const it of heads) {
     // a heading split over lines ("Post-" / "date") is one column; two headings side by side on a line never are,
@@ -106,6 +134,7 @@ export function ocrPages(ocr) {
 export function tableFromPages(pages) {
   pages = pages.map(splitAmounts);
   let cols = null, dateCol = -1, ended = false;
+  let lead = null, lastY = null; // a description's first line, above its date; the last line read on this page
   const wraps = []; // each record's cells, line by line
   const rows = [], records = [];
   // amounts, dates, cheque numbers sit under their heading (often right-aligned): placed by their middle.
@@ -145,6 +174,7 @@ export function tableFromPages(pages) {
   const boilerplate = (l) => pageLines.length > 1 && /[a-z]/i.test(l.text) && !DATE_START.test(l.text) && l.items.every((it) => seen.get(where(it)) > 1);
   for (const ls of pageLines) {
     let skip = new Set();
+    lead = null; lastY = null;
     // a page that repeats the headings: what is above them (bank name, address, "Page No") isn't the table.
     // A page without them carries straight on from the page before.
     let paused = ls.some((l) => isHeader(l.text));
@@ -153,14 +183,18 @@ export function tableFromPages(pages) {
       if (skip.has(l)) continue;
       if (isHeader(l.text)) { // the headings (again, on a later page)
         const c = columns(ls, i);
-        skip = c.band; paused = false;
+        skip = c.band; paused = false; lastY = l.y;
         if (!cols) { cols = c.cols; dateCol = cols.findIndex((k) => DATE_HEAD.test(k.text)); rows.push({ n: 1, cells: cols.map((k) => k.text) }); }
         continue;
       }
       if (!cols || boilerplate(l)) continue; // above the table, or what every page repeats
       const cells = cols.map(() => '');
       const xs = cols.map(() => null); // where each cell's text starts on this line
-      for (const it of l.items) { const k = colOf(it); cells[k] = join(cells[k], it.s); xs[k] ??= it.x; }
+      for (const it of l.items) {
+        const k = colOf(it);
+        if (!it.word && k > dateCol + 1 && /^[-–—]$/.test(it.s)) continue; // a dash for "nothing" in an amount column (not one in the description)
+        cells[k] = join(cells[k], it.s); xs[k] ??= it.x;
+      }
       // a long plain number under the date is the end of a wrapped description ("5718991")
       if (dateCol >= 0 && dateCol + 1 < cols.length && /^\d{5,}$/.test(cells[dateCol])) { cells[dateCol + 1] = join(cells[dateCol], cells[dateCol + 1]); cells[dateCol] = ''; }
       // below the table (a page footer) until the next headings — or a line with a date and an amount
@@ -168,8 +202,23 @@ export function tableFromPages(pages) {
       paused = false;
       const first = cells.find(Boolean) ?? '';
       if (END.test(first) || END.test(l.text)) { if (records.length) ended = true; continue; }
+      // a summary box under the transactions ("Opening Balance 13,28,050.26  Debit Count 50 …")
+      if (records.length && SUMMARY.test(first) && !DATE_START.test(cells[dateCol] ?? '')) { ended = true; continue; }
       const d = dateCol >= 0 ? cells[dateCol] : '';
-      if (d && DATE_START.test(d)) { records.push(cells); wraps.push(cells.map((c, k) => (c ? [{ s: c, x: xs[k] }] : []))); continue; } // a new transaction
+      if (d && DATE_START.test(d)) { // a new transaction
+        const parts = cells.map((c, k) => [...(lead?.[k] ?? []), ...(c ? [{ s: c, x: xs[k] }] : [])]);
+        records.push(parts.map((p) => p.reduce((t, q) => join(t, q.s), ''))); wraps.push(parts);
+        lead = null; lastY = l.y; continue;
+      }
+      // a description printed over two lines with the date row centred between them: its first line sits just above
+      // the date — much nearer to it than to the line before — and belongs to it, not to the transaction above.
+      // The date row then has nothing of its own in that column.
+      const nx = ls[i + 1], nxCols = new Set(nx?.items.map(colOf));
+      if (!d && lastY != null && nx && !skip.has(nx) && l.y - nx.y < 0.6 * (lastY - l.y) && nx.items.some((it) => colOf(it) === dateCol && DATE_START.test(it.s))
+        && cells.every((c, k) => !c || !nxCols.has(k))) {
+        lead = cells.map((c, k) => (c ? [{ s: c, x: xs[k] }] : [])); lastY = l.y; continue;
+      }
+      lastY = l.y;
       if (!records.length) continue;
       if (d && !/^\d{2,4}$/.test(d)) { paused = true; continue; } // the table stops here (a page footer): until the next page's headings
       const last = records.at(-1); // the same transaction, carried onto another line
@@ -193,6 +242,8 @@ export function tableFromPages(pages) {
     for (const w of multi) lens.set(w[k][0].s.length, (lens.get(w[k][0].s.length) ?? 0) + 1);
     const [width, count] = [...lens].sort((a, b) => b[1] - a[1])[0];
     if (width < 12 || count < 3 || count < multi.length * 0.4) return;
+    // a column cut at a fixed width never has a longer piece; descriptions that merely share a length often do
+    if (multi.some((w) => w[k].some((p) => p.s.length > width))) return;
     multi.forEach((w) => {
       let text = '', piece = 0;
       // where the column's lines usually start: a piece starting further right began with a space
