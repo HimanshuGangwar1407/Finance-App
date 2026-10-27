@@ -180,8 +180,11 @@ async function settle(c, { table, id, body, user }) {
   }
   const { rows: [e] } = await c.query(`INSERT INTO entries (kind, ${isIn ? 'receipt_id' : 'payment_id'}, bank_id, amount, date, ref, ref_norm, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
     [isIn ? 'IN' : 'OUT', id, bankId, amount, date, ref, refNorm, user.id]);
-  await audit(c, user.id, isIn ? 'receipt.received' : 'payment.paid', { id, entry: e.id, bankId, amount, date, ref, ...(overdraft ? { overdraft: true } : {}), ...(body.fromStatement ? { fromStatement: true } : {}) });
-  return { id: e.id, left: left - amount };
+  // no account on the slip: it is the account the money went through (any part not yet paid / received stays there too)
+  const assigned = x.bank_id == null;
+  if (assigned) await c.query(`UPDATE ${table} SET bank_id = $2 WHERE id = $1`, [id, bankId]);
+  await audit(c, user.id, isIn ? 'receipt.received' : 'payment.paid', { id, entry: e.id, bankId, amount, date, ref, ...(assigned ? { accountAssigned: true } : {}), ...(overdraft ? { overdraft: true } : {}), ...(body.fromStatement ? { fromStatement: true } : {}) });
+  return { id: e.id, left: left - amount, assigned };
 }
 
 // ── EMI management: settings, schedule, money held, reminders ──
@@ -927,7 +930,8 @@ const routes = [
   ['POST', /^\/api\/reconcile\/apply$/, 'editor', async ({ body, user }) => withTx(async (c) => {
     const x = await reconcileCheck(c, body), bankId = x.bank.id, today = todayIST();
     const rows = new Set(), out = { paid: 0, paidAmount: 0, recorded: 0, recordedAmount: 0, today: 0, tomorrow: 0, cancelled: 0,
-      received: 0, receivedAmount: 0, recordedIn: 0, recordedInAmount: 0, inToday: 0, inTomorrow: 0, inCancelled: 0, balanceSaved: false };
+      received: 0, receivedAmount: 0, recordedIn: 0, recordedInAmount: 0, inToday: 0, inTomorrow: 0, inCancelled: 0, balanceSaved: false,
+      assigned: 0, assignedIn: 0 }; // matched ones that had no account: now this statement's account
     // the two sides: money out (statement debits ↔ payments) and money in (credits ↔ receipts)
     const sides = [
       { out: true, lines: x.debits, list: x.payments, table: 'payments', word: 'payment out', what: 'Payment', id: 'P', matches: body.matches, record: body.record, leftOut: body.leftOut,
@@ -952,8 +956,9 @@ const routes = [
         if (used.has(p.id)) bad(`${p.name} is matched to two statement rows.`);
         if (l.amount > p.outstanding) bad(`${p.name}: the statement shows ${inr(l.amount)}, more than the ${inr(p.outstanding)} left to ${side.out ? 'pay' : 'receive'}.`);
         used.add(p.id);
-        await settle(c, { table: side.table, id: p.id, body: { bank_id: bankId, date: l.date, ref: l.bankRef, amount: (l.amount / 100).toFixed(2), fromStatement: true }, user });
+        const s = await settle(c, { table: side.table, id: p.id, body: { bank_id: bankId, date: l.date, ref: l.bankRef, amount: (l.amount / 100).toFixed(2), fromStatement: true }, user });
         out[side.n.done]++; out[side.n.amt] += l.amount;
+        if (s.assigned) out[side.out ? 'assigned' : 'assignedIn']++;
       }
       for (const r of [].concat(side.record ?? [])) {
         const l = useLine(r.row), name = str(r.payee ?? r.party, 120) || l.payee || (side.out ? 'Bank debit' : 'Bank credit');

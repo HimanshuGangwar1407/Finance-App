@@ -825,7 +825,9 @@ function renderReconcile() {
     const id = R.choice.get(d.row), p = S.items.get(id);
     if (!p) return null;
     const auto = d.match && String(d.match.id) === id ? HOW[d.match.how] : ['chosen by you', 'c-blue'];
-    return h('div', { class: 'chips' }, h('span', { class: `chip ${auto[1]}` }, auto[0]), d.amount < p.outstanding && h('span', { class: 'chip c-blue' }, `part: ${inr(p.outstanding - d.amount)} stays to ${S.w.verb}`));
+    return h('div', { class: 'chips' }, h('span', { class: `chip ${auto[1]}` }, auto[0]), d.amount < p.outstanding && h('span', { class: 'chip c-blue' }, `part: ${inr(p.outstanding - d.amount)} stays to ${S.w.verb}`),
+      // no account on the slip: the statement says which one it went through
+      p.bank_id == null && h('span', { class: 'chip c-blue', title: 'It had no bank account. Applying records it in the account of this statement.' }, `account not decided → ${S.w.did} ${S.out ? 'from' : 'into'} ${D.bank.name}`));
   };
   const table = (S, rows, head, cells, foot) => h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
     h('thead', {}, h('tr', {}, head.map((t, i) => h('th', { class: i === 2 ? 'num' : '' }, t)))), h('tbody', {}, rows.map((d) => h('tr', {}, cells(d)))), foot && h('tfoot', {}, foot)));
@@ -841,9 +843,11 @@ function renderReconcile() {
   const leftSec = (S) => h('section', { class: 'card' },
     h('h2', {}, h('span', { class: 'dot d-amber' }), S.out ? `Left out — due by ${nice(D.to)}, not in the statement (${S.leftOut.length})` : `Expected but not in the statement — due by ${nice(D.to)} (${S.leftOut.length})`),
     h('p', { class: 'muted small' }, `${S.out ? 'Payments' : 'Receipts'} for ${D.bank.name} (or with no bank decided) that were ${S.w.due} by the statement’s last day but aren’t in it. They stay ${S.w.yet} until you decide.`),
-    S.leftOut.length > 0 && h('div', { class: 'bar' }, h('span', { class: 'muted small' }, 'Set all:'),
+    // with no account decided, it may be in another account's statement: "Set all" leaves those alone
+    S.leftOut.some((p) => p.bank_id == null) && h('p', { class: 'muted small' }, `The ones with no bank account decided may have been ${S.w.did} through another account: reconcile that account’s statement too before cancelling them. “Set all” leaves them as they are.`),
+    S.leftOut.some((p) => p.bank_id != null) && h('div', { class: 'bar' }, h('span', { class: 'muted small' }, 'Set all:'),
       [['today', S.w.soon], ['tomorrow', 'Next day'], ['cancel', 'Cancelled'], ['', 'Decide later']].map(([v, t]) =>
-        h('button', { class: 'small', onclick: () => { for (const p of S.leftOut) if (v === '' || v === 'cancel' || !p.emi) S.left.set(p.id, v); rerender(); } }, t))),
+        h('button', { class: 'small', onclick: () => { for (const p of S.leftOut) if (p.bank_id != null && (v === '' || v === 'cancel' || !p.emi)) S.left.set(p.id, v); rerender(); } }, t))),
     S.leftOut.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx rec' },
       h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, S.w.to), h('th', {}, S.out ? 'Due' : 'Expected'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'What happens'))),
       h('tbody', {}, S.leftOut.map((p) => h('tr', {},
@@ -921,7 +925,8 @@ function renderReconcile() {
         matches: O.matched.map((d) => ({ row: d.row, id: Number(R.choice.get(d.row)) })), record: O.rec.map((d) => ({ row: d.row, payee: name(d) })), leftOut: lefts(O),
         matchesIn: I.matched.map((d) => ({ row: d.row, id: Number(R.choice.get(d.row)) })), recordIn: I.rec.map((d) => ({ row: d.row, party: name(d) })), leftOutIn: lefts(I) });
       R.note = [`Reconciled ${D.bank.name}:`, r.paid && `${r.paid} payment(s) marked paid (${inr(r.paidAmount)})`, r.recorded && `${r.recorded} payment(s) recorded as new (${inr(r.recordedAmount)})`,
-        r.received && `${r.received} receipt(s) marked received (${inr(r.receivedAmount)})`, r.recordedIn && `${r.recordedIn} receipt(s) recorded as new (${inr(r.recordedInAmount)})`,
+        r.assigned && `(${r.assigned} with no account now in ${D.bank.name})`,
+        r.received && `${r.received} receipt(s) marked received (${inr(r.receivedAmount)})`, r.assignedIn && `(${r.assignedIn} with no account now in ${D.bank.name})`, r.recordedIn && `${r.recordedIn} receipt(s) recorded as new (${inr(r.recordedInAmount)})`,
         r.today && `${r.today} moved to today`, r.tomorrow && `${r.tomorrow} moved to tomorrow`, r.cancelled && `${r.cancelled} cancelled`,
         r.inToday && `${r.inToday} receipt(s) expected today`, r.inTomorrow && `${r.inTomorrow} receipt(s) moved to tomorrow`, r.inCancelled && `${r.inCancelled} receipt(s) cancelled`,
         r.balanceSaved && 'statement balance saved'].filter(Boolean).join(' ');
@@ -1413,7 +1418,8 @@ function describe(a, positions) {
   if (a.action === 'emi.reminders') return `${d.reminders ?? 0} due · ${d.inApp ?? 0} in-app · ${d.queued ?? 0} email(s) queued · ${d.sent ?? 0} sent${d.via ? ' · daily schedule' : ''}`;
   if (a.action === 'signup.request') return `${d.email} · ${!d.matched ? 'not in People (nothing sent)' : d.emailed === 'sent' ? `link emailed (${d.role})` : d.emailed === 'not set up' ? 'email not set up: admins notified' : `email ${d.emailed}`}`;
   if (a.action === 'reconcile.ai_read') return `${d.file || 'statement'} · ${d.lines} line(s) read · ${d.model}`;
-  if (a.action === 'reconcile.apply') return [`${d.bank} · ${d.from} to ${d.to}`, d.paid && `${d.paid} paid ${inr(d.paidAmount)}`, d.recorded && `${d.recorded} recorded as new`, d.today && `${d.today} to today`, d.tomorrow && `${d.tomorrow} to next day`, d.cancelled && `${d.cancelled} cancelled`, d.balanceSaved && 'balance saved'].filter(Boolean).join(' · ');
+  if (a.action === 'reconcile.apply') return [`${d.bank} · ${d.from} to ${d.to}`, d.paid && `${d.paid} paid ${inr(d.paidAmount)}`, d.recorded && `${d.recorded} recorded as new`, d.received && `${d.received} received ${inr(d.receivedAmount)}`, d.recordedIn && `${d.recordedIn} receipt(s) recorded as new`,
+    (d.assigned || d.assignedIn) && `${(d.assigned || 0) + (d.assignedIn || 0)} with no account put in ${d.bank}`, d.today && `${d.today} to today`, d.tomorrow && `${d.tomorrow} to next day`, d.cancelled && `${d.cancelled} cancelled`, d.balanceSaved && 'balance saved'].filter(Boolean).join(' · ');
   if (a.action === 'payment.reschedule') return `${d.payee} · ${inr(d.amount)} · ${d.from} → ${d.to}`;
   if (a.action === 'bank.import') return `${d.file || 'sheet'} · ${d.added} added${d.balances ? ` (${d.balances} with an opening balance)` : ''}${d.skipped ? ` · ${d.skipped} skipped` : ''}`;
   if (a.action === 'bank.delete') return [`${d.name} (${d.bank} XXXX${d.last4})`, d.entries && `${d.entries} transaction(s) deleted`, d.receivedAmount && `${inr(d.receivedAmount)} in`, d.paidAmount && `${inr(d.paidAmount)} out`, d.emis && `${d.emis} EMI(s)`, d.balances && `${d.balances} balance(s)`, d.nowNotDecided && `${d.nowNotDecided} now “Not decided”`].filter(Boolean).join(' · ');
