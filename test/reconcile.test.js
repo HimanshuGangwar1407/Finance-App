@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import fs from 'node:fs';
 import { readTable } from '../server/sheet.js';
-import { readStatement, matchStatement, similarity, guessPayee } from '../server/reconcile.js';
+import { readStatement, matchStatement, similarity, guessPayee, accountOf } from '../server/reconcile.js';
+import { tableFromLines } from '../server/ai.js';
 import { setPool } from '../server/db.js';
 import { pglitePool } from '../server/local-db.js';
 import { todayIST, addDays } from '../server/money.js';
@@ -37,6 +38,27 @@ test('other layouts: newest first (ICICI), Txn Date / Ref No./Cheque No. with wr
 
   st = statement(csv('Tran Date,Particulars,Amount,DR/CR,Balance\n22-10-2026,STEEL CO,125000,DR,375000\n22-10-2026,MEHTA,80000,CR,455000\n'));
   assert.deepEqual(st.rows.map((r) => [r.debit, r.credit]), [[12_500_000, 0], [0, 8_000_000]]);
+});
+
+test('the account number above the table: its last 4 digits; never a number in the lines, never another field', () => {
+  assert.deepEqual(statement(fixture('hdfc-statement.xlsx'), 'hdfc.xlsx').account, { last4: '1111' }); // "Account No :50200012341111"
+  for (const [text, last4] of [['Account No :50200012341111', '1111'], ['IDBI Bank Statement Of A/c : 0191100000099999', '9999'], ['A/C No. XXXXXXXX4321', '4321'],
+    ['Account Number \'XXXX XXXX 5678', '5678'], ['Acct No: 1234-5678-0042 Customer ID: 998877', '0042'], ['Account Name : X', null], ['Account Branch : SECTOR 18 NOIDA', null],
+    ['Account Statement from 1 Oct 2026 to 22 Oct 2026', null]]) {
+    assert.deepEqual(accountOf([text])?.last4 ?? null, last4, text);
+  }
+  // a beneficiary's account in a narration ("…-XXXXXXXX1234-…") isn't the statement's
+  assert.equal(statement(csv('Date,Narration,Debit,Credit,Balance\n21/10/2026,IMPS-GUPTA-SBIN-XXXXXXXX1234-FREIGHT,500,,9500\n')).account, null);
+  // what the AI read comes with the account number it saw
+  assert.deepEqual(readStatement(tableFromLines([['Date', 'Narration', 'Ref', 'Withdrawal', 'Deposit', 'Balance'], ['21/10/2026', 'X', '', '5.00', '', '95.00']], 'XXXXXXXX7777')).account, { last4: '7777' });
+});
+
+test('matching: a payment assigned to another account isn’t matched by itself — it is only offered', () => {
+  const lines = [{ row: 1, date: '2026-10-22', narration: 'NEFT DR-STEEL CO PVT LTD-BILL 2291', ref: '', debit: 100_000 }, { row: 2, date: '2026-10-22', narration: 'UPI-XYZ', ref: '', debit: 50_000 }];
+  const m = matchStatement(lines, [P(1, 'Steel Co', 100_000, '2026-10-22', 'BILL-2291', 2), P(2, 'Gamma', 50_000, '2026-10-22', '', 2)], 1);
+  assert.deepEqual(m.map((l) => [l.match, l.candidates]), [[null, [1]], [null, [2]]]);
+  // the same payments on this account (or not decided) are matched as before
+  assert.deepEqual(matchStatement(lines, [P(1, 'Steel Co', 100_000, '2026-10-22', 'BILL-2291', 1), P(2, 'Gamma', 50_000, '2026-10-22', '', null)], 1).map((l) => l.match?.how), ['ref', 'amount']);
 });
 
 test('a file that isn’t a statement gets a clear message', () => {
@@ -268,9 +290,12 @@ test('API: a locked PDF asks for its password, then reconciles', async () => {
 test('API: a statement file of a realistic size (hundreds of KB) is accepted', async () => {
   const pdf = fixture('idbi-email-statement.pdf');
   assert.ok(pdf.length > 100_000);
-  const r = await editor('/api/reconcile/check', { file: pdf.toString('base64'), name: 'idbi.pdf', bank_id: hdfc });
+  // the account is found from the statement's "Account No. : 0191100000099999" (its last 4 digits)
+  const idbi = (await admin('/api/banks', { name: 'IDBI Collections', bank: 'IDBI Bank', last4: '9999' })).body.id;
+  const r = await editor('/api/reconcile/check', { file: pdf.toString('base64'), name: 'idbi.pdf' });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(r.body.debits.length, 16);
+  assert.deepEqual([r.body.bank.id, r.body.account], [idbi, { last4: '9999', by: 'statement', agrees: true }]);
 });
 
 // ── a picture-only PDF read with OCR (in the browser), and the running-balance check ──
@@ -318,11 +343,12 @@ test('a line that doesn’t add up with the running balance is flagged and never
 
 test('API: a picture PDF’s OCR words are checked and applied like any statement', async () => {
   const pdf = makePdf(SBI, { shapesOnly: true }); // what arrives: the picture PDF, and the words read from it
-  const body = { file: pdf.toString('base64'), name: 'AMINORICH IDBI.pdf', bank_id: hdfc, ocr: ocrWords() };
+  const body = { file: pdf.toString('base64'), name: 'AMINORICH IDBI.pdf', ocr: ocrWords() }; // the account: from the words read (A/c …9999)
   assert.equal((await editor('/api/reconcile/check', { ...body, ocr: undefined })).body.error.code, 'pdf_no_text');
   const r = await editor('/api/reconcile/check', body);
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.deepEqual([r.body.ocr, r.body.checked, r.body.debits.length, r.body.debits.every((d) => d.mismatch === null)], [true, { ok: 19, of: 19 }, 16, true]);
+  assert.deepEqual([r.body.bank.name, r.body.account.last4], ['IDBI Collections', '9999']);
   assert.equal((await editor('/api/reconcile/check', { ...body, ocr: [{ top: 800, words: [{ x: 'a' }] }] })).status, 400);
 });
 

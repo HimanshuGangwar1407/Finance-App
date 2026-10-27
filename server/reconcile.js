@@ -28,6 +28,21 @@ function matchHeader(cells) {
   return cols.date != null && (cols.debit != null || (cols.amount != null && cols.drcr != null)) ? cols : null;
 }
 
+// the account number printed above the table ("Account No :50200012341111", "Statement Of A/c : 0191…",
+// "A/C No. XXXXXXXX1111"): its last 4 digits, or null. Never from the lines themselves (they name other accounts).
+// The number may be masked and written in groups ("XXXX XXXX 5678", "1234-5678-0042").
+const ACCOUNT_NO = /\b(?:a\/?c|account|acct)\.?(?:\s*(?:no|number|num)\b\.?)?\s*[:.#-]?\s*'?([x*\d]{2,}(?:[ -][x*\d]{2,})*)/i;
+export function accountOf(texts) {
+  for (const t of texts) {
+    const m = ACCOUNT_NO.exec(String(t ?? '').replace(/\s+/g, ' '));
+    if (!m) continue;
+    const groups = m[1].split(/[ -]/); // a short number after it ("… 10/23/26") isn't part of it
+    while (groups.length > 1 && !/\d{4}$/.test(groups.at(-1))) groups.pop();
+    if (/\d{4}$/.test(groups.at(-1))) return { last4: groups.at(-1).slice(-4) };
+  }
+  return null;
+}
+
 // a statement amount: 1,25,000.00 · ₹500 · "500.00 Dr" · a number; empty → 0
 function money(v) {
   if (typeof v === 'number') return Math.round(Math.abs(v) * 100);
@@ -101,7 +116,9 @@ export function readStatement(table) {
   const found = Object.fromEntries(Object.entries(cols).map(([k, i]) => [k, String(header.cells[i])]));
   const last = rows.at(-1);
   const withBal = rows.filter((r) => r.balance != null);
-  return { headerRow: header.n, columns: found, rows, skipped, from: rows[0].date, to: last.date, closing: last.balance == null ? null : { date: last.date, amount: last.balance },
+  // the account it is for: from the lines above the headings (a PDF's or the AI's come as table.head)
+  const account = accountOf([...(table.head ?? []), ...table.rows.slice(0, table.rows.indexOf(header)).map((r) => r.cells.join(' '))]);
+  return { headerRow: header.n, columns: found, rows, skipped, account, from: rows[0].date, to: last.date, closing: last.balance == null ? null : { date: last.date, amount: last.balance },
     opening: opening ? opening.balance : null,
     // how many lines the running balance confirms (null: the statement has no balance column)
     checked: withBal.length ? { ok: withBal.filter((r) => !r.mismatch).length, of: withBal.length } : null };
@@ -140,19 +157,22 @@ export function similarity(line, p) {
  * Statement debits ↔ payments yet to be paid (outstanding = what is left on each). Every debit gets
  *   match: { id, how: 'ref' | 'name' | 'amount', partial } — or null, with candidates: payment ids it could be.
  * A match on amount alone is made only when it can't be anything else (one debit and one payment of that amount).
+ * A payment assigned to another account (its last 4 digits aren't this statement's) is never matched by itself: it
+ * is only offered to choose by hand.
  */
 export function matchStatement(debits, payments, bankId, key = 'debit') {
   // a line's amount; a line that doesn't add up, or a reversal pair, is never matched by itself
   const amt = (d) => d[key], off = (d) => d.mismatch || d.reversedBy || d.reverses;
+  const here = payments.filter((p) => p.bank_id == null || p.bank_id === bankId), isHere = new Set(here);
   const pairs = [];
   for (const d of debits) {
     if (off(d)) continue;
-    for (const p of payments) {
+    for (const p of here) {
       if (amt(d) > p.outstanding) continue;
       const s = similarity(d, p), exact = amt(d) === p.outstanding;
       const strong = s.ref || s.name >= 0.5;
       if (!exact && !strong) continue; // part payments only when the line names the payment
-      const score = (s.ref ? 3 : 0) + 2 * s.name + (exact ? 1 : 0) + (p.bank_id === bankId ? 0.3 : p.bank_id == null ? 0.1 : 0) - Math.min(days(d.date, p.due_date), 60) / 100;
+      const score = (s.ref ? 3 : 0) + 2 * s.name + (exact ? 1 : 0) + (p.bank_id === bankId ? 0.3 : 0.1) - Math.min(days(d.date, p.due_date), 60) / 100;
       pairs.push({ d, p, score, how: s.ref ? 'ref' : s.name >= 0.5 ? 'name' : 'amount', partial: !exact });
     }
   }
@@ -166,7 +186,7 @@ export function matchStatement(debits, payments, bankId, key = 'debit') {
   }
   // amount only: when exactly one free debit and one free payment have that amount
   // (a line the bank reversed isn't a payment: it doesn't make another line of the same amount ambiguous)
-  const freeD = debits.filter((d) => !usedD.has(d.row) && !d.reversedBy && !d.reverses), freeP = payments.filter((p) => !usedP.has(p.id));
+  const freeD = debits.filter((d) => !usedD.has(d.row) && !d.reversedBy && !d.reverses), freeP = here.filter((p) => !usedP.has(p.id));
   for (const d of freeD) {
     if (off(d)) continue;
     const sameD = freeD.filter((x) => amt(x) === amt(d)), sameP = freeP.filter((p) => p.outstanding === amt(d) && !usedP.has(p.id));
@@ -179,7 +199,7 @@ export function matchStatement(debits, payments, bankId, key = 'debit') {
     candidates: out.has(d.row) || d.reversedBy || d.reverses ? [] : payments.filter((p) => !usedP.has(p.id) && p.outstanding >= amt(d))
       .map((p) => ({ p, s: similarity(d, p) }))
       .filter(({ p, s }) => p.outstanding === amt(d) || s.ref || s.name > 0)
-      .sort((a, b) => (b.p.outstanding === amt(d)) - (a.p.outstanding === amt(d)) || b.s.name - a.s.name || days(d.date, a.p.due_date) - days(d.date, b.p.due_date))
+      .sort((a, b) => (b.p.outstanding === amt(d)) - (a.p.outstanding === amt(d)) || isHere.has(b.p) - isHere.has(a.p) || b.s.name - a.s.name || days(d.date, a.p.due_date) - days(d.date, b.p.due_date))
       .slice(0, 10).map(({ p }) => p.id),
   }));
 }
