@@ -172,7 +172,9 @@ test('apply: matched debits are paid (only these leave the balance); left-out on
   });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.deepEqual(r.body, { paid: 3, paidAmount: 13_770_000, recorded: 1, recordedAmount: 5_900, today: 1, tomorrow: 1, cancelled: 1,
-    received: 0, receivedAmount: 0, recordedIn: 0, recordedInAmount: 0, inToday: 0, inTomorrow: 0, inCancelled: 0, balanceSaved: false });
+    received: 0, receivedAmount: 0, recordedIn: 0, recordedInAmount: 0, inToday: 0, inTomorrow: 0, inCancelled: 0, balanceSaved: false,
+    assigned: 1, assignedIn: 0 }); // Gupta Transport had no account: it is HDFC's now
+  assert.equal((await pool.query('SELECT bank_id FROM payments WHERE id = $1', [ids.gupta])).rows[0].bank_id, hdfc);
   const { rows: e } = await pool.query("SELECT p.payee, e.amount, e.date, e.ref, e.bank_id FROM entries e JOIN payments p ON p.id = e.payment_id ORDER BY e.id");
   assert.deepEqual(e.map((x) => [x.payee, Number(x.amount), x.date, x.ref, x.bank_id]), [
     ['Steel Co', 12_500_000, yday, 'N295123456', hdfc], ['Gupta Transport', 820_000, yday, '229512345678', hdfc], ['Office Supplies', 450_000, yday, '123456789012', hdfc],
