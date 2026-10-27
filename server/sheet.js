@@ -133,6 +133,8 @@ const COLUMNS = {
   note: ['description', 'narration', 'remarks', 'remark', 'note', 'notes', 'details', 'purpose'],
   category: ['category', 'expensehead', 'head', 'ledgergroup', 'group'],
   bank: ['bankaccount', 'bank', 'bankname', 'account', 'fromaccount', 'paidfrom', 'paythrough'],
+  // the account number (or only its last 4 digits): decides the account when given
+  acct: ['accountnumber', 'accountno', 'acno', 'acctno', 'accno', 'bankaccountnumber', 'bankaccountno', 'bankacno', 'last4', 'last4digits', 'lastfourdigits', 'accountlast4'],
 };
 const norm = (v) => String(v ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 
@@ -190,11 +192,24 @@ export function importRows(table, { kind, banks, today }) {
   const cell = (r, k) => (cols[k] == null ? '' : r.cells[cols[k]] ?? '');
   const text = (r, k, max) => str(typeof cell(r, k) === 'number' ? String(cell(r, k)) : cell(r, k), max);
 
-  const findBank = (v) => {
+  // the account: by the last 4 digits of its number (an Account No. column, or digits ending the Bank column), else
+  // by its name or bank. Two accounts with the same last 4 digits are told apart by the bank written next to them.
+  const byName = (s) => banks.find((b) => norm(b.name) === s) ?? banks.filter((b) => norm(b.bank) === s || norm(b.bank).startsWith(s) || s.startsWith(norm(b.bank))).find((_, __, all) => all.length === 1);
+  const findBank = (v, no) => {
     const s = norm(v);
+    if (typeof no === 'number' && no > Number.MAX_SAFE_INTEGER) return { problem: 'Account number is too long for Excel to keep exactly as a number: format that column as Text and type it again' };
+    if (/[eE]\+/.test(String(no))) return { problem: 'Account number was turned into a number by Excel (e.g. 5.02E+13): format that column as Text and type it again' };
+    const written = (typeof no === 'number' ? BigInt(Math.round(no)).toString() : String(no ?? '')).replace(/\D/g, '');
+    if (no !== '' && no != null && written.length < 4) return { problem: `Account number “${String(no).slice(0, 20)}”: needs at least its last 4 digits` };
+    const last4 = written.slice(-4) || /(\d{4})\D*$/.exec(String(v))?.[1];
+    if (last4) {
+      let hits = banks.filter((b) => b.last4 === last4);
+      if (hits.length > 1 && s) hits = hits.filter((b) => b === byName(s) || norm(b.name).includes(s) || norm(b.bank).includes(s) || s.includes(norm(b.bank)));
+      if (hits.length === 1) return { id: hits[0].id };
+      return { id: null, note: hits.length ? `${hits.length} accounts end in ${last4} — write the bank too; left as “Not decided”` : `bank account XXXX${last4} not found — left as “Not decided”` };
+    }
     if (!s) return { id: null };
-    const digits = /(\d{4})\D*$/.exec(String(v))?.[1];
-    const hit = banks.find((b) => digits && b.last4 === digits) ?? banks.find((b) => norm(b.name) === s) ?? banks.filter((b) => norm(b.bank) === s || norm(b.bank).startsWith(s) || s.startsWith(norm(b.bank))).find((_, __, all) => all.length === 1);
+    const hit = byName(s);
     return hit ? { id: hit.id } : { id: null, note: `bank account “${String(v).slice(0, 40)}” not found — left as “Not decided”` };
   };
 
@@ -237,9 +252,10 @@ export function importRows(table, { kind, banks, today }) {
       category = CATEGORIES.find((x) => norm(x) === norm(c) || (norm(c) && norm(x).startsWith(norm(c)))) ?? 'Other';
       if (c && category === 'Other' && norm(c) !== 'other') notes.push(`category “${c}” → Other`);
     }
-    const bank = findBank(cell(r, 'bank'));
+    const bank = findBank(cell(r, 'bank'), cell(r, 'acct'));
+    if (bank.problem) problems.push(bank.problem);
     if (bank.note) notes.push(bank.note);
-    out.push({ row: r.n, kind: k, name, amount: amount ?? 0, date, ref: text(r, 'ref', 80), note: text(r, 'note', 300), category, bank_id: bank.id, problems, notes });
+    out.push({ row: r.n, kind: k, name, amount: amount ?? 0, date, ref: text(r, 'ref', 80), note: text(r, 'note', 300), category, bank_id: bank.id ?? null, problems, notes });
   }
   const found = Object.fromEntries(Object.entries(cols).map(([key, i]) => [key, String(header.cells[i])]));
   return { headerRow: header.n, columns: found, rows: out };

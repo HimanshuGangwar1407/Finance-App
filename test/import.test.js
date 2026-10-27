@@ -50,6 +50,23 @@ test('a Type column, or separate Payment / Receipt (Debit / Credit) columns, dec
   assert.equal(rowsOf(csv('Name,Amount\nA,1\n'), 'x.csv', { kind: 'IN' }).rows[0].kind, 'IN');
 });
 
+test('an Account No. column puts each row in the account with those last 4 digits', () => {
+  const two = [...banks, { id: 3, name: 'SBI Current', bank: 'State Bank of India', last4: '1111' }];
+  const r = rowsOf(csv('Name,Amount,Bank,Account No.\nA,10,,50200012342222\nB,10,HDFC,XXXXXXXX1111\nC,10,SBI,1111\nD,10,,1111\nE,10,ICICI,9999\nF,10,,12\nG,10,HDFC,\n'), 'x.csv', { banks: two }).rows;
+  assert.deepEqual(r.map((x) => [x.name, x.bank_id, x.problems[0] ?? '', x.notes.at(-1)]), [
+    ['A', 2, '', 'no date — due today'], // the number alone decides
+    ['B', 1, '', 'no date — due today'], ['C', 3, '', 'no date — due today'], // two accounts end in 1111: the bank tells them apart
+    ['D', null, '', '2 accounts end in 1111 — write the bank too; left as “Not decided”'],
+    ['E', null, '', 'bank account XXXX9999 not found — left as “Not decided”'], // the number wins over the bank's name
+    ['F', null, 'Account number “12”: needs at least its last 4 digits', 'no date — due today'],
+    ['G', 1, '', 'no date — due today']]); // no number: by the bank, as before
+  // an account number Excel stored as a number: exact up to 15 digits; longer ones it can't keep
+  const x = importRows({ rows: [{ n: 1, cells: ['Name', 'Amount', 'A/c No'] }, { n: 2, cells: ['A', 10, 50200012342222] }, { n: 3, cells: ['B', 10, 12345678901234567890] }] }, { kind: 'OUT', banks, today: '2026-10-21' });
+  assert.deepEqual(x.columns, { name: 'Name', amount: 'Amount', acct: 'A/c No' });
+  assert.deepEqual(x.rows.map((y) => [y.bank_id, y.problems.length]), [[2, 0], [null, 1]]);
+  assert.match(x.rows[1].problems[0], /too long for Excel/);
+});
+
 test('amounts, names and banks: what is a problem and what is only noted', () => {
   const r = rowsOf(csv('Name,Amount,Bank account\nA,-5,\nB,0,\nC,abc,\n,100,\nD,(250),\nE,"1,000 Dr",XXXX2222\nF,10,SBI\nG,10,icici\nGrand Total,111,\n'), 'x.csv').rows;
   assert.deepEqual(r.map((x) => [x.name, x.problems[0] ?? '', x.bank_id]), [

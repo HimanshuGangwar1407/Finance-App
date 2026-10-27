@@ -458,6 +458,9 @@ async function sheetImport(c, body) {
   const banks = (await c.query('SELECT id, name, bank, last4 FROM banks ORDER BY id')).rows;
   const out = importRows(table, { kind, banks, today: todayIST() });
   if (!out.rows.length) bad('No rows found under the headings.');
+  // the account each row goes to, as the preview shows it
+  const label = new Map(banks.map((b) => [b.id, `${b.name} (XXXX${b.last4})`]));
+  for (const r of out.rows) r.bank_name = label.get(r.bank_id) ?? null;
   // already in the app: the same name, amount and date (not cancelled), or the same invoice / bill no. still open
   const [rec, pay] = [
     await c.query("SELECT 'IN' AS kind, party AS name, amount, expected_date AS date, ref, status FROM receipts WHERE status <> 'CANCELLED'"),
@@ -483,9 +486,9 @@ async function sheetImport(c, body) {
 // Each debit is: already in the app (recorded before, by reference or same amount and date), matched to a payment
 // yet to be paid, or not in the app. Nothing changes until "apply".
 async function reconcileCheck(c, body) {
-  const bankId = intId(body.bank_id, 'Bank account');
-  const { rows: [bank] } = await c.query('SELECT id, name, bank, last4 FROM banks WHERE id = $1', [bankId]);
-  if (!bank) bad('Choose the bank account this statement is for.');
+  const chosen = body.bank_id === '' || body.bank_id == null ? null : intId(body.bank_id, 'Bank account');
+  const banks = (await c.query('SELECT id, name, bank, last4 FROM banks ORDER BY name, id')).rows;
+  if (chosen && !banks.some((b) => b.id === chosen)) bad('Choose the bank account this statement is for.');
   const file = String(body.file ?? '');
   if (!file || !/^[A-Za-z0-9+/=\s]+$/.test(file)) bad('Choose the bank statement file (.xlsx or .csv).');
   const buf = Buffer.from(file, 'base64');
@@ -495,9 +498,31 @@ async function reconcileCheck(c, body) {
   // a picture-only PDF is read in the browser (OCR): its words and their places come with the file
   const pdf = isPdf || body.ocr ? await import('./pdf.js') : null;
   // or the lines the AI read from it (POST /api/reconcile/ai-read), sent back with the file
-  const st = readStatement(body.lines ? tableFromLines(body.lines) : body.ocr ? pdf.tableFromPages(pdf.ocrPages(body.ocr))
+  const st = readStatement(body.lines ? tableFromLines(body.lines, body.account) : body.ocr ? pdf.tableFromPages(pdf.ocrPages(body.ocr))
     : isPdf ? await pdf.readPdf(buf, str(body.password, 100)) : readTable(buf, str(body.name, 200)));
   if (st.to > todayIST()) bad(`The statement has dates after today (${st.to}). Check that it is the right file.`);
+
+  // the account: the one whose last 4 digits are the statement's account number. One chosen by hand must agree with
+  // it, unless the person says to go ahead (a number misread from a picture).
+  const last4 = st.account?.last4 ?? null, same = last4 ? banks.filter((b) => b.last4 === last4) : [];
+  const label = (b) => `${b.name} (${b.bank} XXXX${b.last4})`;
+  let bank;
+  if (chosen) {
+    bank = banks.find((b) => b.id === chosen);
+    if (last4 && bank.last4 !== last4 && body.anyAccount !== true) {
+      throw Object.assign(err(409, 'account_mismatch', `This statement is for account XXXX${last4}, but ${label(bank)} was chosen. ${same.length === 1 ? `Reconcile it with ${label(same[0])} instead?` : same.length ? 'Choose the account it is for.' : `No account ending in ${last4} is in the app — add it under Banks, or choose the right account.`}`),
+        { detail: { last4, suggest: same.length === 1 ? same[0].id : null } });
+    }
+  } else if (!last4) {
+    throw err(400, 'account_unknown', 'The statement doesn’t show its account number. Choose the bank account it is for.');
+  } else if (same.length === 1) {
+    bank = same[0];
+  } else {
+    throw err(400, 'account_unknown', same.length
+      ? `${same.length} accounts in the app end in ${last4} (${same.map(label).join(', ')}). Choose the one this statement is for.`
+      : `This statement is for account XXXX${last4}, which isn’t in the app. Add it under Banks first, or choose the account it is for.`);
+  }
+  const bankId = bank.id;
   await syncEmis(c, addDays(todayIST(), HORIZON));
 
   // every line gets the bank reference it is recorded under (unique within the statement)
@@ -541,7 +566,8 @@ async function reconcileCheck(c, body) {
   // due by the statement's last date, for this account or not decided: if not matched, they are left out
   const due = (list) => list.filter((p) => p.due_date <= st.to && (p.bank_id === bankId || p.bank_id == null)).map((p) => p.id);
   return {
-    bank, fileName: str(body.name, 200), ocr: Boolean(body.ocr) && !body.lines, ai: Boolean(body.lines), checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
+    // account: the statement's own number (last 4), and whether the account was found by it or chosen by hand
+    bank, account: { last4, by: chosen ? 'chosen' : 'statement', agrees: last4 ? bank.last4 === last4 : null }, fileName: str(body.name, 200), ocr: Boolean(body.ocr) && !body.lines, ai: Boolean(body.lines), checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
     opening: st.opening, appClosing: app.closing, balanceEntered: app.balanceEntered,
     debits: debits.map((d) => line(d, d.debit, outMatch)), credits: credits.map((d) => line(d, d.credit, inMatch)),
     payments, receipts, due: due(payments), dueIn: due(receipts),
@@ -892,7 +918,7 @@ const routes = [
     if (buf.length > MAX_BYTES) bad('That file is too big. Upload at most 3 MB.');
     const r = await readWithAi(buf, str(body.name, 200));
     await log(user.id, 'reconcile.ai_read', { file: r.file, model: r.model, lines: r.table.rows.length - 1, tokens: r.usage });
-    return { lines: r.table.rows.map((x) => x.cells), note: r.note };
+    return { lines: r.table.rows.map((x) => x.cells), account: r.account, note: r.note };
   }],
 
   // apply what was chosen, money out and money in: matched lines are recorded as paid / received (dated as in the
@@ -1001,10 +1027,10 @@ const routes = [
   ['GET', /^\/api\/import\/sample$/, 'viewer', async () => ({ file: {
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', name: 'receipts-payments-upload-sample.xlsx',
     body: toXlsx([
-      ['Type', 'Name', 'Amount', 'Due date', 'Invoice / bill no.', 'Description', 'Category', 'Bank account'],
-      ['Payment', 'Steel Co', 125000, '25/10/2026', 'BILL-2291', 'October steel', 'Vendor', 'HDFC'],
-      ['Payment', 'Office rent', 45000, '01/11/2026', '', 'November rent', 'Rent', ''],
-      ['Receipt', 'Mehta Retail', 80000, '28/10/2026', 'INV-118', 'Order 42', '', ''],
+      ['Type', 'Name', 'Amount', 'Due date', 'Invoice / bill no.', 'Description', 'Category', 'Bank account', 'Account No.'],
+      ['Payment', 'Steel Co', 125000, '25/10/2026', 'BILL-2291', 'October steel', 'Vendor', 'HDFC', 'XXXXXXXX1111'],
+      ['Payment', 'Office rent', 45000, '01/11/2026', '', 'November rent', 'Rent', '', ''],
+      ['Receipt', 'Mehta Retail', 80000, '28/10/2026', 'INV-118', 'Order 42', '', 'HDFC', 'XXXXXXXX1111'],
     ], 'Upload'),
   } })],
 
@@ -1259,7 +1285,7 @@ export async function handler(req, res) {
   } catch (e) {
     const status = e.status || 500;
     if (status >= 500) console.error(e);
-    send(status, 'application/json', JSON.stringify({ error: { code: e.code || 'internal', message: status >= 500 && e.code !== 'config' ? 'Something went wrong. Try again.' : e.message } }));
+    send(status, 'application/json', JSON.stringify({ error: { code: e.code || 'internal', message: status >= 500 && e.code !== 'config' ? 'Something went wrong. Try again.' : e.message, ...(e.detail && status < 500 ? { detail: e.detail } : {}) } }));
   }
 }
 

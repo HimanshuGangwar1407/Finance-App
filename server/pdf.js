@@ -107,7 +107,7 @@ export function tableFromPages(pages) {
   pages = pages.map(splitAmounts);
   let cols = null, dateCol = -1, ended = false;
   const wraps = []; // each record's cells, line by line
-  const rows = [], records = [];
+  const rows = [], records = [], head = []; // head: the lines above the first headings (the account number is there)
   // amounts, dates, cheque numbers sit under their heading (often right-aligned): placed by their middle.
   // Words are left-aligned: placed by where they start (a short "AT ,BROUGHT FORWARD" is still Particulars).
   // A short run of digits ("4539", "2026") is usually the end of a wrapped description or date: placed by where it
@@ -157,7 +157,8 @@ export function tableFromPages(pages) {
         if (!cols) { cols = c.cols; dateCol = cols.findIndex((k) => DATE_HEAD.test(k.text)); rows.push({ n: 1, cells: cols.map((k) => k.text) }); }
         continue;
       }
-      if (!cols || boilerplate(l)) continue; // above the table, or what every page repeats
+      if (!cols) { if (head.length < 60) head.push(l.text); continue; } // above the table
+      if (boilerplate(l)) continue; // what every page repeats
       const cells = cols.map(() => '');
       const xs = cols.map(() => null); // where each cell's text starts on this line
       for (const it of l.items) { const k = colOf(it); cells[k] = join(cells[k], it.s); xs[k] ??= it.x; }
@@ -207,5 +208,5 @@ export function tableFromPages(pages) {
     });
   });
   records.forEach((cells, i) => rows.push({ n: i + 2, cells }));
-  return { sheet: '', rows };
+  return { sheet: '', rows, head };
 }

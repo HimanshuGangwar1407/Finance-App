@@ -33,7 +33,7 @@ async function api(path, body) {
   const r = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const j = await r.json().catch(() => ({ error: { message: `The app’s server didn’t answer (${path} gave HTTP ${r.status}, not app data). Check that the server or the Vercel API function is running.` } }));
   if (r.status === 401 && S.user && !path.endsWith('/login')) { S.user = null; fresh(); boot(); }
-  if (!r.ok) throw Object.assign(new Error(j.error?.message || 'Something went wrong.'), { code: j.error?.code });
+  if (!r.ok) throw Object.assign(new Error(j.error?.message || 'Something went wrong.'), { code: j.error?.code, detail: j.error?.detail });
   return j;
 }
 
@@ -546,7 +546,7 @@ const toBase64 = async (file) => {
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return btoa(bin);
 };
-const COL_LABEL = { type: 'Type', name: 'Name', amount: 'Amount', out: 'Payment amount', in: 'Receipt amount', date: 'Due date', ref: 'Invoice / bill no.', note: 'Description', category: 'Category', bank: 'Bank account' };
+const COL_LABEL = { type: 'Type', name: 'Name', amount: 'Amount', out: 'Payment amount', in: 'Receipt amount', date: 'Due date', ref: 'Invoice / bill no.', note: 'Description', category: 'Category', bank: 'Bank account', acct: 'Account no.' };
 function uploadDialog(kind = 'OUT') {
   let sent = null, checked = null;
   const err = h('p', { class: 'err', role: 'alert' }), result = h('div', { class: 'import-result' });
@@ -586,7 +586,7 @@ function uploadDialog(kind = 'OUT') {
       h('p', { class: 'muted small' }, 'Columns used: ', Object.entries(checked.columns).map(([k, v]) => `${COL_LABEL[k]} ← “${v}”`).join(', '), '.'),
       dup.length > 0 && h('label', { class: 'check' }, dupIn, `Add the ${dup.length} that look already in the app too`),
       h('div', { class: 'scroll import-preview' }, h('table', { class: 'tx' },
-        h('thead', {}, h('tr', {}, h('th', {}, 'Row'), h('th', {}, ''), h('th', {}, 'Type'), h('th', {}, 'Name'), h('th', {}, 'Due date'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Notes'))),
+        h('thead', {}, h('tr', {}, h('th', {}, 'Row'), h('th', {}, ''), h('th', {}, 'Type'), h('th', {}, 'Name'), h('th', {}, 'Due date'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Account'), h('th', {}, 'Notes'))),
         h('tbody', {}, rows.slice(0, 500).map((r) => h('tr', { class: r.status === 'ok' || (r.status === 'duplicate' && dupIn.checked) ? '' : 'inactive' },
           h('td', { class: 'muted' }, r.row),
           h('td', {}, h('span', { class: `chip ${tone[r.status]}` }, word[r.status])),
@@ -594,6 +594,7 @@ function uploadDialog(kind = 'OUT') {
           h('td', {}, h('strong', {}, r.name || '—'), [r.ref, r.note].filter(Boolean).length > 0 && h('div', { class: 'muted small' }, [r.ref, r.note].filter(Boolean).join(' · '))),
           h('td', { class: 'nowrap' }, r.date ? nice(r.date) : '—'),
           h('td', { class: 'num' }, r.amount ? inr(r.amount) : '—'),
+          h('td', { class: 'small' }, r.bank_name ?? h('span', { class: 'muted' }, 'Not decided')),
           h('td', { class: 'small' }, [...r.problems, r.duplicate, ...r.notes].filter(Boolean).join('; '))))))),
       rows.length > 500 && h('p', { class: 'muted small' }, `Showing the first 500 of ${rows.length} rows.`)].filter(Boolean));
   };
@@ -618,7 +619,7 @@ function uploadDialog(kind = 'OUT') {
     h('h2', {}, 'Upload payments / receipts from Excel'),
     h('p', { class: 'muted' }, 'Each row of the sheet is added as yet to be paid (or yet to be received). Nothing is added until you check the rows below and press Add. ', sample, '.'),
     h('label', {}, h('span', {}, 'Excel (.xlsx) or CSV file'), fileIn,
-      h('small', { class: 'muted' }, 'Needs a heading row with at least a name (Name / Party / Vendor…) and an amount (Amount…). Also read if present: Type (Payment / Receipt), Due date, Invoice / bill no., Description, Category, Bank account.')),
+      h('small', { class: 'muted' }, 'Needs a heading row with at least a name (Name / Party / Vendor…) and an amount (Amount…). Also read if present: Type (Payment / Receipt), Due date, Invoice / bill no., Description, Category, Bank account, Account No. (each row is put in the account whose last 4 digits match).')),
     h('label', {}, h('span', {}, 'Rows without a Type column are'), kindIn),
     result, err,
     h('div', { class: 'bar' }, addBtn, h('button', { type: 'button', onclick: () => dlg.close() }, 'Cancel')));
@@ -630,7 +631,8 @@ function uploadDialog(kind = 'OUT') {
 // but not in the statement are "left out": paying today, next day, or cancelled.
 async function loadReconcile() {
   const sum = await api('/api/transactions/summary');
-  S.rec ??= { bankId: sum.accounts[0] ? String(sum.accounts[0].id) : '', data: null, sent: null, choice: new Map(), payee: new Map(), left: new Map(), saveBalance: false, err: '', busy: false };
+  // bankId '': the account whose last 4 digits are the statement's account number
+  S.rec ??= { bankId: '', anyAccount: false, mismatch: null, data: null, sent: null, choice: new Map(), payee: new Map(), left: new Map(), saveBalance: false, err: '', busy: false };
   S.rec.accounts = sum.accounts;
   renderReconcile();
 }
@@ -638,12 +640,12 @@ const HOW = { ref: ['bill / ref. no. in narration', 'c-green'], name: ['name in 
 
 async function recCheck(file, keepNote = false) {
   const R = S.rec;
-  R.err = ''; R.busy = true; if (!keepNote) R.note = ''; renderReconcile();
+  R.err = ''; R.mismatch = null; R.busy = true; if (!keepNote) R.note = ''; renderReconcile();
   try {
     if (file) {
       if (file.size > 3 * 1024 * 1024) throw new Error('That file is too big. Upload at most 3 MB.');
       R.sent = { file: await toBase64(file), name: file.name };
-      R.file = file; R.password = ''; R.needPassword = false; R.aiNote = '';
+      R.file = file; R.password = ''; R.needPassword = false; R.aiNote = ''; R.anyAccount = false;
       // a photo or screenshot of a statement: only the AI reads those
       if (/^image\//.test(file.type)) {
         if (!S.ai) throw new Error('A photo of a statement can only be read with AI reading, which isn’t set up for this app. Upload the PDF, Excel or CSV statement, or paste it.');
@@ -651,19 +653,25 @@ async function recCheck(file, keepNote = false) {
       }
     }
     try {
-      R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId });
+      R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId, anyAccount: R.anyAccount });
     } catch (e) {
       // a picture of a statement (no text in the PDF): read it here with OCR, then check what was read
       if (e.code !== 'pdf_no_text' || !file) throw e;
       R.sent.ocr = await ocrPdf(file, R.password, (msg) => { R.progress = msg; renderReconcile(); });
       R.progress = '';
-      R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId });
+      R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId, anyAccount: R.anyAccount });
     }
     R.needPassword = false;
     R.choice = firstChoices(R.data);
     R.payee = new Map(); R.left = new Map(); R.leftIn = new Map(); R.saveBalance = false;
-  } catch (e) { R.err = e.message; R.data = null; R.progress = ''; if (e.code === 'pdf_password') R.needPassword = true; }
+  } catch (e) { recFailed(e); if (e.code === 'pdf_password') R.needPassword = true; }
   R.busy = false; renderReconcile();
+}
+// a statement whose account number isn't the chosen account's: say so, and offer the right one (or to go ahead)
+function recFailed(e) {
+  const R = S.rec;
+  R.err = e.message; R.data = null; R.progress = '';
+  R.mismatch = e.code === 'account_mismatch' ? e.detail ?? {} : null;
 }
 // what each statement line starts as: its matched payment / receipt; money that came in and matches nothing is set to
 // be recorded as a new receipt (so Apply brings the account to the bank's position) — unless it might be one of the
@@ -675,17 +683,17 @@ const firstChoices = (data) => new Map([
 // read the chosen file with Claude (any PDF, or a photo): its lines are then checked like any other statement
 async function recAi(busy = false) {
   const R = S.rec;
-  if (!busy) { R.err = ''; R.note = ''; R.busy = true; }
+  if (!busy) { R.err = ''; R.mismatch = null; R.note = ''; R.busy = true; }
   R.progress = 'Claude (AI) is reading the statement — this can take up to a minute…'; renderReconcile();
   try {
     const r = await api('/api/reconcile/ai-read', { file: R.sent.file, name: R.sent.name });
-    R.sent = { file: R.sent.file, name: R.sent.name, lines: r.lines };
+    R.sent = { file: R.sent.file, name: R.sent.name, lines: r.lines, account: r.account };
     R.aiNote = r.note;
     R.progress = 'Checking what was read…'; renderReconcile();
-    R.data = await api('/api/reconcile/check', { ...R.sent, bank_id: R.bankId });
+    R.data = await api('/api/reconcile/check', { ...R.sent, bank_id: R.bankId, anyAccount: R.anyAccount });
     R.choice = firstChoices(R.data);
     R.payee = new Map(); R.left = new Map(); R.leftIn = new Map(); R.saveBalance = false;
-  } catch (e) { R.err = e.message; R.data = null; }
+  } catch (e) { recFailed(e); }
   R.progress = ''; R.busy = false; renderReconcile();
 }
 // ── OCR: the words on each page of a picture-only PDF, with where they are (PDF points, y up, as pdf.js gives text) ──
@@ -747,7 +755,8 @@ function renderReconcile() {
   const pasteIn = h('textarea', { name: 'pasted', rows: '4', placeholder: 'Or paste the statement here: in the bank’s email, select the table (from the column headings to the last line), copy, and paste.', 'aria-label': 'Paste the statement' });
   const step = h('section', { class: 'card rec-step' },
     h('div', { class: 'bar grow' },
-      h('label', {}, h('span', {}, 'Bank account'), h('select', { name: 'bank', onchange: (e) => { R.bankId = e.target.value; if (R.sent) recCheck(); } },
+      h('label', {}, h('span', {}, 'Bank account'), h('select', { name: 'bank', onchange: (e) => { R.bankId = e.target.value; R.anyAccount = false; if (R.sent) recCheck(); } },
+        h('option', { value: '', selected: R.bankId === '' }, 'From the statement (last 4 digits of its account no.)'),
         R.accounts.map((b) => h('option', { value: String(b.id), selected: String(b.id) === R.bankId }, `${b.name} — ${b.bank} XXXX${b.last4}`)))),
       h('label', {}, h('span', {}, 'Bank statement (PDF, Excel or CSV)'), fileIn)),
     R.needPassword && h('div', { class: 'bar' }, pwIn, h('button', { class: 'small primary', onclick: () => { R.password = pwIn.value; recCheck(null, true); } }, 'Open PDF')),
@@ -767,7 +776,16 @@ function renderReconcile() {
         ? (D.checked.ok === D.checked.of ? `The running balance confirms all ${D.checked.of} lines.` : `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below and aren’t matched automatically; check them against the statement.`)
         : 'The statement has no balance column to check the figures against — compare the amounts with the statement before applying.')),
     D && !D.ocr && D.checked && D.checked.ok < D.checked.of && h('p', { class: 'rec-ocr warn' }, icon('alert'), h('span', {}, `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below.`)),
+    // the account the statement is reconciled with, and how it was found
+    D && h('p', { class: `rec-ocr ${D.account.agrees === false ? 'warn' : ''}` }, icon(D.account.agrees === false ? 'alert' : 'check'),
+      h('span', {}, D.account.last4 == null ? `The statement doesn’t show its account number: reconciling with ${D.bank.name} (${D.bank.bank} XXXX${D.bank.last4}), as chosen.`
+        : D.account.agrees ? `Statement account XXXX${D.account.last4} → ${D.bank.name} (${D.bank.bank} XXXX${D.bank.last4})${D.account.by === 'statement' ? ', found by its last 4 digits' : ''}. What is recorded from it goes to this account.`
+          : `The statement shows account XXXX${D.account.last4}, but it is being reconciled with ${D.bank.name} (XXXX${D.bank.last4}), as you chose.`)),
     R.err && h('p', { class: 'err', role: 'alert' }, R.err),
+    R.mismatch && h('div', { class: 'bar' },
+      R.mismatch.suggest && h('button', { class: 'small primary', onclick: () => { R.bankId = String(R.mismatch.suggest); R.anyAccount = false; recCheck(null, true); } },
+        `Use ${R.accounts.find((b) => b.id === R.mismatch.suggest)?.name ?? 'that account'} (XXXX${R.mismatch.last4})`),
+      h('button', { class: 'small', onclick: () => { R.anyAccount = true; recCheck(null, true); } }, 'Reconcile with the chosen account anyway')),
     aiOffer,
     !S.ai && can('admin') && h('p', { class: 'muted small' }, 'AI reading (for statements this page can’t read, and photos of statements) is off: add an ANTHROPIC_API_KEY to the app’s settings to turn it on.'));
   if (!R.accounts.length) return app.replaceChildren(topBar(), pageHead('Reconcile with the bank statement', ''), h('div', { class: 'card' }, h('p', { class: 'empty' }, 'Add a bank account first (Banks → “+ Add bank account”).')));
@@ -789,7 +807,7 @@ function renderReconcile() {
         : { id: 'R', thing: 'receipt', things: 'receipts', did: 'received', to: 'Received from', due: 'expected', yet: 'yet to be received', soon: 'Expected today', sign: 1, verb: 'receive' } };
   };
   const O = side(true), I = side(false);
-  const recLabel = (S, p) => `${S.w.id}-${p.id} · ${p.name} · ${S.w.due} ${nice(p.due_date)} · ${inr(p.outstanding)}${p.outstanding < p.amount ? ' left' : ''}${p.bank_name ? '' : ' · bank not decided'}`;
+  const recLabel = (S, p) => `${S.w.id}-${p.id} · ${p.name} · ${S.w.due} ${nice(p.due_date)} · ${inr(p.outstanding)}${p.outstanding < p.amount ? ' left' : ''}${!p.bank_name ? ' · bank not decided' : p.bank_id !== D.bank.id ? ` · for ${p.bank_name}` : ''}`;
   const amountCell = (S, d) => h('td', { class: 'num' }, money(S.w.sign * d.amount, S.out ? '' : 'pos'));
 
   const lineCell = (S, d) => h('td', {}, h('div', {}, d.narration || '—'), h('div', { class: 'muted small' }, [d.ref && `Ref. ${d.ref}`, `row ${d.row}`].filter(Boolean).join(' · ')),
@@ -899,7 +917,7 @@ function renderReconcile() {
     if (!confirm(`Apply to ${D.bank.name}?\n\n${summary.join('\n')}`)) return;
     R.busy = true; renderReconcile();
     try {
-      const r = await api('/api/reconcile/apply', { ...R.sent, password: R.password, bank_id: R.bankId, saveBalance: R.saveBalance,
+      const r = await api('/api/reconcile/apply', { ...R.sent, password: R.password, bank_id: R.bankId, anyAccount: R.anyAccount, saveBalance: R.saveBalance,
         matches: O.matched.map((d) => ({ row: d.row, id: Number(R.choice.get(d.row)) })), record: O.rec.map((d) => ({ row: d.row, payee: name(d) })), leftOut: lefts(O),
         matchesIn: I.matched.map((d) => ({ row: d.row, id: Number(R.choice.get(d.row)) })), recordIn: I.rec.map((d) => ({ row: d.row, party: name(d) })), leftOutIn: lefts(I) });
       R.note = [`Reconciled ${D.bank.name}:`, r.paid && `${r.paid} payment(s) marked paid (${inr(r.paidAmount)})`, r.recorded && `${r.recorded} payment(s) recorded as new (${inr(r.recordedAmount)})`,

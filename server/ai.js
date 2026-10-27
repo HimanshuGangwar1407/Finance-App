@@ -34,9 +34,10 @@ const LINE = {
 const SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['is_statement', 'lines', 'note'],
+  required: ['is_statement', 'account_number', 'lines', 'note'],
   properties: {
     is_statement: { type: 'boolean', description: 'false if this is not a bank account statement.' },
+    account_number: { type: 'string', description: 'The number of the account this statement is for, exactly as printed (it may be masked, e.g. "XXXXXXXX1111"); "" if not shown.' },
     lines: { type: 'array', items: LINE },
     note: { type: 'string', description: 'Anything unclear (unreadable figures, cut-off pages); "" if nothing.' },
   },
@@ -94,13 +95,13 @@ export async function readWithAi(buf, fileName = '') {
   const s = (v) => str(v, 300);
   const rows = [{ n: 1, cells: ['Date', 'Narration', 'Ref No.', 'Withdrawal', 'Deposit', 'Balance'] },
     ...out.lines.slice(0, 5000).map((l, i) => ({ n: i + 2, cells: [s(l.date), s(l.narration), s(l.ref), s(l.withdrawal), s(l.deposit), s(l.balance)] }))];
-  return { table: { sheet: '', rows }, note: s(out.note), model: message.model, usage: { input: message.usage?.input_tokens ?? 0, output: message.usage?.output_tokens ?? 0 }, file: fileName };
+  return { table: { sheet: '', rows }, account: str(out.account_number, 40), note: s(out.note), model: message.model, usage: { input: message.usage?.input_tokens ?? 0, output: message.usage?.output_tokens ?? 0 }, file: fileName };
 }
 
 /** a table sent back by the browser (what the AI read), checked before use */
-export function tableFromLines(lines) {
+export function tableFromLines(lines, account = '') {
   if (!Array.isArray(lines) || !lines.length || lines.length > 5001) fail('The statement lines couldn’t be read. Read the statement again.');
-  return { sheet: '', rows: lines.map((cells, i) => {
+  return { sheet: '', head: str(account, 40) ? [`Account No: ${str(account, 40)}`] : [], rows: lines.map((cells, i) => {
     if (!Array.isArray(cells) || cells.length !== 6 || !cells.every((c) => typeof c === 'string' && c.length <= 300)) fail('The statement lines couldn’t be read. Read the statement again.');
     return { n: i + 1, cells };
   }) };
