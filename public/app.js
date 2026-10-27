@@ -91,16 +91,29 @@ function authScreen(needsSetup) {
 
 // ── the page shown: the dashboard, Banks, Transactions, EMIs, Users, or the activity log ──
 async function load() {
-  // who is signed in, fresh each time a page opens: a changed role shows straight away, removed access signs out
-  try {
-    const st = await api('/api/state');
-    if (!st.user) { S.user = null; fresh(); return boot(); }
-    S.user = st.user; S.ai = Boolean(st.ai);
-  } catch { /* offline for a moment: the page itself will say so */ }
+  // who is signed in, fresh each time a page opens: a changed role shows straight away, removed access signs out.
+  // Once someone is signed in, this is asked alongside the page's own data rather than before it (one wait, not two).
+  const was = S.user && `${S.user.id}|${S.user.role}`;
+  const who = api('/api/state').catch(() => null); // null: offline for a moment — the page itself will say so
+  const gone = (st) => st && !st.user;
+  if (!was) {
+    const st = await who;
+    if (gone(st)) { S.user = null; fresh(); return boot(); }
+    if (st) { S.user = st.user; S.ai = Boolean(st.ai); }
+  }
   if ((S.view === 'activity' || S.view === 'users') && !can('admin')) S.view = 'position';
   if (S.view === 'reconcile' && !can('editor')) S.view = 'position';
-  try { await ({ position: loadPosition, banks: loadBanks, transactions: loadTransactions, emis: loadEmis, reconcile: loadReconcile, users: loadUsers, activity: loadActivity })[S.view](); }
-  catch (e) { if (S.user) app.replaceChildren(topBar(), h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again'))); }
+  const page = ({ position: loadPosition, banks: loadBanks, transactions: loadTransactions, emis: loadEmis, reconcile: loadReconcile, users: loadUsers, activity: loadActivity })[S.view]().then(() => null, (e) => e);
+  if (was) {
+    const st = await who;
+    if (gone(st)) { await page; if (S.user) { S.user = null; fresh(); boot(); } return; } // (a refused request may already have signed out)
+    if (st) {
+      S.user = st.user; S.ai = Boolean(st.ai);
+      if (`${st.user.id}|${st.user.role}` !== was) { await page; return load(); } // the role changed: open the page again as it now is
+    }
+  }
+  const e = await page;
+  if (e && S.user) app.replaceChildren(topBar(), h('div', { class: 'card' }, h('p', { class: 'neg' }, e.message), h('button', { onclick: load }, 'Try again')));
 }
 
 // simple line icons (stroke paths on a 24×24 grid)

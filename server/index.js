@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { q, withTx, ensureSchema, setPool } from './db.js';
+import { q, withTx, ensureSchema, setPool, getPool } from './db.js';
 import { finalBalance } from './balance.js';
 import { emiDates } from './emi.js';
 import { bankStatements } from './ledger.js';
@@ -71,8 +71,21 @@ async function syncEmis(c, through) {
     ON CONFLICT (emi_id, due_date) WHERE emi_id IS NOT NULL DO NOTHING`, [ids, dates]);
 }
 
-// db: the pool, or a transaction's client
-async function position(db, { today, upTo, approvedOnly = false, uncertain = true }) {
+// syncEmis for a page being looked at: instalments are made once and never deleted (only cancelled), so the ones this
+// server has already made sure of (per database) aren't written again. Usually one read, no transaction, no write.
+const ensured = new WeakMap();
+async function ensureEmis(through) {
+  const pool = getPool(), seen = ensured.get(pool) ?? new Set();
+  ensured.set(pool, seen);
+  const { rows } = await q('SELECT id, day, start_date, end_date FROM emis WHERE active');
+  const todo = rows.flatMap((e) => emiDates(e, through).map((d) => `${e.id}|${d}`)).filter((k) => !seen.has(k));
+  if (!todo.length) return;
+  await withTx((c) => syncEmis(c, through));
+  for (const k of todo) seen.add(k);
+}
+
+// everything the balances are worked out from. db: the pool, or a transaction's client
+async function ledger(db) {
   const sql = [
     'SELECT id, name, bank, last4 FROM banks ORDER BY name, id',
     'SELECT id, bank_id, amount, as_of FROM balances',
@@ -85,9 +98,13 @@ async function position(db, { today, upTo, approvedOnly = false, uncertain = tru
   const out = [];
   if (db.release) for (const t of sql) out.push(await db.query(t));
   else out.push(...await Promise.all(sql.map((t) => db.query(t))));
-  const [banks, balances, receipts, payments, entries] = out;
-  const result = finalBalance({ banks: banks.rows, balances: balances.rows, receipts: receipts.rows, payments: payments.rows, entries: entries.rows, today, upTo, approvedOnly, uncertain });
-  return { banks: banks.rows, ...result };
+  const [banks, balances, receipts, payments, entries] = out.map((r) => r.rows);
+  return { banks, balances, receipts, payments, entries };
+}
+// the position per account; data: a ledger already read (a page that needs it for more than this reads it once)
+async function position(db, { today, upTo, approvedOnly = false, uncertain = true }, data) {
+  const d = data ?? await ledger(db);
+  return { banks: d.banks, ...finalBalance({ ...d, today, upTo, approvedOnly, uncertain }) };
 }
 const HORIZON = 62; // EMI payments are made this many days ahead, enough for any hold to have started
 
@@ -224,8 +241,9 @@ function emiSettings(body, old = NEW_EMI) {
 }
 
 // marks each unpaid instalment covered or not: can its account's balance pay it together with its earlier EMIs?
-async function withCoverage(rows, today) {
-  const balances = new Map((await position({ query: q }, { today, upTo: today })).rows.filter((r) => r.id != null).map((r) => [r.id, r.today]));
+// pos: today's position, when already worked out
+async function withCoverage(rows, today, pos) {
+  const balances = new Map((pos ?? await position({ query: q }, { today, upTo: today })).rows.filter((r) => r.id != null).map((r) => [r.id, r.today]));
   const cover = coverage(rows.filter((r) => !r.projected && r.left > 0), balances);
   return rows.map((r) => { const c = cover.get(r.payment_id); return c && !r.projected ? { ...r, covered: c.covered, short_by: c.shortBy } : r; });
 }
@@ -257,13 +275,18 @@ async function emiSchedule(db, today) {
   return out.sort((a, b) => a.due_date.localeCompare(b.due_date) || a.emi_id - b.emi_id);
 }
 
-// per account: balance now, money held for EMIs (reserved), and what is available for anything else
-async function emiOverview(today) {
-  await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
-  const [pos, sched, { rows: [act] }] = await Promise.all([
-    position({ query: q }, { today, upTo: today }), emiSchedule({ query: q }, today),
+// what the EMI pages and the dashboard are worked out from, read once: the ledger, today's position, every instalment
+async function emiData(today) {
+  await ensureEmis(addDays(today, HORIZON));
+  const [data, sched, { rows: [act] }] = await Promise.all([
+    ledger({ query: q }), emiSchedule({ query: q }, today),
     q('SELECT count(*)::int AS n, coalesce(sum(amount), 0)::bigint AS monthly FROM emis WHERE active'),
   ]);
+  return { data, sched, act, pos: await position(null, { today, upTo: today }, data) };
+}
+
+// per account: balance now, money held for EMIs (reserved), and what is available for anything else
+function emiOverview(today, { pos, sched, act }) {
   const open = sched.filter((r) => !r.projected && ['overdue', 'due', 'upcoming', 'scheduled'].includes(r.state));
   const sum = (xs) => ({ count: xs.length, amount: xs.reduce((s, r) => s + r.left, 0) });
   const accounts = pos.rows.filter((r) => r.id != null).map((r) => ({
@@ -400,7 +423,8 @@ async function history(f) {
 // every receipt and payment that is dated in the period or had money move in it, with how much has been settled:
 // pending (nothing yet), partial, completed, or cancelled
 async function records(f) {
-  const where = [`(t.date BETWEEN $1 AND $2 OR EXISTS (SELECT 1 FROM entries e WHERE (CASE WHEN t.kind = 'IN' THEN e.receipt_id ELSE e.payment_id END) = t.id AND e.date BETWEEN $1 AND $2))`];
+  // dated in the period, or with money received / paid in it (worked out once per record, in the totals below)
+  const where = ['(t.date BETWEEN $1 AND $2 OR t.moved_in_period)'];
   const args = [f.from, f.to], arg = (v) => { args.push(v); return `$${args.length}`; };
   if (f.bank) { const b = arg(f.bank); where.push(`(t.bank_id = ${b} OR ${b} = ANY(t.banks))`); }
   if (f.type) where.push(`t.kind = ${arg(f.type)}`);
@@ -421,6 +445,7 @@ async function records(f) {
   }
   const { rows } = await q(`SELECT * FROM (
       SELECT x.*, coalesce(d.settled, 0)::bigint AS settled, d.last_date, d.bank_refs, coalesce(d.banks, '{}') AS banks, b.name AS bank_name, cu.name AS recorded_by,
+        coalesce(d.moved_in_period, false) AS moved_in_period,
         CASE WHEN x.status = 'CANCELLED' THEN 'cancelled' WHEN coalesce(d.settled, 0) >= x.amount THEN 'completed' WHEN coalesce(d.settled, 0) > 0 THEN 'partial' ELSE 'pending' END AS state
       FROM (
         SELECT 'IN' AS kind, r.id, r.expected_date AS date, r.party AS name, r.ref, r.note, '' AS category, r.amount, r.bank_id, r.status, false AS emi, r.created_by FROM receipts r
@@ -429,13 +454,13 @@ async function records(f) {
       ) x
       LEFT JOIN (
         SELECT CASE WHEN receipt_id IS NULL THEN 'OUT' ELSE 'IN' END AS kind, coalesce(receipt_id, payment_id) AS id, sum(amount) AS settled, max(date) AS last_date,
-          string_agg(ref, ', ' ORDER BY id) AS bank_refs, array_agg(DISTINCT bank_id) AS banks
+          string_agg(ref, ', ' ORDER BY id) AS bank_refs, array_agg(DISTINCT bank_id) AS banks, bool_or(date BETWEEN $1 AND $2) AS moved_in_period
         FROM entries GROUP BY 1, 2
       ) d ON d.kind = x.kind AND d.id = x.id
       LEFT JOIN banks b ON b.id = coalesce(x.bank_id, d.banks[1])
       LEFT JOIN users cu ON cu.id = x.created_by
     ) t WHERE ${where.join(' AND ')} ORDER BY t.date DESC, t.kind, t.id DESC LIMIT 5000`, args);
-  return rows;
+  return rows.map(({ moved_in_period, ...r }) => r);
 }
 
 // ── an uploaded Excel / CSV sheet → receipts and payments yet to be paid / received (pending: balances don't move) ──
@@ -712,7 +737,7 @@ const routes = [
     const today = todayIST(), p = url.searchParams;
     const date = p.get('date') ? ymd(p.get('date')) : today;
     if (date < today) bad('Pick today or a later date.');
-    await withTx((c) => syncEmis(c, addDays(date, HORIZON)));
+    await ensureEmis(addDays(date, HORIZON));
     const result = await position({ query: q }, { today, upTo: date, approvedOnly: p.get('approvedOnly') === '1', uncertain: p.get('uncertain') !== '0' });
     return { today, date, ...result };
   }],
@@ -770,12 +795,9 @@ const routes = [
   // cover their EMIs, and the money received and paid this month
   ['GET', /^\/api\/dashboard$/, 'viewer', async () => {
     const today = todayIST(), from = `${today.slice(0, 8)}01`;
-    const ov = await emiOverview(today);
-    const [open, banks, balances, entries] = await Promise.all([
-      emiSchedule({ query: q }, today).then((rows) => withCoverage(rows.filter((r) => !r.projected && r.left > 0), today)),
-      q('SELECT id, name, bank, last4 FROM banks ORDER BY name, id'), q('SELECT id, bank_id, amount, as_of FROM balances'), q('SELECT kind, bank_id, amount, date FROM entries'),
-    ]);
-    const month = bankStatements({ banks: banks.rows, balances: balances.rows, entries: entries.rows, from, to: today }).total;
+    const x = await emiData(today), ov = emiOverview(today, x);
+    const open = await withCoverage(x.sched.filter((r) => !r.projected && r.left > 0), today, x.pos);
+    const month = bankStatements({ banks: x.data.banks, balances: x.data.balances, entries: x.data.entries, from, to: today }).total;
     const sum = (xs) => ({ count: xs.length, amount: xs.reduce((n, r) => n + r.left, 0) });
     const within = (days) => sum(open.filter((r) => r.due_date >= today && r.due_date <= addDays(today, days)));
     return {
@@ -788,7 +810,7 @@ const routes = [
   }],
 
   // money reserved for EMIs and what is left to spend, per account; overdue and upcoming instalments
-  ['GET', /^\/api\/emis\/overview$/, 'viewer', async () => emiOverview(todayIST())],
+  ['GET', /^\/api\/emis\/overview$/, 'viewer', async () => { const today = todayIST(); return emiOverview(today, await emiData(today)); }],
 
   // every instalment: past and current ones from the records, future ones projected 12 months ahead
   ['GET', /^\/api\/emis\/schedule$/, 'viewer', async ({ url }) => {
@@ -797,7 +819,7 @@ const routes = [
     const emi = p.get('emi') ? intId(p.get('emi'), 'EMI') : null, bank = p.get('bank') ? intId(p.get('bank'), 'Bank account') : null;
     const from = ymd(p.get('from'), 'From', { optional: true }), to = ymd(p.get('to'), 'To', { optional: true });
     if (from && to && from > to) bad('The “from” date must be on or before the “to” date.');
-    await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
+    await ensureEmis(addDays(today, HORIZON));
     const rows = (await withCoverage(await emiSchedule({ query: q }, today), today)).filter((r) =>
       (!status || (status === 'open' ? ['overdue', 'due', 'upcoming', 'scheduled'].includes(r.state) && !r.projected : r.state === status)) &&
       (!emi || r.emi_id === emi) && (!bank || r.bank_id === bank) && (!from || r.due_date >= from) && (!to || r.due_date <= to));
@@ -1044,13 +1066,10 @@ const routes = [
   ['GET', /^\/api\/banks\/day$/, 'viewer', async ({ url }) => {
     const today = todayIST(), date = url.searchParams.get('date') ? ymd(url.searchParams.get('date'), 'Date') : today;
     if (date > today) bad('Pick today or an earlier day.');
-    await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
-    const [banks, balances, entries, moves, sched, pos] = await Promise.all([
-      q('SELECT id, name, bank, last4 FROM banks ORDER BY name, id'), q('SELECT id, bank_id, amount, as_of FROM balances'),
-      q('SELECT kind, bank_id, amount, date FROM entries'), history({ from: date, to: date, bank: null, type: '', q: '' }),
-      emiSchedule({ query: q }, today), position({ query: q }, { today, upTo: today }),
-    ]);
-    const st = bankStatements({ banks: banks.rows, balances: balances.rows, entries: entries.rows, from: date, to: date });
+    await ensureEmis(addDays(today, HORIZON));
+    const [data, moves, sched] = await Promise.all([ledger({ query: q }), history({ from: date, to: date, bank: null, type: '', q: '' }), emiSchedule({ query: q }, today)]);
+    const pos = await position(null, { today, upTo: today }, data);
+    const st = bankStatements({ banks: data.banks, balances: data.balances, entries: data.entries, from: date, to: date });
     const held = new Map(pos.rows.filter((r) => r.id != null).map((r) => [r.id, r.held]));
     const real = sched.filter((r) => !r.projected);
     const rows = st.rows.map((b) => ({
@@ -1068,7 +1087,7 @@ const routes = [
 
   ['GET', /^\/api\/transactions\/summary$/, 'viewer', async ({ url }) => {
     const f = txFilters(url), today = todayIST();
-    await withTx((c) => syncEmis(c, addDays(today, HORIZON)));
+    await ensureEmis(addDays(today, HORIZON));
     const [banks, balances, entries, open] = await Promise.all([
       q('SELECT id, name, bank, last4 FROM banks ORDER BY name, id'), q('SELECT id, bank_id, amount, as_of FROM balances'),
       q('SELECT kind, bank_id, amount, date FROM entries'), records({ ...f, status: '', type: '', q: '' }),
