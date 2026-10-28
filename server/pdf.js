@@ -183,7 +183,7 @@ export function tableFromPages(pages) {
       });
     }
   }
-  if (!cols) fail('No statement table found in this PDF: no heading row with Particulars / Narration and Withdrawals / Debit.');
+  if (!cols) fail(`No statement table found in this ${pages.some((p) => p.some((it) => it.word)) ? 'picture' : 'PDF'}: no heading row with Particulars / Narration and Withdrawals / Debit.`);
   // Some banks (HDFC) cut a description into pieces of a fixed number of characters, often mid-word ("…ROAD LIN" /
   // "ES-ANSALS…"). When most wrapped cells of a column start with a piece of the same length, that is the width:
   // a piece that fills it is joined to the next without a space. Wrapping at spaces (IDBI) shows no such width.

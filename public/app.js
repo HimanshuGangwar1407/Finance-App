@@ -705,20 +705,53 @@ async function loadReconcile() {
 }
 const HOW = { ref: ['bill / ref. no. in narration', 'c-green'], name: ['name in narration', 'c-green'], amount: ['amount only — check', 'c-amber'] };
 
-async function recCheck(file, keepNote = false) {
+// files: the file chosen (or several photos of one statement, its pages in order); none: check the same one again
+async function recCheck(files, keepNote = false) {
   const R = S.rec;
+  files = files ? [...(files instanceof File ? [files] : files)] : null;
+  const file = files?.[0];
   R.err = ''; R.mismatch = null; R.busy = true; if (!keepNote) R.note = ''; renderReconcile();
   try {
     if (file) {
-      if (file.size > 3 * 1024 * 1024) throw new Error('That file is too big. Upload at most 3 MB.');
-      R.sent = { file: await toBase64(file), name: file.name };
-      R.file = file; R.password = ''; R.needPassword = false; R.aiNote = ''; R.anyAccount = false; R.unreadable = false;
-      // a photo or screenshot of a statement: this page can't read those itself — the AI or Docsumo does
-      if (/^image\//.test(file.type)) {
-        R.unreadable = true;
-        if (S.ai) return await recAi(true);
-        throw new Error(S.docsumo ? 'This page can’t read a photo of a statement itself. Read it with Docsumo (below).'
-          : 'A photo of a statement can only be read with AI reading, which isn’t set up for this app. Upload the PDF, Excel or CSV statement, or paste it.');
+      R.file = file; R.password = ''; R.needPassword = false; R.aiNote = ''; R.anyAccount = false; R.unreadable = false; R.data = null;
+      const photos = files.filter(isPhoto);
+      // photos or screenshots of a statement (JPG, PNG…): read here with OCR, like a PDF that is a picture
+      if (photos.length) {
+        if (photos.length < files.length) throw new Error('Choose one statement file — or several photos / screenshots of one statement, its pages in order.');
+        if (photos.length > 20) throw new Error('Choose at most 20 photos (pages) of one statement.');
+        const name = photos.length > 1 ? `${photos.length} photos — ${photos.map((f) => f.name).join(', ')}` : file.name;
+        // the file first (made small enough to send), so Docsumo or the AI can be given it if this page can't read it
+        R.sent = { file: '', name };
+        R.progress = 'Opening the photo…'; renderReconcile();
+        R.sent.file = await photoFile(photos).catch((x) => {
+          // a TIFF this browser can't show: Docsumo can still take it as it is
+          if (photos.length === 1 && /\.tiff?$/i.test(file.name) && file.size <= 3 * 1024 * 1024) return toBase64(file);
+          throw x;
+        });
+        // read, and checked against the running balance; if some lines don't add up, read again more closely in
+        // another way — keeping the reading the balance confirms best
+        let best = null, failed = null;
+        for (const [i, how] of PHOTO_READS.entries()) {
+          const progress = (msg) => { R.progress = i ? `Some lines didn’t add up — reading it again, more closely (try ${i + 1} of ${PHOTO_READS.length}). ${msg}` : msg; renderReconcile(); };
+          try {
+            const ocr = await readPhotos(photos, progress, how);
+            progress('Checking what was read…');
+            const data = await api('/api/reconcile/check', { ...R.sent, ocr, bank_id: R.bankId, anyAccount: R.anyAccount });
+            const score = data.checked ? data.checked.ok / Math.max(1, data.checked.of) : 1;
+            if (!best || score > best.score) best = { ocr, score };
+            if (score === 1) break;
+          } catch (x) {
+            if (/^account_/.test(x.code ?? '')) throw x; // not about the reading: which account it is for
+            failed = x;
+            if (!best) break; // nothing like a statement found: no use reading again (Docsumo is offered)
+          }
+        }
+        if (!best) throw Object.assign(failed, { detail: { unreadable: true } });
+        R.sent.ocr = best.ocr;
+      } else {
+        if (files.length > 1) throw new Error('Choose one statement file — or several photos / screenshots of one statement, its pages in order.');
+        if (file.size > 3 * 1024 * 1024) throw new Error('That file is too big. Upload at most 3 MB.');
+        R.sent = { file: await toBase64(file), name: file.name };
       }
     }
     try {
@@ -735,7 +768,7 @@ async function recCheck(file, keepNote = false) {
     R.choice = firstChoices(R.data);
     R.payee = new Map(); R.left = new Map(); R.leftIn = new Map(); R.saveBalance = false;
   } catch (e) { recFailed(e); if (e.code === 'pdf_password') R.needPassword = true; }
-  R.busy = false; renderReconcile();
+  R.progress = ''; R.busy = false; renderReconcile();
 }
 // a statement whose account number isn't the chosen account's: say so, and offer the right one (or to go ahead)
 function recFailed(e) {
@@ -796,59 +829,163 @@ const loadScript = (src) => new Promise((ok, no) => {
   if (document.querySelector(`script[src="${src}"]`)) return ok();
   document.head.append(h('script', { src, onload: ok, onerror: () => no(new Error('The reader for pictures of statements didn’t load. Check the connection and try again.')) }));
 });
+// Tesseract reads each page that draw(p) gives ({ canvas, scale: pixels per point }); straighten: a photo taken at a slant
+async function ocrRead(count, draw, label, progress, { straighten = false } = {}) {
+  progress('Loading the reader (the first time takes a few seconds)…');
+  await loadScript('/vendor/tesseract.min.js');
+  const worker = await window.Tesseract.createWorker('eng', 1, {
+    workerPath: '/vendor/tesseract-worker.min.js', corePath: '/vendor/tesseract-core-simd-lstm.wasm.js', langPath: '/vendor', gzip: true, workerBlobURL: false,
+  });
+  const pages = [];
+  try {
+    await worker.setParameters({ tessedit_pageseg_mode: '11', preserve_interword_spaces: '1' }); // words wherever they are on the page
+    for (let p = 1; p <= count; p++) {
+      progress(label(p, count));
+      const { canvas, scale } = await draw(p);
+      const { data } = await worker.recognize(canvas, { rotateAuto: straighten }, { blocks: true, text: false });
+      const words = [];
+      for (const b of data.blocks ?? []) for (const par of b.paragraphs) for (const l of par.lines) for (const w of l.words) {
+        const base = w.baseline && Number.isFinite(w.baseline.y0) ? (w.baseline.y0 + w.baseline.y1) / 2 : w.bbox.y1;
+        words.push({ x: w.bbox.x0 / scale, y: (canvas.height - base) / scale, w: (w.bbox.x1 - w.bbox.x0) / scale, h: (w.bbox.y1 - w.bbox.y0) / scale, s: w.text });
+      }
+      pages.push({ top: canvas.height / scale, words });
+    }
+  } finally { await worker.terminate(); }
+  return pages;
+}
 async function ocrPdf(file, password, progress) {
   progress('Opening the PDF…');
   const pdfjs = await import('/vendor/pdf.min.mjs');
   pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.mjs';
   const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), password: password || undefined, isEvalSupported: false }).promise;
   if (doc.numPages > 20) throw new Error('That picture PDF has more than 20 pages. Upload a shorter period.');
-  progress('Loading the reader (the first time takes a few seconds)…');
-  await loadScript('/vendor/tesseract.min.js');
-  const worker = await window.Tesseract.createWorker('eng', 1, {
-    workerPath: '/vendor/tesseract-worker.min.js', corePath: '/vendor/tesseract-core-simd-lstm.wasm.js', langPath: '/vendor', gzip: true, workerBlobURL: false,
-  });
-  const SCALE = 3, pages = [];
-  try {
-    await worker.setParameters({ tessedit_pageseg_mode: '11', preserve_interword_spaces: '1' }); // words wherever they are on the page
-    for (let p = 1; p <= doc.numPages; p++) {
-      progress(`Reading the picture of the statement: page ${p} of ${doc.numPages}…`);
-      const page = await doc.getPage(p), vp = page.getViewport({ scale: SCALE });
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-      await page.render({ canvasContext: ctx, viewport: vp }).promise;
-      // black and white: light grey headings read as clearly as the figures
-      const img = ctx.getImageData(0, 0, canvas.width, canvas.height), d = img.data;
-      for (let i = 0; i < d.length; i += 4) { const v = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2] < 215 ? 0 : 255; d[i] = d[i + 1] = d[i + 2] = v; }
-      ctx.putImageData(img, 0, 0);
-      const { data } = await worker.recognize(canvas, {}, { blocks: true, text: false });
-      const words = [];
-      for (const b of data.blocks ?? []) for (const par of b.paragraphs) for (const l of par.lines) for (const w of l.words) {
-        const base = w.baseline && Number.isFinite(w.baseline.y0) ? (w.baseline.y0 + w.baseline.y1) / 2 : w.bbox.y1;
-        words.push({ x: w.bbox.x0 / SCALE, y: (vp.height - base) / SCALE, w: (w.bbox.x1 - w.bbox.x0) / SCALE, h: (w.bbox.y1 - w.bbox.y0) / SCALE, s: w.text });
-      }
-      pages.push({ top: vp.height / SCALE, words });
-    }
-  } finally { await worker.terminate(); }
-  return pages;
+  const SCALE = 3;
+  return ocrRead(doc.numPages, async (p) => {
+    const page = await doc.getPage(p), vp = page.getViewport({ scale: SCALE });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    // black and white: light grey headings read as clearly as the figures
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height), d = img.data;
+    for (let i = 0; i < d.length; i += 4) { const v = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2] < 215 ? 0 : 255; d[i] = d[i + 1] = d[i + 2] = v; }
+    ctx.putImageData(img, 0, 0);
+    return { canvas, scale: SCALE };
+  }, (p, n) => `Reading the picture of the statement: page ${p} of ${n}…`, progress);
 }
+
+// ── photos and screenshots of a statement (JPG, PNG, WebP…), its pages in order ──
+const PHOTO = /\.(jpe?g|jfif|png|webp|bmp|gif|tiff?|heic|heif|avif)$/i;
+const isPhoto = (f) => /^image\//.test(f.type) || PHOTO.test(f.name);
+// a photo drawn for reading: `width` pixels across (a screenshot is enlarged, a big photo made smaller), a white
+// margin round it, then black and white against its own surroundings — so a shadow across the page, a tinted band or
+// white headings on a coloured bar don't swallow the text
+function photoCanvas(bmp, { width, ink }) {
+  let k = Math.min(4, width / bmp.width);
+  k = Math.min(k, Math.sqrt(14e6 / (bmp.width * bmp.height)));
+  const w = Math.round(bmp.width * k), hh = Math.round(bmp.height * k), scale = w / 595, pad = Math.round(40 * scale);
+  const canvas = document.createElement('canvas');
+  canvas.width = w + 2 * pad; canvas.height = hh + 2 * pad;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bmp, pad, pad, w, hh);
+  // the background near each point: the page shrunk (each pixel the average of a patch about two lines high), then
+  // stretched back smoothly
+  const cell = Math.max(4, Math.round(16 * scale)), small = document.createElement('canvas');
+  small.width = Math.ceil(canvas.width / cell); small.height = Math.ceil(canvas.height / cell);
+  const sctx = small.getContext('2d');
+  sctx.imageSmoothingQuality = 'high'; sctx.drawImage(canvas, 0, 0, small.width, small.height);
+  const bg = document.createElement('canvas');
+  bg.width = canvas.width; bg.height = canvas.height;
+  const bctx = bg.getContext('2d', { willReadFrequently: true });
+  bctx.imageSmoothingQuality = 'high'; bctx.drawImage(small, 0, 0, bg.width, bg.height);
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height), d = img.data, m = bctx.getImageData(0, 0, bg.width, bg.height).data;
+  const lum = (a, i) => 0.299 * a[i] + 0.587 * a[i + 1] + 0.114 * a[i + 2];
+  for (let i = 0; i < d.length; i += 4) {
+    const v = lum(d, i), around = lum(m, i);
+    const dark = around > 100 ? v < around - ink : v > around + ink; // dark text on a light page; light text on a dark bar
+    d[i] = d[i + 1] = d[i + 2] = dark ? 0 : 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return { canvas, scale };
+}
+// a photo as a JPEG no bigger than `budget` bytes, for sending on
+async function toJpeg(bmp, budget) {
+  for (let px = 2400, q = 0.85; ; px *= 0.8, q = Math.max(0.5, q - 0.1)) {
+    const k = Math.min(1, px / Math.max(bmp.width, bmp.height)), c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height); ctx.drawImage(bmp, 0, 0, c.width, c.height);
+    const blob = await new Promise((ok) => c.toBlob(ok, 'image/jpeg', q));
+    if (blob.size <= budget || px < 900) return { bytes: new Uint8Array(await blob.arrayBuffer()), w: c.width, h: c.height };
+  }
+}
+// JPEGs → one PDF, a page each (A4 wide), so several photos go to the server — and to Docsumo or the AI — as one statement
+function jpegPdf(jpgs) {
+  const enc = new TextEncoder(), parts = [], at = [];
+  let len = 0;
+  const add = (x) => { const b = typeof x === 'string' ? enc.encode(x) : x; parts.push(b); len += b.length; };
+  const obj = (n, dict, stream) => {
+    at[n] = len; add(`${n} 0 obj\n${dict}\n`);
+    if (stream) { add('stream\n'); add(stream); add('\nendstream\n'); }
+    add('endobj\n');
+  };
+  add('%PDF-1.4\n');
+  obj(1, '<< /Type /Catalog /Pages 2 0 R >>');
+  obj(2, `<< /Type /Pages /Kids [${jpgs.map((_, i) => `${3 + 3 * i} 0 R`).join(' ')}] /Count ${jpgs.length} >>`);
+  jpgs.forEach((j, i) => {
+    const n = 3 + 3 * i, W = 595, H = Math.round((595 * j.h / j.w) * 100) / 100, draw = enc.encode(`q ${W} 0 0 ${H} 0 0 cm /Im Do Q`);
+    obj(n, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${W} ${H}] /Resources << /XObject << /Im ${n + 2} 0 R >> >> /Contents ${n + 1} 0 R >>`);
+    obj(n + 1, `<< /Length ${draw.length} >>`, draw);
+    obj(n + 2, `<< /Type /XObject /Subtype /Image /Width ${j.w} /Height ${j.h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${j.bytes.length} >>`, j.bytes);
+  });
+  const xref = len, size = 3 + 3 * jpgs.length;
+  add(`xref\n0 ${size}\n0000000000 65535 f \n${at.slice(1).map((o) => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size ${size} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  return new Blob(parts, { type: 'application/pdf' });
+}
+const openPhoto = async (f) => {
+  try { return await createImageBitmap(f); } catch {
+    throw new Error(`“${f.name}” can’t be opened here${/\.(heic|heif)$/i.test(f.name) ? ' (an iPhone HEIC photo)' : ''}. Save it as JPG or PNG — on a phone, a screenshot of it works — then upload that.`);
+  }
+};
+// the photos as one file to send (with the words read, or to Docsumo / the AI): one JPG / PNG of up to 2 MB as it is;
+// a bigger one, or another kind, made a smaller JPEG; several, one PDF of about 2 MB at most
+async function photoFile(photos) {
+  if (photos.length === 1 && /^image\/(png|jpeg)$/.test(photos[0].type) && photos[0].size <= 2 * 1024 * 1024) return toBase64(photos[0]);
+  const jpgs = [];
+  for (const f of photos) {
+    const bmp = await openPhoto(f);
+    try { jpgs.push(await toJpeg(bmp, (1.9 * 1024 * 1024) / photos.length)); } finally { bmp.close(); }
+  }
+  return toBase64(jpgs.length === 1 ? new Blob([jpgs[0].bytes], { type: 'image/jpeg' }) : jpegPdf(jpgs));
+}
+// the ways a photo is read, in turn, until the running balance confirms every line: how wide it is drawn (pixels),
+// and how much darker than its surroundings a point must be to count as ink
+const PHOTO_READS = [{ width: 3000, ink: 20 }, { width: 2400, ink: 14 }, { width: 2000, ink: 10 }];
+// the words on each photo, read here (OCR)
+const readPhotos = (photos, progress, how) => ocrRead(photos.length, async (p) => {
+  const bmp = await openPhoto(photos[p - 1]);
+  try { return photoCanvas(bmp, how); } finally { bmp.close(); }
+},(p, n) => (n > 1 ? `Reading the photos of the statement: ${p} of ${n}…` : 'Reading the photo of the statement…'), progress, { straighten: true });
 
 // bank charges, fees and the GST on them: recorded together with one button
 const CHARGE = /charge|chrg|chgs|commission|\bfee\b|fees|gst|service\s*tax|sms\s*alert|min(imum)?\s*bal/i;
 
 function renderReconcile() {
   const R = S.rec, D = R.data;
-  const fileIn = h('input', { type: 'file', name: 'statement', accept: `.pdf,.xlsx,.csv,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv${S.ai || S.docsumo ? ',.png,.jpg,.jpeg,image/png,image/jpeg' : ''}${S.docsumo ? ',.tif,.tiff,image/tiff' : ''}`, onchange: (e) => e.target.files[0] && recCheck(e.target.files[0]) });
+  // a statement file, or photos / screenshots of one (several: its pages, chosen together)
+  const fileIn = h('input', { type: 'file', name: 'statement', multiple: true, accept: '.pdf,.xlsx,.csv,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,.jpg,.jpeg,.jfif,.png,.webp,.bmp,.gif,.tif,.tiff,.heic,.heif,image/*', onchange: (e) => e.target.files.length && recCheck(e.target.files) });
   // AI reading: offered for a PDF or a photo once one is chosen, most of all when OCR couldn't confirm every line
-  const canAi = S.ai && R.file && /pdf|image/.test(R.file.type || (/\.pdf$/i.test(R.file.name) ? 'pdf' : '')) && !R.busy && !D?.ai;
+  const canAi = S.ai && R.file && R.sent?.file && /pdf|image/.test(R.file.type || (/\.pdf$/i.test(R.file.name) ? 'pdf' : '')) && !R.busy && !D?.ai;
   const aiOffer = canAi && h('div', { class: `rec-ai ${D?.checked && D.checked.ok < D.checked.of ? 'urge' : ''}` },
     h('button', { class: 'small primary', onclick: () => recAi() }, D ? '✨ Read it with AI instead' : '✨ Read with AI'),
     h('span', { class: 'muted small' }, D?.checked && D.checked.ok < D.checked.of ? 'Some lines don’t add up — Claude (AI) may read them better. ' : R.err ? 'Claude (AI) can read PDFs this page can’t, and photos of statements. ' : '',
       'The statement is sent to Anthropic to be read; the figures are checked against the running balance as usual.'));
   // Docsumo: only for a PDF or photo this page couldn't read itself — not read, or read with lines that don't add up
   const ownMisread = D && !D.ai && !D.docsumo && D.checked && D.checked.ok < D.checked.of;
-  const docFile = R.file && /pdf|image/.test(R.file.type || (/\.(pdf|png|jpe?g|tiff?)$/i.test(R.file.name) ? 'pdf' : ''));
+  const docFile = R.file && R.sent?.file && /pdf|image/.test(R.file.type || (/\.(pdf|png|jpe?g|tiff?)$/i.test(R.file.name) ? 'pdf' : ''));
   const canDocsumo = docFile && !R.busy && !D?.docsumo && (R.unreadable || ownMisread);
   const docsumoOffer = canDocsumo && (S.docsumo
     ? h('div', { class: 'rec-ai urge' },
@@ -863,10 +1000,10 @@ function renderReconcile() {
       h('label', {}, h('span', {}, 'Bank account'), bankPicker({ name: 'bank', label: 'Bank account', value: R.bankId,
         options: [['', 'From the statement (last 4 digits of its account no.)'], ...R.accounts.map((b) => [String(b.id), `${b.name} — ${b.bank} XXXX${b.last4}`])],
         onchange: (v) => { R.bankId = v; R.anyAccount = false; if (R.sent) recCheck(); } })),
-      h('label', {}, h('span', {}, 'Bank statement (PDF, Excel or CSV)'), fileIn)),
+      h('label', {}, h('span', {}, 'Bank statement (PDF, Excel, CSV or photos)'), fileIn)),
     R.needPassword && h('div', { class: 'bar' }, pwIn, h('button', { class: 'small primary', onclick: () => { R.password = pwIn.value; recCheck(null, true); } }, 'Open PDF')),
     h('div', { class: 'rec-paste' }, pasteIn, h('button', { class: 'small', onclick: () => { const t = pasteIn.value.trim(); if (t) recCheck(new File([t], 'pasted statement.txt', { type: 'text/plain' })); } }, 'Read pasted statement')),
-    h('p', { class: 'muted small' }, 'It is read for: date, narration / particulars, cheque or reference no., withdrawal (debit) and balance. A PDF saved as a picture (e.g. with “Microsoft Print to PDF”) is read here with OCR, and every line is checked against the running balance. Nothing changes until you press Apply.'),
+    h('p', { class: 'muted small' }, 'It is read for: date, narration / particulars, cheque or reference no., withdrawal (debit) and balance. A PDF saved as a picture (e.g. with “Microsoft Print to PDF”), and photos or screenshots of a statement (JPG, PNG…; for several pages, choose them together), are read here with OCR, and every line is checked against the running balance. Nothing changes until you press Apply.'),
     R.sent && h('p', { class: 'small' }, 'File: ', h('strong', {}, R.sent.name), D && ` · ${nice(D.from)} – ${nice(D.to)} · ${D.debits.length} payment(s) out, ${D.credits.length} credit(s) in`),
     // read fine, but nothing moved in the account
     D && !D.debits.length && !D.credits.length && h('p', { class: 'rec-ocr' }, icon('check'), h('span', {}, `Read: no money went in or out of ${D.bank.name} in this statement.`)),
