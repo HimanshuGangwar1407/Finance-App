@@ -37,13 +37,64 @@ async function api(path, body) {
   return j;
 }
 
-// fields: [{ name, label, type, value, options: [[value, text]], hint, required, min, max }]
+// ── choosing a bank account by typing: a search box in place of a drop-down ──
+// Shows the account chosen; clicking it lists them all (like a drop-down), typing narrows the list by name, bank or
+// last 4 digits ("hdfc", "1111", "salary"). Arrow keys and Enter choose, Escape puts back what was there.
+// options: [[value, text]] ('' may be a choice too, e.g. "Not decided yet"). The element's .value is the chosen value,
+// so a form reads it like a <select>; onchange(value) is called when the choice changes.
+let pickers = 0;
+function bankPicker({ options, value = '', name, label, required, placeholder = 'Type to search accounts…', onchange }) {
+  const id = `bank-pick-${++pickers}`, opts = options.map(([v, t]) => ({ v: String(v), t: String(t) }));
+  let chosen = opts.find((o) => o.v === String(value ?? '')) ?? (required ? null : opts.find((o) => o.v === '')) ?? null;
+  let shown = [], active = -1;
+  const input = h('input', { type: 'text', role: 'combobox', 'aria-autocomplete': 'list', 'aria-expanded': 'false', 'aria-controls': id, 'aria-label': label,
+    autocomplete: 'off', spellcheck: 'false', placeholder, required, class: 'bank-pick-input' });
+  const list = h('ul', { id, role: 'listbox', class: 'bank-pick-list', hidden: true });
+  const el = h('div', { class: 'bank-pick', 'data-name': name ?? null }, input, list);
+  const words = (s) => s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const matches = (o, q) => words(q).every((w) => words(o.t).some((x) => x.startsWith(w)) || o.t.toLowerCase().replace(/[^a-z0-9]/g, '').includes(w));
+  const show = (q = '') => {
+    shown = q ? opts.filter((o) => matches(o, q)) : opts;
+    active = shown.indexOf(chosen) >= 0 && !q ? shown.indexOf(chosen) : shown.length ? 0 : -1;
+    list.replaceChildren(...(shown.length ? shown.map((o, i) => h('li', { id: `${id}-${i}`, role: 'option', 'aria-selected': String(i === active), class: [i === active && 'active', o === chosen && 'chosen'].filter(Boolean).join(' '),
+      onmousedown: (e) => { e.preventDefault(); pick(o); } }, o.t)) : [h('li', { class: 'none' }, `No account matches “${q}”`)]));
+    list.hidden = false; input.setAttribute('aria-expanded', 'true');
+    if (active >= 0) { input.setAttribute('aria-activedescendant', `${id}-${active}`); list.children[active].scrollIntoView({ block: 'nearest' }); } else input.removeAttribute('aria-activedescendant');
+  };
+  const close = () => { list.hidden = true; input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); };
+  const sync = () => { input.value = chosen ? chosen.t : ''; input.setCustomValidity(''); };
+  const pick = (o) => { const was = chosen; chosen = o; sync(); close(); if (o !== was) onchange?.(o.v); };
+  list.addEventListener('click', (e) => e.preventDefault()); // in a form the picker sits in a <label>: its click would reopen the list
+  input.addEventListener('focus', () => { input.select(); show(); });
+  input.addEventListener('click', () => { if (list.hidden) show(); });
+  input.addEventListener('input', () => { show(input.value.trim()); input.setCustomValidity(required && !input.value.trim() ? '' : 'Choose an account from the list.'); });
+  input.addEventListener('blur', () => { close(); sync(); }); // typed but not chosen: back to what was chosen
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (list.hidden) return show();
+      if (!shown.length) return;
+      active = (active + (e.key === 'ArrowDown' ? 1 : -1) + shown.length) % shown.length;
+      [...list.children].forEach((li, i) => { li.classList.toggle('active', i === active); li.setAttribute('aria-selected', String(i === active)); });
+      input.setAttribute('aria-activedescendant', `${id}-${active}`); list.children[active].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter' && !list.hidden) { e.preventDefault(); if (shown[active]) pick(shown[active]); } // choosing doesn't send the form
+    else if (e.key === 'Escape' && !list.hidden) { e.preventDefault(); e.stopPropagation(); close(); sync(); input.select(); } // (the dialog stays open)
+    else if (e.key === 'Tab' && !list.hidden && input.value.trim() && shown[active] && input.value !== chosen?.t) pick(shown[active]);
+  });
+  Object.defineProperty(el, 'value', { get: () => chosen?.v ?? '', set: (v) => { chosen = opts.find((o) => o.v === String(v)) ?? null; sync(); } });
+  el.focus = () => input.focus();
+  sync();
+  return el;
+}
+
+// fields: [{ name, label, type, value, options: [[value, text]], hint, required, min, max }] — type 'bank': a bankPicker
 function form(fields, submitLabel, onSubmit, { onCancel } = {}) {
   const err = h('p', { class: 'err', role: 'alert' });
   const inputs = {};
   const rows = fields.map((f) => {
     let input;
-    if (f.type === 'select') input = h('select', { name: f.name, required: f.required }, f.options.map(([v, t]) => h('option', { value: v, selected: String(v) === String(f.value ?? '') }, t)));
+    if (f.type === 'bank') input = bankPicker({ options: f.options, value: f.value, name: f.name, label: f.label, required: f.required, placeholder: f.placeholder });
+    else if (f.type === 'select') input = h('select', { name: f.name, required: f.required }, f.options.map(([v, t]) => h('option', { value: v, selected: String(v) === String(f.value ?? '') }, t)));
     else if (f.type === 'checkbox') return h('label', { class: 'check' }, inputs[f.name] = h('input', { type: 'checkbox', name: f.name, checked: !!f.value }), f.label);
     else input = h('input', { name: f.name, type: f.type || 'text', value: f.value ?? '', required: f.required, min: f.min, max: f.max, inputmode: f.type === 'money' ? 'decimal' : null, autocomplete: f.autocomplete || 'off', placeholder: f.placeholder });
     if (f.type === 'money') input.type = 'text';
@@ -315,7 +366,7 @@ function settleDialog(i, bankOpts) {
   const out = i.kind === 'OUT';
   openDialog(out ? `Mark paid: ${i.name}` : `Mark received: ${i.name}`, [
     { name: 'amount', label: 'Amount (₹)', type: 'money', value: rupees(i.amount), required: true, hint: `Still ${out ? 'to pay' : 'to receive'}: ${inr(i.amount)}. Enter less for a part ${out ? 'payment' : 'receipt'}.` },
-    { name: 'bank_id', label: out ? 'Paid from' : 'Received in', type: 'select', value: i.bankId ?? (bankOpts.length === 1 ? bankOpts[0][0] : ''), options: [['', 'Choose…'], ...bankOpts], required: true },
+    { name: 'bank_id', label: out ? 'Paid from' : 'Received in', type: 'bank', value: i.bankId ?? (bankOpts.length === 1 ? bankOpts[0][0] : ''), options: bankOpts, required: true },
     { name: 'date', label: 'Date in the bank', type: 'date', value: S.today, max: S.today, required: true },
     { name: 'ref', label: 'Bank reference (UTR / cheque no.)', required: true },
   ], 'Save', (v) => confirmCode('insufficient', (ok) => api(`/api/${out ? 'payments' : 'receipts'}/${i.id}/settle`, { ...v, confirmShortfall: ok })));
@@ -324,7 +375,7 @@ function settleDialog(i, bankOpts) {
 function balanceDialog(bankOpts) {
   const yesterday = addDays(S.pos.today, -1);
   openDialog('Enter bank balance', [
-    { name: 'bank_id', label: 'Account', type: 'select', options: bankOpts, required: true },
+    { name: 'bank_id', label: 'Account', type: 'bank', value: bankOpts[0]?.[0], options: bankOpts, required: true },
     { name: 'amount', label: 'Balance (₹)', type: 'money', required: true, hint: 'Use a minus sign for an overdraft, e.g. -25000.' },
     { name: 'as_of', label: 'Balance at the end of', type: 'date', value: yesterday, max: S.pos.today, required: true,
       hint: 'Normally yesterday’s closing balance (= this morning’s opening). If you take the live balance during the day, date it today: anything marked paid or received today is then treated as already in it.' },
@@ -339,7 +390,7 @@ function paymentDialog(anyBank) {
     { name: 'amount', label: 'Amount (₹)', type: 'money', required: true },
     { name: 'due_date', label: 'Pay on', type: 'date', value: S.date, required: true },
     { name: 'category', label: 'Category', type: 'select', options: CATEGORIES.map((c) => [c, c]), required: true },
-    { name: 'bank_id', label: 'Pay from', type: 'select', options: anyBank },
+    { name: 'bank_id', label: 'Pay from', type: 'bank', value: anyBank[0][0], options: anyBank },
     { name: 'ref', label: 'Invoice / bill no. (optional)' },
     { name: 'note', label: 'Note (optional)' },
     ...(can('admin') ? [{ name: 'approved', label: 'Approved', type: 'checkbox', value: true }] : []),
@@ -352,7 +403,7 @@ function receiptDialog(anyBank) {
     { name: 'amount', label: 'Amount (₹)', type: 'money', required: true },
     { name: 'expected_date', label: 'Expected on', type: 'date', value: S.date, required: true },
     { name: 'certainty', label: 'How sure', type: 'select', value: 'LIKELY', options: [['FIRM', 'Firm (confirmed)'], ['LIKELY', 'Likely'], ['UNCERTAIN', 'Uncertain']] },
-    { name: 'bank_id', label: 'Into account', type: 'select', options: anyBank },
+    { name: 'bank_id', label: 'Into account', type: 'bank', value: anyBank[0][0], options: anyBank },
     { name: 'ref', label: 'Invoice no. (optional)' },
     { name: 'note', label: 'Note (optional)' },
   ], 'Add receipt', (v) => confirmDup((dup) => api('/api/receipts', { ...v, confirmDuplicate: dup })));
@@ -497,7 +548,7 @@ function renderTransactions(sum, rows) {
       [['today', 'Today'], ['month', 'This month'], ['lastmonth', 'Last month'], ['fy', 'This financial year'], ['all', 'All time'], ['custom', 'Custom dates']].map(([v, t]) => h('option', { value: v, selected: f.preset === v }, t))),
     h('label', { class: 'check' }, 'From', h('input', { type: 'date', name: 'from', value: f.from, max: f.to, onchange: setDate('from') })),
     h('label', { class: 'check' }, 'To', h('input', { type: 'date', name: 'to', value: f.to, min: f.from, onchange: setDate('to') })),
-    h('select', { 'aria-label': 'Bank account', onchange: set('bank') }, [['', 'All bank accounts'], ...accounts.map((b) => [String(b.id), b.name])].map(([v, t]) => h('option', { value: v, selected: f.bank === v }, t))),
+    bankPicker({ label: 'Bank account', options: [['', 'All bank accounts'], ...accounts.map((b) => [String(b.id), `${b.name} — ${b.bank} XXXX${b.last4}`])], value: f.bank, onchange: (v) => { S.tf = { ...S.tf, bank: v }; load(); } }),
     h('select', { 'aria-label': 'Type', onchange: set('type') }, [['', 'Receipts and payments'], ['IN', 'Receipts only'], ['OUT', 'Payments only']].map(([v, t]) => h('option', { value: v, selected: f.type === v }, t))),
     f.view === 'records' && h('select', { 'aria-label': 'Status', onchange: set('status') }, [['', 'Any status'], ['pending', 'Yet to be paid / received'], ['partial', 'Partly settled'], ['completed', 'Completed'], ['cancelled', 'Cancelled']].map(([v, t]) => h('option', { value: v, selected: f.status === v }, t)))));
 
@@ -771,9 +822,9 @@ function renderReconcile() {
   const pasteIn = h('textarea', { name: 'pasted', rows: '4', placeholder: 'Or paste the statement here: in the bank’s email, select the table (from the column headings to the last line), copy, and paste.', 'aria-label': 'Paste the statement' });
   const step = h('section', { class: 'card rec-step' },
     h('div', { class: 'bar grow' },
-      h('label', {}, h('span', {}, 'Bank account'), h('select', { name: 'bank', onchange: (e) => { R.bankId = e.target.value; R.anyAccount = false; if (R.sent) recCheck(); } },
-        h('option', { value: '', selected: R.bankId === '' }, 'From the statement (last 4 digits of its account no.)'),
-        R.accounts.map((b) => h('option', { value: String(b.id), selected: String(b.id) === R.bankId }, `${b.name} — ${b.bank} XXXX${b.last4}`)))),
+      h('label', {}, h('span', {}, 'Bank account'), bankPicker({ name: 'bank', label: 'Bank account', value: R.bankId,
+        options: [['', 'From the statement (last 4 digits of its account no.)'], ...R.accounts.map((b) => [String(b.id), `${b.name} — ${b.bank} XXXX${b.last4}`])],
+        onchange: (v) => { R.bankId = v; R.anyAccount = false; if (R.sent) recCheck(); } })),
       h('label', {}, h('span', {}, 'Bank statement (PDF, Excel or CSV)'), fileIn)),
     R.needPassword && h('div', { class: 'bar' }, pwIn, h('button', { class: 'small primary', onclick: () => { R.password = pwIn.value; recCheck(null, true); } }, 'Open PDF')),
     h('div', { class: 'rec-paste' }, pasteIn, h('button', { class: 'small', onclick: () => { const t = pasteIn.value.trim(); if (t) recCheck(new File([t], 'pasted statement.txt', { type: 'text/plain' })); } }, 'Read pasted statement')),
@@ -1026,7 +1077,7 @@ function txDialog(kind, accounts) {
     { name: 'amount', label: 'Amount (₹)', type: 'money', required: true },
     { name: 'status', label: 'Status', type: 'select', value: 'completed', options: [['completed', out ? 'Paid — the money has left the bank' : 'Received — the money is in the bank'], ['pending', out ? 'Yet to be paid (balances not affected)' : 'Yet to be received (balances not affected)']] },
     { name: 'date', label: 'Date', type: 'date', value: S.today, required: true, hint: 'For a received / paid item, the date it went through the bank (today or earlier). For a pending one, the date it is due.' },
-    { name: 'bank_id', label: 'Bank account', type: 'select', options: [...accounts.map((b) => [b.id, `${b.name} — ${b.bank} XXXX${b.last4}`]), ['', 'Not decided yet (pending only)']], required: false },
+    { name: 'bank_id', label: 'Bank account', type: 'bank', value: accounts[0]?.id, options: [...accounts.map((b) => [b.id, `${b.name} — ${b.bank} XXXX${b.last4}`]), ['', 'Not decided yet (pending only)']], required: false },
     { name: 'bank_ref', label: 'Bank reference (UTR / cheque no.)', hint: 'Needed when it is received or paid. The same reference can’t be used twice on one account.' },
     ...(out ? [{ name: 'category', label: 'Category', type: 'select', options: CATEGORIES.map((c) => [c, c]), required: true }] : []),
     { name: 'ref', label: out ? 'Invoice / bill no. (optional)' : 'Invoice no. (optional)' },
@@ -1219,7 +1270,7 @@ function renderEmis(ov, emis, rows, rem) {
       h('div', { class: 'bar' },
         h('select', { 'aria-label': 'Schedule status', onchange: set('status') }, [['open', 'Still to pay'], ['overdue', 'Overdue'], ['due', 'Due today'], ['upcoming', 'Next 30 days'], ['scheduled', 'Later'], ['paid', 'Paid'], ['cancelled', 'Cancelled'], ['', 'Everything (incl. next 12 months)']].map(([v, t]) => h('option', { value: v, selected: f.status === v }, t))),
         h('select', { 'aria-label': 'Loan', onchange: set('emi') }, [['', 'All loans'], ...emis.map((e) => [String(e.id), e.lender + (e.active ? '' : ' (stopped)')])].map(([v, t]) => h('option', { value: v, selected: f.emi === v }, t))),
-        h('select', { 'aria-label': 'Account', onchange: set('bank') }, [['', 'All accounts'], ...ov.accounts.map((a) => [String(a.id), a.name])].map(([v, t]) => h('option', { value: v, selected: f.bank === v }, t))))),
+        bankPicker({ label: 'Account', options: [['', 'All accounts'], ...ov.accounts.map((a) => [String(a.id), `${a.name} — ${a.bank}`])], value: f.bank, onchange: (v) => { S.ef = { ...S.ef, bank: v }; load(); } }))),
     rows.length ? h('div', { class: 'scroll' }, h('table', { class: 'tx' },
       h('thead', {}, h('tr', {}, h('th', {}, 'Due date'), h('th', {}, 'Loan'), h('th', {}, 'Account'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'Paid'), h('th', {}, 'Status'), can('editor') && h('th', {}, ''))),
       h('tbody', {}, rows.map((r) => {
@@ -1289,7 +1340,7 @@ function emiForm(bankOpts) {
   openDialog('Add an EMI', [
     { name: 'lender', label: 'Lender / loan', placeholder: 'e.g. HDFC car loan', required: true },
     { name: 'amount', label: 'EMI amount (₹)', type: 'money', required: true },
-    { name: 'bank_id', label: 'Paid from account', type: 'select', options: bankOpts, required: true },
+    { name: 'bank_id', label: 'Paid from account', type: 'bank', value: bankOpts[0]?.[0], options: bankOpts, required: true },
     { name: 'start_date', label: 'Next EMI date', type: 'date', min: addDays(S.today, -31), required: true, hint: 'It repeats on this day every month (the last day in shorter months).' },
     { name: 'end_date', label: 'Last EMI date (optional)', type: 'date' },
     { name: 'ref', label: 'Loan account no. (optional)' },
