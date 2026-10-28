@@ -17,7 +17,7 @@ const COLUMNS = {
   drcr: ['drcr', 'crdr', 'type', 'debitcredit', 'transactiontype'],
   balance: ['closingbalance', 'balance', 'balanceinr', 'availablebalance', 'runningbalance'],
 };
-function matchHeader(cells) {
+export function matchHeader(cells) {
   const heads = cells.map(norm), used = new Set(), cols = {};
   for (const [key, names] of Object.entries(COLUMNS)) {
     for (const name of names) {

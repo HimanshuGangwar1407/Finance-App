@@ -152,7 +152,7 @@ async function load() {
   if (!was) {
     const st = await who;
     if (gone(st)) { S.user = null; fresh(); return boot(); }
-    if (st) { S.user = st.user; S.ai = Boolean(st.ai); newDay(st); }
+    if (st) { S.user = st.user; S.ai = Boolean(st.ai); S.docsumo = Boolean(st.docsumo); newDay(st); }
   }
   if ((S.view === 'activity' || S.view === 'users') && !can('admin')) S.view = 'position';
   if (S.view === 'reconcile' && !can('editor')) S.view = 'position';
@@ -161,7 +161,7 @@ async function load() {
     const st = await who;
     if (gone(st)) { await page; if (S.user) { S.user = null; fresh(); boot(); } return; } // (a refused request may already have signed out)
     if (st) {
-      S.user = st.user; S.ai = Boolean(st.ai);
+      S.user = st.user; S.ai = Boolean(st.ai); S.docsumo = Boolean(st.docsumo);
       // the role changed, or the day did: open the page again as it now is
       if (`${st.user.id}|${st.user.role}` !== was || newDay(st)) { await page; return load(); }
     }
@@ -712,11 +712,13 @@ async function recCheck(file, keepNote = false) {
     if (file) {
       if (file.size > 3 * 1024 * 1024) throw new Error('That file is too big. Upload at most 3 MB.');
       R.sent = { file: await toBase64(file), name: file.name };
-      R.file = file; R.password = ''; R.needPassword = false; R.aiNote = ''; R.anyAccount = false;
-      // a photo or screenshot of a statement: only the AI reads those
+      R.file = file; R.password = ''; R.needPassword = false; R.aiNote = ''; R.anyAccount = false; R.unreadable = false;
+      // a photo or screenshot of a statement: this page can't read those itself — the AI or Docsumo does
       if (/^image\//.test(file.type)) {
-        if (!S.ai) throw new Error('A photo of a statement can only be read with AI reading, which isn’t set up for this app. Upload the PDF, Excel or CSV statement, or paste it.');
-        return await recAi(true);
+        R.unreadable = true;
+        if (S.ai) return await recAi(true);
+        throw new Error(S.docsumo ? 'This page can’t read a photo of a statement itself. Read it with Docsumo (below).'
+          : 'A photo of a statement can only be read with AI reading, which isn’t set up for this app. Upload the PDF, Excel or CSV statement, or paste it.');
       }
     }
     try {
@@ -724,7 +726,8 @@ async function recCheck(file, keepNote = false) {
     } catch (e) {
       // a picture of a statement (no text in the PDF): read it here with OCR, then check what was read
       if (e.code !== 'pdf_no_text' || !file) throw e;
-      R.sent.ocr = await ocrPdf(file, R.password, (msg) => { R.progress = msg; renderReconcile(); });
+      R.sent.ocr = await ocrPdf(file, R.password, (msg) => { R.progress = msg; renderReconcile(); })
+        .catch((x) => { throw Object.assign(x, { detail: { unreadable: true } }); });
       R.progress = '';
       R.data = await api('/api/reconcile/check', { ...R.sent, password: R.password, bank_id: R.bankId, anyAccount: R.anyAccount });
     }
@@ -739,6 +742,7 @@ function recFailed(e) {
   const R = S.rec;
   R.err = e.message; R.data = null; R.progress = '';
   R.mismatch = e.code === 'account_mismatch' ? e.detail ?? {} : null;
+  if (e.detail?.unreadable) R.unreadable = true; // this page's own reader couldn't read it: Docsumo is offered
 }
 // what each statement line starts as: its matched payment / receipt; money that came in and matches nothing is set to
 // be recorded as a new receipt (so Apply brings the account to the bank's position) — unless it might be one of the
@@ -756,6 +760,30 @@ async function recAi(busy = false) {
     const r = await api('/api/reconcile/ai-read', { file: R.sent.file, name: R.sent.name });
     R.sent = { file: R.sent.file, name: R.sent.name, lines: r.lines, account: r.account };
     R.aiNote = r.note;
+    R.progress = 'Checking what was read…'; renderReconcile();
+    R.data = await api('/api/reconcile/check', { ...R.sent, bank_id: R.bankId, anyAccount: R.anyAccount });
+    R.choice = firstChoices(R.data);
+    R.payee = new Map(); R.left = new Map(); R.leftIn = new Map(); R.saveBalance = false;
+  } catch (e) { recFailed(e); }
+  R.progress = ''; R.busy = false; renderReconcile();
+}
+// read the chosen file with Docsumo — only offered when this page couldn't read it: Docsumo reads in the background,
+// so the file is sent, then asked for every few seconds until it is read; its lines are checked like any other statement
+async function recDocsumo() {
+  const R = S.rec, { file, name } = R.sent;
+  R.err = ''; R.mismatch = null; R.note = ''; R.busy = true;
+  R.progress = 'Sending the statement to Docsumo…'; renderReconcile();
+  try {
+    const { docId } = await api('/api/reconcile/docsumo-read', { file, name });
+    let r = { ready: false };
+    for (let i = 0; !r.ready; i++) {
+      if (i >= 100) throw new Error('Docsumo is taking too long to read this statement. Try again in a few minutes.');
+      R.progress = `Docsumo is reading the statement — this can take a minute or two${i ? ` (${i * 3} s)` : ''}…`; renderReconcile();
+      await new Promise((ok) => setTimeout(ok, i ? 3000 : 1500));
+      r = await api('/api/reconcile/docsumo-result', { docId, name });
+    }
+    R.sent = { file, name, lines: r.lines, account: r.account, reader: 'docsumo' };
+    R.aiNote = '';
     R.progress = 'Checking what was read…'; renderReconcile();
     R.data = await api('/api/reconcile/check', { ...R.sent, bank_id: R.bankId, anyAccount: R.anyAccount });
     R.choice = firstChoices(R.data);
@@ -811,13 +839,23 @@ const CHARGE = /charge|chrg|chgs|commission|\bfee\b|fees|gst|service\s*tax|sms\s
 
 function renderReconcile() {
   const R = S.rec, D = R.data;
-  const fileIn = h('input', { type: 'file', name: 'statement', accept: `.pdf,.xlsx,.csv,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv${S.ai ? ',.png,.jpg,.jpeg,image/png,image/jpeg' : ''}`, onchange: (e) => e.target.files[0] && recCheck(e.target.files[0]) });
+  const fileIn = h('input', { type: 'file', name: 'statement', accept: `.pdf,.xlsx,.csv,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv${S.ai || S.docsumo ? ',.png,.jpg,.jpeg,image/png,image/jpeg' : ''}${S.docsumo ? ',.tif,.tiff,image/tiff' : ''}`, onchange: (e) => e.target.files[0] && recCheck(e.target.files[0]) });
   // AI reading: offered for a PDF or a photo once one is chosen, most of all when OCR couldn't confirm every line
   const canAi = S.ai && R.file && /pdf|image/.test(R.file.type || (/\.pdf$/i.test(R.file.name) ? 'pdf' : '')) && !R.busy && !D?.ai;
   const aiOffer = canAi && h('div', { class: `rec-ai ${D?.checked && D.checked.ok < D.checked.of ? 'urge' : ''}` },
     h('button', { class: 'small primary', onclick: () => recAi() }, D ? '✨ Read it with AI instead' : '✨ Read with AI'),
     h('span', { class: 'muted small' }, D?.checked && D.checked.ok < D.checked.of ? 'Some lines don’t add up — Claude (AI) may read them better. ' : R.err ? 'Claude (AI) can read PDFs this page can’t, and photos of statements. ' : '',
       'The statement is sent to Anthropic to be read; the figures are checked against the running balance as usual.'));
+  // Docsumo: only for a PDF or photo this page couldn't read itself — not read, or read with lines that don't add up
+  const ownMisread = D && !D.ai && !D.docsumo && D.checked && D.checked.ok < D.checked.of;
+  const docFile = R.file && /pdf|image/.test(R.file.type || (/\.(pdf|png|jpe?g|tiff?)$/i.test(R.file.name) ? 'pdf' : ''));
+  const canDocsumo = docFile && !R.busy && !D?.docsumo && (R.unreadable || ownMisread);
+  const docsumoOffer = canDocsumo && (S.docsumo
+    ? h('div', { class: 'rec-ai urge' },
+      h('button', { class: 'small primary', onclick: () => recDocsumo() }, D ? 'Read it with Docsumo instead' : 'Read with Docsumo'),
+      h('span', { class: 'muted small' }, ownMisread ? 'Some lines this page read don’t add up — Docsumo may read them better. ' : 'This page couldn’t read this statement itself — Docsumo can. ',
+        'The statement is sent to Docsumo to be read; the figures are checked against the running balance as usual.'))
+    : can('admin') && h('p', { class: 'muted small' }, 'Reading with Docsumo (for statements this page can’t read) is off: add a DOCSUMO_API_KEY to the app’s settings to turn it on.'));
   const pwIn = h('input', { type: 'password', name: 'pdfPassword', autocomplete: 'off', placeholder: 'PDF password', 'aria-label': 'PDF password' });
   const pasteIn = h('textarea', { name: 'pasted', rows: '4', placeholder: 'Or paste the statement here: in the bank’s email, select the table (from the column headings to the last line), copy, and paste.', 'aria-label': 'Paste the statement' });
   const step = h('section', { class: 'card rec-step' },
@@ -838,6 +876,10 @@ function renderReconcile() {
         ? (D.checked.ok === D.checked.of ? `The running balance confirms all ${D.checked.of} lines.` : `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below and aren’t matched automatically; check them against the statement.`)
         : 'The statement has no balance column to check the figures against — compare the amounts with the statement before applying.',
       R.aiNote ? ` The AI noted: “${R.aiNote}”` : '')),
+    D?.docsumo && h('p', { class: `rec-ocr ${D.checked && D.checked.ok < D.checked.of ? 'warn' : ''}` }, icon(D.checked && D.checked.ok === D.checked.of ? 'check' : 'alert'),
+      h('span', {}, 'Read by Docsumo (this page couldn’t read it). ', D.checked
+        ? (D.checked.ok === D.checked.of ? `The running balance confirms all ${D.checked.of} lines.` : `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below and aren’t matched automatically; check them against the statement.`)
+        : 'The statement has no balance column to check the figures against — compare the amounts with the statement before applying.')),
     D?.ocr && h('p', { class: `rec-ocr ${D.checked && D.checked.ok < D.checked.of ? 'warn' : ''}` }, icon(D.checked && D.checked.ok === D.checked.of ? 'check' : 'alert'),
       h('span', {}, 'Read from a picture of the statement (OCR). ', D.checked
         ? (D.checked.ok === D.checked.of ? `The running balance confirms all ${D.checked.of} lines.` : `The running balance confirms ${D.checked.ok} of ${D.checked.of} lines — the others are flagged below and aren’t matched automatically; check them against the statement.`)
@@ -853,6 +895,7 @@ function renderReconcile() {
       R.mismatch.suggest && h('button', { class: 'small primary', onclick: () => { R.bankId = String(R.mismatch.suggest); R.anyAccount = false; recCheck(null, true); } },
         `Use ${R.accounts.find((b) => b.id === R.mismatch.suggest)?.name ?? 'that account'} (XXXX${R.mismatch.last4})`),
       h('button', { class: 'small', onclick: () => { R.anyAccount = true; recCheck(null, true); } }, 'Reconcile with the chosen account anyway')),
+    docsumoOffer,
     aiOffer,
     !S.ai && can('admin') && h('p', { class: 'muted small' }, 'AI reading (for statements this page can’t read, and photos of statements) is off: add an ANTHROPIC_API_KEY to the app’s settings to turn it on.'));
   if (!R.accounts.length) return app.replaceChildren(topBar(), pageHead('Reconcile with the bank statement', ''), h('div', { class: 'card' }, h('p', { class: 'empty' }, 'Add a bank account first (Banks → “+ Add bank account”).')));
@@ -1475,7 +1518,7 @@ const ACTION_LABELS = {
   'position.add': 'Added a position', 'position.edit': 'Edited a position', 'position.activate': 'Activated a position', 'position.deactivate': 'Deactivated a position',
   'payment.add': 'Added a payment', 'payment.paid': 'Marked a payment paid', 'payment.approve': 'Approved a payment', 'payment.cancel': 'Cancelled a payment',
   'receipt.add': 'Added a receipt', 'receipt.received': 'Marked a receipt received', 'receipt.cancel': 'Cancelled a receipt',
-  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account', 'bank.delete': 'Deleted a bank account', 'bank.import': 'Uploaded bank accounts from a sheet', 'reconcile.apply': 'Reconciled a bank statement', 'reconcile.ai_read': 'Had a statement read by AI', 'payment.reschedule': 'Moved a payment’s due date', 'payment.delete': 'Deleted a payment', 'receipt.delete': 'Deleted a receipt',
+  'import.add': 'Uploaded payments / receipts from a sheet', 'emi.add': 'Added an EMI', 'emi.stop': 'Stopped an EMI', 'balance.add': 'Entered a bank balance', 'bank.add': 'Added a bank account', 'bank.delete': 'Deleted a bank account', 'bank.import': 'Uploaded bank accounts from a sheet', 'reconcile.apply': 'Reconciled a bank statement', 'reconcile.ai_read': 'Had a statement read by AI', 'reconcile.docsumo_read': 'Had a statement read by Docsumo', 'payment.reschedule': 'Moved a payment’s due date', 'payment.delete': 'Deleted a payment', 'receipt.delete': 'Deleted a receipt',
 };
 const actionTone = (a) => (/failed|locked/.test(a) ? 'c-red' : /^(login|logout|setup|admin)/.test(a) ? 'c-blue' : /^(person|position|user)/.test(a) ? 'c-violet' : /cancel|deactivate|stop|delete/.test(a) ? 'c-red' : 'c-amber');
 // a short, readable summary of what was recorded
@@ -1485,6 +1528,7 @@ function describe(a, positions) {
   if (a.action === 'emi.reminders') return `${d.reminders ?? 0} due · ${d.inApp ?? 0} in-app · ${d.queued ?? 0} email(s) queued · ${d.sent ?? 0} sent${d.via ? ' · daily schedule' : ''}`;
   if (a.action === 'signup.request') return `${d.email} · ${!d.matched ? 'not in People (nothing sent)' : d.emailed === 'sent' ? `link emailed (${d.role})` : d.emailed === 'not set up' ? 'email not set up: admins notified' : `email ${d.emailed}`}`;
   if (a.action === 'reconcile.ai_read') return `${d.file || 'statement'} · ${d.lines} line(s) read · ${d.model}`;
+  if (a.action === 'reconcile.docsumo_read') return `${d.file || 'statement'} · ${d.lines} line(s) read by Docsumo`;
   if (a.action === 'reconcile.apply') return [`${d.bank} · ${d.from} to ${d.to}`, d.paid && `${d.paid} paid ${inr(d.paidAmount)}`, d.recorded && `${d.recorded} recorded as new`, d.received && `${d.received} received ${inr(d.receivedAmount)}`, d.recordedIn && `${d.recordedIn} receipt(s) recorded as new`,
     (d.assigned || d.assignedIn) && `${(d.assigned || 0) + (d.assignedIn || 0)} with no account put in ${d.bank}`, d.today && `${d.today} to today`, d.tomorrow && `${d.tomorrow} to next day`, d.cancelled && `${d.cancelled} cancelled`, d.balanceSaved && 'balance saved'].filter(Boolean).join(' · ');
   if (a.action === 'payment.reschedule') return `${d.payee} · ${inr(d.amount)} · ${d.from} → ${d.to}`;

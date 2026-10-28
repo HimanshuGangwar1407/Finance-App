@@ -17,6 +17,7 @@ import { toCsv, toXlsx } from './export.js';
 import { readTable, importRows, bankRows, MAX_BYTES } from './sheet.js';
 import { readStatement, matchStatement, lineRef, guessPayee } from './reconcile.js';
 import { readWithAi, tableFromLines, aiConfigured } from './ai.js';
+import { startDocsumo, docsumoResult, docsumoConfigured } from './docsumo.js';
 import { dueReminders, projectDates, coverage, DEFAULT_BEFORE } from './reminders.js';
 import { emailConfigured, sendEmail } from './email.js';
 import * as A from './auth.js';
@@ -527,9 +528,17 @@ async function reconcileCheck(c, body) {
   const isPdf = buf.subarray(0, 5).toString('latin1') === '%PDF-';
   // a picture-only PDF is read in the browser (OCR): its words and their places come with the file
   const pdf = isPdf || body.ocr ? await import('./pdf.js') : null;
-  // or the lines the AI read from it (POST /api/reconcile/ai-read), sent back with the file
-  const st = readStatement(body.lines ? tableFromLines(body.lines, body.account) : body.ocr ? pdf.tableFromPages(pdf.ocrPages(body.ocr))
-    : isPdf ? await pdf.readPdf(buf, str(body.password, 100)) : readTable(buf, str(body.name, 200)));
+  // or the lines the AI / Docsumo read from it (POST /api/reconcile/ai-read, /docsumo-read), sent back with the file
+  const fromLines = Array.isArray(body.lines), byDocsumo = fromLines && body.reader === 'docsumo';
+  let st;
+  try {
+    st = readStatement(fromLines ? tableFromLines(body.lines, body.account) : body.ocr ? pdf.tableFromPages(pdf.ocrPages(body.ocr))
+      : isPdf ? await pdf.readPdf(buf, str(body.password, 100)) : readTable(buf, str(body.name, 200)));
+  } catch (e) {
+    // the app's own reader couldn't make sense of the file: the one time Docsumo is offered
+    if (!fromLines && e.code === 'invalid_argument') e.detail = { unreadable: true };
+    throw e;
+  }
   if (st.to > todayIST()) bad(`The statement has dates after today (${st.to}). Check that it is the right file.`);
 
   // the account: the one whose last 4 digits are the statement's account number. One chosen by hand must agree with
@@ -597,7 +606,7 @@ async function reconcileCheck(c, body) {
   const due = (list) => list.filter((p) => p.due_date <= st.to && (p.bank_id === bankId || p.bank_id == null)).map((p) => p.id);
   return {
     // account: the statement's own number (last 4), and whether the account was found by it or chosen by hand
-    bank, account: { last4, by: chosen ? 'chosen' : 'statement', agrees: last4 ? bank.last4 === last4 : null }, fileName: str(body.name, 200), ocr: Boolean(body.ocr) && !body.lines, ai: Boolean(body.lines), checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
+    bank, account: { last4, by: chosen ? 'chosen' : 'statement', agrees: last4 ? bank.last4 === last4 : null }, fileName: str(body.name, 200), ocr: Boolean(body.ocr) && !fromLines, ai: fromLines && !byDocsumo, docsumo: byDocsumo, checked: st.checked, from: st.from, to: st.to, columns: st.columns, skipped: st.skipped, closing: st.closing,
     opening: st.opening, appClosing: app.closing, balanceEntered: app.balanceEntered,
     debits: debits.map((d) => line(d, d.debit, outMatch)), credits: credits.map((d) => line(d, d.credit, inMatch)),
     payments, receipts, due: due(payments), dueIn: due(receipts),
@@ -651,7 +660,7 @@ const signIn = (ctx, user) => ctx.headers.push(['Set-Cookie', A.cookieHeader(A.m
 const routes = [
   ['GET', /^\/api\/state$/, null, async ({ user }) => {
     const { rows: [{ n }] } = await q('SELECT count(*)::int AS n FROM users');
-    return { needsSetup: n === 0, user, today: todayIST(), ai: aiConfigured() };
+    return { needsSetup: n === 0, user, today: todayIST(), ai: aiConfigured(), docsumo: docsumoConfigured() };
   }],
 
   // the first person to open the app creates the admin account
@@ -951,6 +960,21 @@ const routes = [
     const r = await readWithAi(buf, str(body.name, 200));
     await log(user.id, 'reconcile.ai_read', { file: r.file, model: r.model, lines: r.table.rows.length - 1, tokens: r.usage });
     return { lines: r.table.rows.map((x) => x.cells), account: r.account, note: r.note };
+  }],
+
+  // read a statement this app can't read itself (with Docsumo): the file is sent, then asked for until it is read;
+  // its lines then go to check / apply like the AI's
+  ['POST', /^\/api\/reconcile\/docsumo-read$/, 'editor', async ({ body }) => {
+    const file = String(body.file ?? '');
+    if (!file || !/^[A-Za-z0-9+/=\s]+$/.test(file)) bad('Choose the bank statement file.');
+    const buf = Buffer.from(file, 'base64');
+    if (buf.length > MAX_BYTES) bad('That file is too big. Upload at most 3 MB.');
+    return startDocsumo(buf, str(body.name, 200));
+  }],
+  ['POST', /^\/api\/reconcile\/docsumo-result$/, 'editor', async ({ body, user }) => {
+    const r = await docsumoResult(body.docId);
+    if (r.ready) await log(user.id, 'reconcile.docsumo_read', { file: str(body.name, 200), doc: str(body.docId, 100), lines: r.lines.length - 1 });
+    return r;
   }],
 
   // apply what was chosen, money out and money in: matched lines are recorded as paid / received (dated as in the
