@@ -171,7 +171,7 @@ export function parseDate(v, base1904 = false) {
 
 // an amount cell: a number, or text like "₹ 1,25,000.50", "Rs. 500", "(500)" or "500 Dr"
 function amountOf(v) {
-  if (typeof v === 'number') { if (!Number.isFinite(v)) return { error: 'isn’t a number' }; return { paise: Math.round(v * 100) }; }
+  if (typeof v === 'number') { if (!Number.isFinite(v)) return { error: 'isn’t a number' }; if (Math.abs(v) >= 1e13) return { error: 'is too large' }; return { paise: Math.round(v * 100) }; }
   const s = String(v ?? '').trim().replace(/\s*(dr|cr)\.?$/i, '').replace(/^\((.*)\)$/, '-$1');
   if (!s) return { paise: null };
   try { return { paise: toPaise(s, 'Amount', { allowNegative: true }) }; } catch { return { error: `“${String(v).slice(0, 30)}” isn’t an amount` }; }

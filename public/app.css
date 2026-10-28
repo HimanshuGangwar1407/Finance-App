@@ -173,6 +173,8 @@ tr.inactive td, .pos-row.inactive { opacity: .6; }
 .seg button { border: 0; background: transparent; color: var(--muted); }
 .seg button.on { background: var(--card); color: var(--text); box-shadow: var(--shadow); }
 table.tx { min-width: 760px; }
+table.tx .chip { display: inline-block; white-space: nowrap; } /* "Yet to be received" on one line, never broken between letters */
+table.tx td.tx-id { min-width: 0; white-space: nowrap; } /* a short ID (R-12, T-00042): its room goes to the name and the buttons */
 table.tx tfoot td { font-weight: 600; }
 
 /* ── app shell: fixed left sidebar and a header with the reminders bell ── */

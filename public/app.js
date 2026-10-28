@@ -96,10 +96,12 @@ async function load() {
   const was = S.user && `${S.user.id}|${S.user.role}`;
   const who = api('/api/state').catch(() => null); // null: offline for a moment — the page itself will say so
   const gone = (st) => st && !st.user;
+  // a page left open past midnight moves on to the new day (dates before today are refused for the position)
+  const newDay = (st) => { const moved = st.today !== S.today; S.today = st.today; if (!S.date || S.date < st.today) S.date = st.today; return moved; };
   if (!was) {
     const st = await who;
     if (gone(st)) { S.user = null; fresh(); return boot(); }
-    if (st) { S.user = st.user; S.ai = Boolean(st.ai); }
+    if (st) { S.user = st.user; S.ai = Boolean(st.ai); newDay(st); }
   }
   if ((S.view === 'activity' || S.view === 'users') && !can('admin')) S.view = 'position';
   if (S.view === 'reconcile' && !can('editor')) S.view = 'position';
@@ -109,7 +111,8 @@ async function load() {
     if (gone(st)) { await page; if (S.user) { S.user = null; fresh(); boot(); } return; } // (a refused request may already have signed out)
     if (st) {
       S.user = st.user; S.ai = Boolean(st.ai);
-      if (`${st.user.id}|${st.user.role}` !== was) { await page; return load(); } // the role changed: open the page again as it now is
+      // the role changed, or the day did: open the page again as it now is
+      if (`${st.user.id}|${st.user.role}` !== was || newDay(st)) { await page; return load(); }
     }
   }
   const e = await page;
