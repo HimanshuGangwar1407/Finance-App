@@ -15,14 +15,16 @@ let fetcher = null;
 /** tests put a stand-in for fetch here */
 export function setDocsumoFetch(f) { fetcher = f; docType = null; }
 
+// path: under BASE, or a whole https://app.docsumo.com/… address (some of Docsumo's endpoints live elsewhere)
 async function call(path, init = {}) {
   if (!docsumoConfigured()) fail('Reading with Docsumo isn’t set up: add a DOCSUMO_API_KEY in the app’s settings (on Vercel: Settings → Environment Variables), then redeploy.', 'docsumo_not_configured');
   let r;
   try {
-    r = await (fetcher ?? fetch)(BASE + path, { ...init, headers: { apikey: process.env.DOCSUMO_API_KEY, ...init.headers }, signal: AbortSignal.timeout(40_000) });
+    r = await (fetcher ?? fetch)(path.startsWith('https://') ? path : BASE + path, { ...init, headers: { apikey: process.env.DOCSUMO_API_KEY.trim(), ...init.headers }, signal: AbortSignal.timeout(40_000) });
   } catch { fail('Docsumo didn’t answer. Try again.', 'docsumo_unavailable', 502); }
   let body = null;
   try { body = await r.json(); } catch {}
+  if (r.status >= 400) console.error('docsumo', init.method ?? 'GET', path.replace(/^https:\/\/[^/]+/, ''), r.status, JSON.stringify(body)?.slice(0, 500));
   if (r.status === 401 || r.status === 403) fail('Docsumo refused the DOCSUMO_API_KEY. Check it in the app’s settings.', 'docsumo_not_configured');
   if (r.status === 429) fail('Docsumo is busy right now. Try again in a minute.', 'docsumo_busy', 429);
   if (r.status >= 400 && r.status < 500) fail(`Docsumo couldn’t take this file: ${str(body?.error || body?.message || `error ${r.status}`, 200)}`);
@@ -30,15 +32,26 @@ async function call(path, init = {}) {
   return { status: r.status, body };
 }
 
-// the document type to read it as: set by hand, or the account's bank-statement type (looked up once)
+// the document type to read it as: set by hand (DOCSUMO_DOC_TYPE), or the account's bank-statement type, looked up
+// once — from the account's types, else its enabled types; an Indian / general one before a US one
 let docType = null;
-async function statementType() {
-  if (process.env.DOCSUMO_DOC_TYPE) return process.env.DOCSUMO_DOC_TYPE;
+export async function statementType() {
+  if (process.env.DOCSUMO_DOC_TYPE) return process.env.DOCSUMO_DOC_TYPE.trim();
   if (docType) return docType;
-  const types = (await call('/limit/')).body?.data?.document_types ?? [];
-  const t = types.find((x) => /bank/i.test(`${x.title} ${x.value}`) && /statement/i.test(`${x.title} ${x.value}`));
-  if (!t?.value) fail('Your Docsumo account has no bank statement document type turned on. Turn one on in Docsumo, or set DOCSUMO_DOC_TYPE in the app’s settings.', 'docsumo_not_configured');
-  return (docType = String(t.value));
+  const lists = [
+    async () => (await call('/limit/')).body?.data?.document_types ?? [],
+    async () => (await call('https://app.docsumo.com/api/v1/mew/documents/types/')).body?.data?.document ?? [],
+  ];
+  const seen = [];
+  for (const list of lists) {
+    let types = [];
+    try { types = (await list()).map((x) => ({ title: str(x.title, 100), value: str(x.value ?? x.doc_type, 100) })).filter((x) => x.value); } catch (e) { if (e.code !== 'invalid_argument') throw e; continue; } // only a list Docsumo hasn't got is passed over
+    seen.push(...types.map((x) => x.title || x.value));
+    const bank = types.filter((x) => /bank|statement/i.test(`${x.title} ${x.value}`) && /statement|stmt/i.test(`${x.title} ${x.value}`));
+    const t = bank.find((x) => /india|\bin_/i.test(`${x.title} ${x.value}`)) ?? bank.find((x) => !/\bus\b|^us_/i.test(`${x.title} ${x.value}`)) ?? bank[0];
+    if (t) return (docType = t.value);
+  }
+  fail(`Your Docsumo account has no bank statement document type${seen.length ? ` (it has: ${[...new Set(seen)].slice(0, 8).join(', ')})` : ''}. Turn one on in Docsumo, or set DOCSUMO_DOC_TYPE in the app’s settings to the type to use.`, 'docsumo_not_configured');
 }
 
 /** file: Buffer of a PDF, PNG, JPEG or TIFF → { docId } (Docsumo starts reading it) */
@@ -65,19 +78,40 @@ export async function startDocsumo(buf, fileName = '') {
 const val = (c) => (c && typeof c === 'object' && !Array.isArray(c) ? c.value : c);
 const text = (v) => (v == null ? '' : String(v).replace(/\s+/g, ' ').trim());
 const isRow = (x) => x && typeof x === 'object' && !Array.isArray(x);
-// every table (an array of rows, each { column: { value } }) and every single field, wherever they are in the answer
+const isCell = (x) => isRow(x) && 'value' in x;
+// every table and every single field, wherever they are in the answer. A table: an array of rows, each
+// { column: { value } } or { column: value }; or { headers / columns: [names], rows: [[cells]] }
 function walk(node, tables, fields, key = '') {
   if (Array.isArray(node)) {
-    if (node.length && node.every(isRow) && node.some((r) => Object.values(r).some((c) => isRow(c) && 'value' in c))) tables.push(node);
+    if (node.length && node.every(isRow) && !node.every(isCell)) tables.push(node);
     else for (const x of node) walk(x, tables, fields);
   } else if (isRow(node)) {
-    if ('value' in node && !Array.isArray(node.value) && !isRow(node.value)) fields.push([key, text(node.value)]);
+    const heads = node.headers ?? node.columns ?? node.header;
+    if (Array.isArray(heads) && Array.isArray(node.rows) && node.rows.every(Array.isArray)) {
+      const names = heads.map((h) => text(val(h)));
+      tables.push(node.rows.map((r) => Object.fromEntries(names.map((n, i) => [n, r[i]]))));
+    } else if (isCell(node) && !Array.isArray(node.value) && !isRow(node.value)) fields.push([key, text(node.value)]);
     else for (const [k, v] of Object.entries(node)) walk(v, tables, fields, k);
-  }
+  } else if (key && (typeof node === 'string' || typeof node === 'number')) fields.push([key, text(node)]);
 }
+// what Docsumo sent, in a few words (said when it can't be used, so it can be looked into)
+const describe = (data) => (isRow(data) ? Object.entries(data).slice(0, 10).map(([k, v]) => (Array.isArray(v)
+  ? `${k} (${v.length} rows: ${[...new Set(v.filter(isRow).flatMap((r) => Object.keys(r)))].slice(0, 8).join(', ')})` : k)).join('; ') : typeof data);
 // columns by heading: the statement reader's names first, then any heading that contains one of these words
-const LOOSE = { date: /date|\bdt\b/i, narration: /narration|descr|particular|detail|remark/i, ref: /ref|che?q|chq|utr/i,
-  debit: /withdraw|debit|\bdr\b/i, credit: /deposit|credit|\bcr\b/i, amount: /amount|amt/i, drcr: /dr.?cr|cr.?dr|type/i, balance: /balance|bal\b/i };
+const LOOSE = { date: /date|\bdt\b/i, narration: /narration|descr|particular|detail|remark|memo|transaction$/i, ref: /ref|che?q|chq|utr/i,
+  debit: /withdraw|debit|\bdr\b|money\s*out|paid\s*out|outflow/i, credit: /deposit|credit|\bcr\b|money\s*in|paid\s*in|inflow/i,
+  amount: /amount|amt/i, drcr: /dr.?cr|cr.?dr|type|direction/i, balance: /balance|bal\b/i };
+// dates written with numbers, all in the same order: day first, or month first (as Docsumo may write them, US-style
+// "10/21/2026") — told apart by a part over 12, else by which keeps the statement in date order → "2026-10-21"
+const NUM_DATE = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})$/;
+export function isoDates(dates) {
+  const parts = dates.map((d) => NUM_DATE.exec(d)), nums = parts.filter(Boolean);
+  if (!nums.length) return dates;
+  const iso = (m, us) => { const y = m[3].length === 2 ? `20${m[3]}` : m[3], [d, mo] = us ? [m[2], m[1]] : [m[1], m[2]]; return `${y}-${mo.padStart(2, '0')}-${d.padStart(2, '0')}`; };
+  const inOrder = (us) => { const k = nums.map((m) => iso(m, us)); return k.every((x, i) => !i || k[i - 1] <= x) || k.every((x, i) => !i || k[i - 1] >= x); };
+  const us = nums.some((m) => +m[1] > 12) ? false : nums.some((m) => +m[2] > 12) ? true : !inOrder(false) && inOrder(true);
+  return dates.map((d, i) => (parts[i] ? iso(parts[i], us) : d));
+}
 function columnsOf(heads) {
   const exact = matchHeader(heads);
   if (exact) return exact;
@@ -99,20 +133,25 @@ export function linesFromDocsumo(data) {
     const heads = [...new Set(t.flatMap((r) => Object.keys(r)))], cols = columnsOf(heads);
     if (cols && (!best || t.length > best.t.length)) best = { t, heads, cols };
   }
-  if (!best) fail('Docsumo didn’t find a table of transactions in this file. Check that it is a bank statement.', 'docsumo_unreadable');
+  if (!best) {
+    console.error('docsumo: no transactions table in', JSON.stringify(data)?.slice(0, 2000));
+    fail(`Docsumo didn’t find a table of transactions in this file. Check that it is a bank statement. (Docsumo returned: ${str(describe(data), 300) || 'nothing'})`, 'docsumo_unreadable');
+  }
   const { t, heads, cols } = best;
   const cell = (r, k) => (cols[k] == null ? '' : text(val(r[heads[cols[k]]])));
-  const lines = [['Date', 'Narration', 'Ref No.', 'Withdrawal', 'Deposit', 'Balance']];
+  const rows = [];
   for (const r of t.slice(0, 5000)) {
     let out = cell(r, 'debit'), inn = cell(r, 'credit');
-    if (cols.debit == null && cols.credit == null) { // one amount column: by its Dr / Cr, or its sign
+    if (cols.debit == null && cols.credit == null) { // one amount column: by its Dr / Cr (debit, withdrawal…), or its sign
       const a = cell(r, 'amount'), kind = cell(r, 'drcr');
-      if (/^-|^\(|\bdr\.?$/i.test(a) || /^d/i.test(kind)) out = a.replace(/^-|^\((.*)\)$/g, '$1'); else inn = a;
+      if (/^-|^\(|\bdr\.?$/i.test(a) || /^(d|w|out|paid|payment)/i.test(kind)) out = a.replace(/^-|^\((.*)\)$/g, '$1'); else inn = a;
     } else if (cols.debit == null && cols.credit != null && cols.amount != null && !inn) out = cell(r, 'amount');
     const line = [cell(r, 'date'), cell(r, 'narration'), cell(r, 'ref'), out, inn, cell(r, 'balance')].map((s) => s.slice(0, 300));
-    if (line.some(Boolean)) lines.push(line);
+    if (line.some(Boolean)) rows.push(line);
   }
-  if (lines.length < 2) fail('Docsumo didn’t find any transactions in this file.', 'docsumo_unreadable');
+  if (!rows.length) fail(`Docsumo didn’t find any transactions in this file. (Docsumo returned: ${str(describe(data), 300)})`, 'docsumo_unreadable');
+  isoDates(rows.map((l) => l[0])).forEach((d, i) => { rows[i][0] = d; });
+  const lines = [['Date', 'Narration', 'Ref No.', 'Withdrawal', 'Deposit', 'Balance'], ...rows];
   // the account number: a field named like one, with digits in it
   const acct = fields.find(([k, v]) => /a\/?c|account|acct/i.test(k) && /(no|num|#)/i.test(k) && /\d{4}/.test(v))
     ?? fields.find(([k, v]) => /a\/?c|account|acct/i.test(k) && /\d{4}\W*$/.test(v));
@@ -123,6 +162,9 @@ export function linesFromDocsumo(data) {
 export async function docsumoResult(docId) {
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(String(docId ?? ''))) fail('That Docsumo document isn’t known. Read the statement again.');
   const { status, body } = await call(`/data/simplified/${docId}/`);
-  if (status === 202 || !body.data) return { ready: false };
+  const state = String(body.meta_data?.status ?? '').toLowerCase();
+  if (/err|fail/.test(state)) fail('Docsumo couldn’t read this file (it marked it as failed). Try a clearer photo, or the PDF.', 'docsumo_unreadable');
+  // still reading: said with 202, or as an answer with nothing in it yet
+  if (status === 202 || !isRow(body.data) || !Object.keys(body.data).length || /^(new|queued|processing|uploaded|in_progress)$/.test(state)) return { ready: false };
   return { ready: true, ...linesFromDocsumo(body.data) };
 }

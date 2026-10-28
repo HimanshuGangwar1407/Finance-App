@@ -354,6 +354,18 @@ test('API: a picture PDF’s OCR words are checked and applied like any statemen
   assert.equal((await editor('/api/reconcile/check', { ...body, ocr: [{ top: 800, words: [{ x: 'a' }] }] })).status, 400);
 });
 
+test('API: a photo of a statement (JPG / PNG) with the words read from it is checked like any statement; one that isn’t a statement says so', async () => {
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64)]);
+  const r = await editor('/api/reconcile/check', { file: png.toString('base64'), name: 'IMG_2041.png', ocr: ocrWords() });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual([r.body.ocr, r.body.checked, r.body.debits.length, r.body.bank.name], [true, { ok: 19, of: 19 }, 16, 'IDBI Collections']);
+  // a photo with no statement table in it: a plain message, and marked as one this app can't read (Docsumo is offered)
+  const W = (x, y, s) => ({ x, y, w: s.length * 5, h: 9, s });
+  const greeting = await editor('/api/reconcile/check', { file: png.toString('base64'), name: 'greeting.jpg', ocr: [{ top: 800, words: [W(60, 400, 'Happy'), W(100, 400, 'Diwali')] }] });
+  assert.deepEqual([greeting.status, greeting.body.error.detail], [400, { unreadable: true }]);
+  assert.match(greeting.body.error.message, /No statement table found in this picture/);
+});
+
 test('the browser’s OCR files are served by the app, and the page may run them (WebAssembly) but nothing else', async () => {
   for (const [p, type] of [['/vendor/pdf.min.mjs', 'text/javascript'], ['/vendor/pdf.worker.min.mjs', 'text/javascript'], ['/vendor/tesseract.min.js', 'text/javascript'],
     ['/vendor/tesseract-worker.min.js', 'text/javascript'], ['/vendor/tesseract-core-simd-lstm.wasm.js', 'text/javascript'], ['/vendor/eng.traineddata.gz', 'application/octet-stream']]) {

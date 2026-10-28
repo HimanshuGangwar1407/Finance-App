@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { startDocsumo, docsumoResult, linesFromDocsumo, setDocsumoFetch, docsumoConfigured } from '../server/docsumo.js';
+import { startDocsumo, docsumoResult, linesFromDocsumo, setDocsumoFetch, docsumoConfigured, isoDates, statementType } from '../server/docsumo.js';
 import { readStatement } from '../server/reconcile.js';
 import { tableFromLines } from '../server/ai.js';
 import { setPool } from '../server/db.js';
@@ -13,7 +13,7 @@ import { makePdf } from './pdf-maker.js';
 const calls = [];
 const res = (status, body) => ({ status, ok: status < 400, json: async () => body });
 const fakeDocsumo = (routes) => async (url, init) => {
-  const path = url.replace('https://app.docsumo.com/api/v1/eevee/apikey', '');
+  const path = url.startsWith('https://app.docsumo.com/api/v1/eevee/apikey') ? url.replace('https://app.docsumo.com/api/v1/eevee/apikey', '') : url;
   calls.push({ path, init });
   const key = Object.keys(routes).find((k) => path.startsWith(k));
   return key ? (typeof routes[key] === 'function' ? routes[key](path, init) : routes[key]) : res(404, { error: 'not found' });
@@ -68,7 +68,7 @@ test('a PDF is uploaded with the API key, as the account’s bank-statement type
   assert.equal(r.ready, true);
   assert.equal(r.account, 'XXXXXXXX1198');
   assert.deepEqual(r.lines[0], ['Date', 'Narration', 'Ref No.', 'Withdrawal', 'Deposit', 'Balance']);
-  assert.deepEqual(r.lines[3], ['21/10/2026', 'SUNITA', '967712', '25422', '', '21,58,667.85']);
+  assert.deepEqual(r.lines[3], ['2026-10-21', 'SUNITA', '967712', '25422', '', '21,58,667.85']);
   // the lines are a statement like any other: checked against the running balance, the account found by its last 4
   const st = readStatement(tableFromLines(r.lines, r.account));
   assert.deepEqual([st.rows.length, st.checked, st.account], [4, { ok: 4, of: 4 }, { last4: '1198' }]);
@@ -103,9 +103,56 @@ test('Docsumo’s tables in other shapes: one Amount column with Dr / Cr, signed
   const signed = linesFromDocsumo({ table: [row({ 'Txn Date': '01-10-2026', Narration: 'RENT', Amount: '-5,000.00', 'Closing Balance': '95,000.00' }), row({ 'Txn Date': '02-10-2026', Narration: 'SALE', Amount: '700.00', 'Closing Balance': '95,700.00' })] });
   assert.deepEqual(signed.lines.slice(1).map((l) => [l[3], l[4], l[5]]), [['5,000.00', '', '95,000.00'], ['', '700.00', '95,700.00']]);
   const loose = linesFromDocsumo({ txns: [row({ 'Posting Date (DD/MM)': '01-10-2026', 'Value Date': '30-09-2026', 'Transaction Details': 'RENT', 'Withdrawals (INR)': '5,000.00', 'Deposits (INR)': '', 'Running Bal': '95,000.00' })], 'A/C No.': cell('123456785555') });
-  assert.deepEqual(loose.lines[1], ['01-10-2026', 'RENT', '', '5,000.00', '', '95,000.00']);
+  assert.deepEqual(loose.lines[1], ['2026-10-01', 'RENT', '', '5,000.00', '', '95,000.00']);
   assert.equal(loose.account, '123456785555');
   assert.throws(() => linesFromDocsumo({ 'Basic Information': { 'Invoice Number': cell('2020') } }), (e) => e.code === 'docsumo_unreadable');
+});
+
+test('Docsumo’s answer in other forms: plain values, a headers + rows table, US-style dates, Money Out / Money In, a Type column', () => {
+  // plain values (no { value }), month-first dates (told apart by a day over 12), "Money Out" / "Money In"
+  const us = linesFromDocsumo({ account_number: 'XXXX1198', transactions: [
+    { 'Txn Date': '10/09/2026', Details: 'RENT', 'Money Out': '5,000.00', 'Money In': '', 'Closing Balance': '95,000.00' },
+    { 'Txn Date': '10/21/2026', Details: 'SALE', 'Money Out': '', 'Money In': '700.00', 'Closing Balance': '95,700.00' },
+  ] });
+  assert.deepEqual(us.lines.slice(1), [['2026-10-09', 'RENT', '', '5,000.00', '', '95,000.00'], ['2026-10-21', 'SALE', '', '', '700.00', '95,700.00']]);
+  assert.equal(us.account, 'XXXX1198');
+  // day-first stays day-first; when no part is over 12, the order that keeps the statement in date order wins
+  assert.deepEqual(isoDates(['09/10/2026', '21/10/2026']), ['2026-10-09', '2026-10-21']);
+  assert.deepEqual(isoDates(['10/02/2026', '10/05/2026', '11/01/2026']), ['2026-10-02', '2026-10-05', '2026-11-01']); // only in date order month-first
+  assert.deepEqual(isoDates(['10/02/2026', '10/05/2026', '10/11/2026']), ['2026-02-10', '2026-05-10', '2026-11-10']); // in order either way: day-first, as Indian banks write it
+  assert.deepEqual(isoDates(['02/10/2026', '05/10/2026', '11/10/2026']), ['2026-10-02', '2026-10-05', '2026-10-11']); // day-first
+  assert.deepEqual(isoDates(['21 Oct 2026', '']), ['21 Oct 2026', '']);
+  // a table given as headings and rows; one Amount column with a Type of Debit / Credit / Withdrawal
+  const grid = linesFromDocsumo({ Statement: { headers: ['Date', 'Description', 'Amount', 'Type', 'Balance'], rows: [
+    ['01-10-2026', 'RENT', '5,000.00', 'Withdrawal', '95,000.00'], ['02-10-2026', 'SALE', '700.00', 'Credit', '95,700.00'], ['03-10-2026', 'FEE', '10.00', 'Debit', '95,690.00']] } });
+  assert.deepEqual(grid.lines.slice(1).map((l) => [l[3], l[4]]), [['5,000.00', ''], ['', '700.00'], ['10.00', '']]);
+  // nothing usable: the message says what Docsumo sent, so it can be looked into
+  assert.throws(() => linesFromDocsumo({ 'Basic Information': { Bank: cell('IDBI') }, Summary: [row({ Month: 'Oct', Total: 5 })] }),
+    (e) => e.code === 'docsumo_unreadable' && /Docsumo returned: Basic Information; Summary \(1 rows: Month, Total\)/.test(e.message));
+});
+
+test('still reading: a 202, an empty answer or a “processing” status all wait; a failed one says so', async () => {
+  process.env.DOCSUMO_API_KEY = 'test-key';
+  for (const answer of [res(202, {}), res(200, { data: {}, meta_data: { status: 'reviewing' } }), res(200, { data: statement('21/10/2026'), meta_data: { status: 'processing' } })]) {
+    setDocsumoFetch(fakeDocsumo({ '/data/simplified/': answer }));
+    assert.deepEqual(await docsumoResult('d1'), { ready: false });
+  }
+  setDocsumoFetch(fakeDocsumo({ '/data/simplified/': res(200, { data: {}, meta_data: { status: 'erred' } }) }));
+  await assert.rejects(docsumoResult('d1'), /marked it as failed/);
+  setDocsumoFetch(fakeDocsumo({ '/data/simplified/': res(200, { data: statement('21/10/2026'), meta_data: { status: 'reviewing' } }) }));
+  assert.equal((await docsumoResult('d1')).lines.length, 6);
+});
+
+test('the bank-statement type: an Indian / general one before a US one; from the enabled types if the first list has none; else names what there is', async () => {
+  const pick = async (routes) => { setDocsumoFetch(fakeDocsumo(routes)); return statementType(); };
+  assert.equal(await pick({ '/limit/': res(200, { data: { document_types: [{ title: 'US Bank Statement', value: 'us_bank_statement' }, { title: 'Bank Statement', value: 'bank_statement_v2' }] } }) }), 'bank_statement_v2');
+  assert.equal(await pick({ '/limit/': res(200, { data: { document_types: [{ title: 'Invoice', value: 'invoice' }] } }),
+    'https://app.docsumo.com/api/v1/mew/documents/types/': res(200, { data: { document: [{ title: 'Bank Statements India', doc_type: 'in_bank_statement' }] } }) }), 'in_bank_statement');
+  await assert.rejects(pick({ '/limit/': res(404, {}), 'https://app.docsumo.com/api/v1/mew/documents/types/': res(200, { data: { document: [{ title: 'Invoice', doc_type: 'invoice' }] } }) }),
+    /no bank statement document type \(it has: Invoice\)/);
+  process.env.DOCSUMO_DOC_TYPE = ' my_statements ';
+  assert.equal(await pick({}), 'my_statements');
+  delete process.env.DOCSUMO_DOC_TYPE;
 });
 
 // ── the API ──
