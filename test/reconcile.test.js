@@ -178,7 +178,7 @@ test('apply: matched debits are paid (only these leave the balance); left-out on
   const { rows: e } = await pool.query("SELECT p.payee, e.amount, e.date, e.ref, e.bank_id FROM entries e JOIN payments p ON p.id = e.payment_id ORDER BY e.id");
   assert.deepEqual(e.map((x) => [x.payee, Number(x.amount), x.date, x.ref, x.bank_id]), [
     ['Steel Co', 12_500_000, yday, 'N295123456', hdfc], ['Gupta Transport', 820_000, yday, '229512345678', hdfc], ['Office Supplies', 450_000, yday, '123456789012', hdfc],
-    ['HDFC bank charges', 5_900, yday, 'SERVICE CHARGES - NEFT GST', hdfc]]);
+    ['HDFC bank charges', 5_900, yday, `SERVICE CHARGES - NEFT GST ${yday.replace(/-/g, '')}`, hdfc]]); // no reference of its own: the narration and the date
   const sum = (await editor(`/api/transactions/summary?bank=${hdfc}&from=${addDays(today, -4)}&to=${today}`)).body.total;
   assert.equal(sum.closing, 50_000_000 - 13_770_000 - 5_900);
   const { rows: p } = await pool.query('SELECT id, due_date, status FROM payments WHERE id = ANY($1::int[]) ORDER BY id', [[ids.rent, ids.sharma, ids.emi, ids.later]]);

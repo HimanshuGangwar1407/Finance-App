@@ -45,7 +45,7 @@ export function accountOf(texts) {
 
 // a statement amount: 1,25,000.00 · ₹500 · "500.00 Dr" · a number; empty → 0
 function money(v) {
-  if (typeof v === 'number') return Math.round(Math.abs(v) * 100);
+  if (typeof v === 'number') return Math.abs(v) < 1e13 ? Math.round(Math.abs(v) * 100) : null; // (null: not understood, as for text that isn't an amount)
   const s = String(v ?? '').trim().replace(/\s*(dr|cr)\.?$/i, '');
   if (!s || s === '-') return 0;
   try { return Math.abs(toPaise(s.replace(/^\((.*)\)$/, '$1'), 'Amount', { allowNegative: true })); } catch { return null; }
@@ -242,9 +242,12 @@ export function guessPayee(narration) {
 }
 
 export function lineRef(line, taken) {
-  let ref = str(line.ref || line.narration || `Statement ${line.date}`, 70);
-  if (!normRef(ref)) ref = `Statement ${line.date}`;
-  if (taken.has(normRef(ref))) ref = `${ref.slice(0, 60)} (row ${line.row})`;
+  // without a reference of its own, the narration and the date: the same charge next month ("SMS ALERT CHARGES") is
+  // another line, not one already recorded. The date without its hyphens, so 2026-01-11 and 2026-11-01 stay apart.
+  const day = line.date.replace(/-/g, '');
+  let ref = line.ref ? str(line.ref, 70) : `${str(line.narration, 60)} ${day}`.trim();
+  if (!normRef(ref.replace(day, ''))) ref = `Statement ${day}`;
+  if (taken.has(normRef(ref))) ref = `${line.ref ? str(line.ref, 60) : `${str(line.narration, 48)} ${day}`} (row ${line.row})`;
   taken.add(normRef(ref));
   return ref;
 }

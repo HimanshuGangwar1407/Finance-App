@@ -423,12 +423,14 @@ async function history(f) {
 // every receipt and payment that is dated in the period or had money move in it, with how much has been settled:
 // pending (nothing yet), partial, completed, or cancelled
 async function records(f) {
-  // dated in the period, or with money received / paid in it (worked out once per record, in the totals below)
-  const where = ['(t.date BETWEEN $1 AND $2 OR t.moved_in_period)'];
+  // dated in the period, or with money received / paid in it (worked out once per record, in the totals below); a
+  // period up to today also shows what is still to be paid / received later (a payment due next week is on the list)
+  const where = [`(t.date BETWEEN $1 AND $2 OR t.moved_in_period${f.to >= todayIST() ? ` OR (t.date > $2 AND t.state IN ('pending', 'partial'))` : ''})`];
   const args = [f.from, f.to], arg = (v) => { args.push(v); return `$${args.length}`; };
   if (f.bank) { const b = arg(f.bank); where.push(`(t.bank_id = ${b} OR ${b} = ANY(t.banks))`); }
   if (f.type) where.push(`t.kind = ${arg(f.type)}`);
-  if (f.status) where.push(`t.state = ${arg(f.status)}`);
+  // "yet to be paid / received": anything with money still to come or go, partly settled ones too
+  if (f.status) where.push(f.status === 'pending' ? `t.state IN ('pending', 'partial')` : `t.state = ${arg(f.status)}`);
   if (f.q) {
     where.push(searchWhere(f, arg, {
       name: ({ t }) => `t.name ILIKE ${t()}`,
@@ -860,8 +862,12 @@ const routes = [
     const only = (col) => `SELECT DISTINCT e.${col} FROM entries e WHERE e.bank_id = $1 AND e.${col} IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM entries x WHERE x.${col} = e.${col} AND x.bank_id <> $1)`;
     const recs = (await c.query(only('receipt_id'), [id])).rows.map((r) => r.receipt_id);
-    const pays = [...new Set([...(await c.query(only('payment_id'), [id])).rows.map((r) => r.payment_id),
-      ...(await c.query('SELECT p.id FROM payments p JOIN emis e ON e.id = p.emi_id WHERE e.bank_id = $1', [id])).rows.map((r) => r.id)])];
+    // an instalment paid (in part) through another account stays, as an ordinary payment: that account's money is kept
+    const { rows: inst } = await c.query(`SELECT p.id, EXISTS (SELECT 1 FROM entries x WHERE x.payment_id = p.id AND x.bank_id <> $1) AS elsewhere
+      FROM payments p JOIN emis e ON e.id = p.emi_id WHERE e.bank_id = $1`, [id]);
+    const kept = inst.filter((r) => r.elsewhere).map((r) => r.id);
+    if (kept.length) await c.query('UPDATE payments SET emi_id = NULL WHERE id = ANY($1::int[])', [kept]);
+    const pays = [...new Set([...(await c.query(only('payment_id'), [id])).rows.map((r) => r.payment_id), ...inst.filter((r) => !r.elsewhere).map((r) => r.id)])];
     const { rowCount: entries } = await c.query('DELETE FROM entries WHERE bank_id = $1 OR receipt_id = ANY($2::int[]) OR payment_id = ANY($3::int[])', [id, recs, pays]);
     await c.query('DELETE FROM receipts WHERE id = ANY($1::int[])', [recs]);
     await c.query('DELETE FROM payments WHERE id = ANY($1::int[])', [pays]);
@@ -892,8 +898,9 @@ const routes = [
   ['POST', /^\/api\/payments$/, 'editor', async ({ body, user }) => withTx((c) => addPayment(c, body, user))],
 
   // record money that actually left / arrived in the bank — all of what is left, or part of it
+  // (fromStatement is for reconciliation only: from here, the EMI reserve and the shortfall question always apply)
   ['POST', /^\/api\/(receipts|payments)\/(\d+)\/settle$/, 'editor', async ({ body, user, m }) =>
-    withTx((c) => settle(c, { table: m[1], id: intId(m[2]), body, user })).catch(unique(REF_TAKEN))],
+    withTx((c) => settle(c, { table: m[1], id: intId(m[2]), body: { ...body, fromStatement: false }, user })).catch(unique(REF_TAKEN))],
 
   // ── transactions: money actually received / paid, bank statements for a period, and reports ──
   // add a receipt or payment as pending (no effect on balances), or as already received / paid in one step
@@ -1094,7 +1101,7 @@ const routes = [
     ]);
     const st = bankStatements({ banks: banks.rows, balances: balances.rows, entries: entries.rows, from: f.from, to: f.to, only: f.bank });
     const pending = { IN: { count: 0, amount: 0 }, OUT: { count: 0, amount: 0 } };
-    for (const r of open) if ((r.state === 'pending' || r.state === 'partial') && r.date >= f.from && r.date <= f.to) { pending[r.kind].count++; pending[r.kind].amount += r.amount - r.settled; }
+    for (const r of open) if ((r.state === 'pending' || r.state === 'partial') && r.date >= f.from && (r.date <= f.to || f.to >= today)) { pending[r.kind].count++; pending[r.kind].amount += r.amount - r.settled; }
     return { today, from: f.from, to: f.to, accounts: banks.rows, banks: st.rows, total: st.total, pending };
   }],
 
@@ -1241,7 +1248,7 @@ const routes = [
     if (who === 'none') where.push('a.user_id IS NULL');
     else if (who) where.push(`a.user_id = ${arg(intId(who, 'User'))}`);
     const type = p.get('type');
-    if (type) where.push(`split_part(a.action, '.', 1) = ANY(${arg(ACTIVITY_TYPES[type] ?? bad('Type: choose one of the options.'))}::text[])`);
+    if (type) where.push(`split_part(a.action, '.', 1) = ANY(${arg((Object.hasOwn(ACTIVITY_TYPES, type) ? ACTIVITY_TYPES[type] : null) ?? bad('Type: choose one of the options.'))}::text[])`);
     const from = ymd(p.get('from'), 'From', { optional: true }), to = ymd(p.get('to'), 'To', { optional: true });
     if (from) where.push(`a.at >= ${arg(istStart(from))}::timestamptz`);
     if (to) where.push(`a.at < ${arg(istStart(addDays(to, 1)))}::timestamptz`);
